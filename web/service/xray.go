@@ -25,6 +25,7 @@ var (
 type XrayService struct {
 	inboundService InboundService
 	settingService SettingService
+	l2tpService    L2tpService
 	xrayAPI        xray.XrayAPI
 }
 
@@ -113,6 +114,11 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		if !inbound.Enable {
 			continue
 		}
+		// Skip L2TP inbounds — they are not native Xray protocols.
+		// A paired dokodemo-door inbound is injected below instead.
+		if inbound.Protocol == "l2tp" {
+			continue
+		}
 		// get settings clients
 		settings := map[string]any{}
 		json.Unmarshal([]byte(inbound.Settings), &settings)
@@ -191,6 +197,17 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		inboundConfig := inbound.GenXrayInboundConfig()
 		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *inboundConfig)
 	}
+
+	// Inject paired dokodemo-door inbounds for L2TP
+	l2tpInbounds, _ := s.l2tpService.GetL2tpInbounds()
+	for _, l2tpInbound := range l2tpInbounds {
+		if !l2tpInbound.Enable {
+			continue
+		}
+		dokodemoConfig := s.l2tpService.GetDokodemoConfig(l2tpInbound)
+		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *dokodemoConfig)
+	}
+
 	return xrayConfig, nil
 }
 

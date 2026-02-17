@@ -17,6 +17,7 @@ type XrayTrafficJob struct {
 	xrayService     service.XrayService
 	inboundService  service.InboundService
 	outboundService service.OutboundService
+	l2tpService     service.L2tpService
 }
 
 // NewXrayTrafficJob creates a new traffic collection job instance.
@@ -33,6 +34,12 @@ func (j *XrayTrafficJob) Run() {
 	if err != nil {
 		return
 	}
+
+	// Collect L2TP per-client traffic from iptables accounting and merge
+	if l2tpTraffics := j.l2tpService.CollectL2tpTraffic(); len(l2tpTraffics) > 0 {
+		clientTraffics = append(clientTraffics, l2tpTraffics...)
+	}
+
 	err, needRestart0 := j.inboundService.AddTraffic(traffics, clientTraffics)
 	if err != nil {
 		logger.Warning("add inbound traffic failed:", err)

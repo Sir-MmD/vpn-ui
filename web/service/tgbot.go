@@ -2929,6 +2929,7 @@ func (t *Tgbot) getInboundsAddClient() (*telego.InlineKeyboardMarkup, error) {
 		model.Mixed:     true,
 		model.WireGuard: true,
 		model.HTTP:      true,
+		model.L2TP:      true,
 	}
 
 	var buttons []telego.InlineKeyboardButton

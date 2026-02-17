@@ -1,0 +1,50 @@
+{{define "form/l2tp"}}
+<a-form
+    :colon="false"
+    :label-col="{ md: {span:8} }"
+    :wrapper-col="{ md: {span:14} }"
+>
+    <a-form-item label="IP Range">
+        <a-input
+            v-model.trim="inbound.settings.ipRange"
+            placeholder="10.0.2.10-10.0.2.50"
+        ></a-input>
+    </a-form-item>
+    <a-form-item label="Local IP">
+        <a-input
+            v-model.trim="inbound.settings.localIp"
+            placeholder="10.0.2.1"
+        ></a-input>
+    </a-form-item>
+    <a-form-item label="DNS 1">
+        <a-input
+            v-model.trim="inbound.settings.dns1"
+            placeholder="8.8.8.8"
+        ></a-input>
+    </a-form-item>
+    <a-form-item label="DNS 2">
+        <a-input
+            v-model.trim="inbound.settings.dns2"
+            placeholder="8.8.4.4"
+        ></a-input>
+    </a-form-item>
+    <a-form-item label="MTU">
+        <a-input-number
+            v-model.number="inbound.settings.mtu"
+            :min="1000"
+            :max="1500"
+        ></a-input-number>
+    </a-form-item>
+    <a-form-item label="IPsec">
+        <a-switch v-model="inbound.settings.ipsecEnable"></a-switch>
+    </a-form-item>
+    <template v-if="inbound.settings.ipsecEnable">
+        <a-form-item label="IPsec PSK">
+            <a-input
+                v-model.trim="inbound.settings.ipsecPsk"
+                placeholder="pre-shared key"
+            ></a-input>
+        </a-form-item>
+    </template>
+</a-form>
+{{end}}

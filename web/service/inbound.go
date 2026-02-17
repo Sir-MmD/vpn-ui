@@ -262,7 +262,7 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 	// Secure client ID
 	for _, client := range clients {
 		switch inbound.Protocol {
-		case "trojan":
+		case "trojan", "l2tp":
 			if client.Password == "" {
 				return inbound, false, common.NewError("empty client ID")
 			}
@@ -598,7 +598,7 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 	// Secure client ID
 	for _, client := range clients {
 		switch oldInbound.Protocol {
-		case "trojan":
+		case "trojan", "l2tp":
 			if client.Password == "" {
 				return false, common.NewError("empty client ID")
 			}
@@ -690,7 +690,7 @@ func (s *InboundService) DelInboundClient(inboundId int, clientId string) (bool,
 
 	email := ""
 	client_key := "id"
-	if oldInbound.Protocol == "trojan" {
+	if oldInbound.Protocol == "trojan" || oldInbound.Protocol == "l2tp" {
 		client_key = "password"
 	}
 	if oldInbound.Protocol == "shadowsocks" {
@@ -795,7 +795,7 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 	for index, oldClient := range oldClients {
 		oldClientId := ""
 		switch oldInbound.Protocol {
-		case "trojan":
+		case "trojan", "l2tp":
 			oldClientId = oldClient.Password
 			newClientId = clients[0].Password
 		case "shadowsocks":
@@ -1437,7 +1437,7 @@ func (s *InboundService) SetClientTelegramUserID(trafficId int, tgId int64) (boo
 	for _, oldClient := range oldClients {
 		if oldClient.Email == clientEmail {
 			switch inbound.Protocol {
-			case "trojan":
+			case "trojan", "l2tp":
 				clientId = oldClient.Password
 			case "shadowsocks":
 				clientId = oldClient.Email
@@ -1523,7 +1523,7 @@ func (s *InboundService) ToggleClientEnableByEmail(clientEmail string) (bool, bo
 	for _, oldClient := range oldClients {
 		if oldClient.Email == clientEmail {
 			switch inbound.Protocol {
-			case "trojan":
+			case "trojan", "l2tp":
 				clientId = oldClient.Password
 			case "shadowsocks":
 				clientId = oldClient.Email
@@ -1604,7 +1604,7 @@ func (s *InboundService) ResetClientIpLimitByEmail(clientEmail string, count int
 	for _, oldClient := range oldClients {
 		if oldClient.Email == clientEmail {
 			switch inbound.Protocol {
-			case "trojan":
+			case "trojan", "l2tp":
 				clientId = oldClient.Password
 			case "shadowsocks":
 				clientId = oldClient.Email
@@ -1663,7 +1663,7 @@ func (s *InboundService) ResetClientExpiryTimeByEmail(clientEmail string, expiry
 	for _, oldClient := range oldClients {
 		if oldClient.Email == clientEmail {
 			switch inbound.Protocol {
-			case "trojan":
+			case "trojan", "l2tp":
 				clientId = oldClient.Password
 			case "shadowsocks":
 				clientId = oldClient.Email
@@ -1725,7 +1725,7 @@ func (s *InboundService) ResetClientTrafficLimitByEmail(clientEmail string, tota
 	for _, oldClient := range oldClients {
 		if oldClient.Email == clientEmail {
 			switch inbound.Protocol {
-			case "trojan":
+			case "trojan", "l2tp":
 				clientId = oldClient.Password
 			case "shadowsocks":
 				clientId = oldClient.Email

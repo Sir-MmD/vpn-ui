@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/database/model"
+	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/web/service"
 	"github.com/mhsanaei/3x-ui/v2/web/session"
 	"github.com/mhsanaei/3x-ui/v2/web/websocket"
@@ -18,6 +19,7 @@ import (
 type InboundController struct {
 	inboundService service.InboundService
 	xrayService    service.XrayService
+	l2tpService    service.L2tpService
 }
 
 // NewInboundController creates a new InboundController and sets up its routes.
@@ -52,6 +54,20 @@ func (a *InboundController) initRouter(g *gin.RouterGroup) {
 	g.POST("/lastOnline", a.lastOnline)
 	g.POST("/updateClientTraffic/:email", a.updateClientTraffic)
 	g.POST("/:id/delClientByEmail/:email", a.delInboundClientByEmail)
+}
+
+// onL2tpChanged regenerates L2TP configs and restarts services when an L2TP inbound is modified.
+func (a *InboundController) onL2tpChanged() {
+	if err := a.l2tpService.GenerateAllConfigs(); err != nil {
+		logger.Warning("L2TP: config generation failed:", err)
+	}
+	if err := a.l2tpService.SetupAllTproxy(); err != nil {
+		logger.Warning("L2TP: TPROXY setup failed:", err)
+	}
+	if err := a.l2tpService.RestartServices(); err != nil {
+		logger.Warning("L2TP: service restart failed:", err)
+	}
+	a.xrayService.SetToNeedRestart()
 }
 
 // getInbounds retrieves the list of inbounds for the logged-in user.
@@ -124,7 +140,9 @@ func (a *InboundController) addInbound(c *gin.Context) {
 		return
 	}
 	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundCreateSuccess"), inbound, nil)
-	if needRestart {
+	if inbound.Protocol == model.L2TP {
+		a.onL2tpChanged()
+	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
 	// Broadcast inbounds update via WebSocket
@@ -139,13 +157,21 @@ func (a *InboundController) delInbound(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundDeleteSuccess"), err)
 		return
 	}
+	// Check if this is an L2TP inbound before deletion
+	oldInbound, _ := a.inboundService.GetInbound(id)
+	isL2tp := oldInbound != nil && oldInbound.Protocol == model.L2TP
+	if isL2tp {
+		a.l2tpService.CleanupTproxy(oldInbound)
+	}
 	needRestart, err := a.inboundService.DelInbound(id)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
 	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundDeleteSuccess"), id, nil)
-	if needRestart {
+	if isL2tp {
+		a.onL2tpChanged()
+	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
 	// Broadcast inbounds update via WebSocket
@@ -175,7 +201,9 @@ func (a *InboundController) updateInbound(c *gin.Context) {
 		return
 	}
 	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), inbound, nil)
-	if needRestart {
+	if inbound.Protocol == model.L2TP {
+		a.onL2tpChanged()
+	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
 	// Broadcast inbounds update via WebSocket
@@ -255,7 +283,9 @@ func (a *InboundController) addInboundClient(c *gin.Context) {
 		return
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundClientAddSuccess"), nil)
-	if needRestart {
+	if data.Protocol == model.L2TP {
+		a.onL2tpChanged()
+	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
 }
@@ -269,13 +299,16 @@ func (a *InboundController) delInboundClient(c *gin.Context) {
 	}
 	clientId := c.Param("clientId")
 
+	oldInbound, _ := a.inboundService.GetInbound(id)
 	needRestart, err := a.inboundService.DelInboundClient(id, clientId)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundClientDeleteSuccess"), nil)
-	if needRestart {
+	if oldInbound != nil && oldInbound.Protocol == model.L2TP {
+		a.onL2tpChanged()
+	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
 }
@@ -297,7 +330,9 @@ func (a *InboundController) updateInboundClient(c *gin.Context) {
 		return
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundClientUpdateSuccess"), nil)
-	if needRestart {
+	if inbound.Protocol == model.L2TP {
+		a.onL2tpChanged()
+	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
 }
