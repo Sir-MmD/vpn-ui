@@ -2940,6 +2940,7 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
     protocol,
     ipsecEnable = true,
     ipsecPsk = RandomUtil.randomSeq(16),
+    allowRaw = false,
     ipRange = "10.0.2.10-10.0.2.50",
     localIp = "10.0.2.1",
     dns1 = "8.8.8.8",
@@ -2950,6 +2951,7 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
     super(protocol);
     this.ipsecEnable = ipsecEnable;
     this.ipsecPsk = ipsecPsk;
+    this.allowRaw = allowRaw;
     this.ipRange = ipRange;
     this.localIp = localIp;
     this.dns1 = dns1;
@@ -2963,6 +2965,7 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
       Protocols.L2TP,
       json.ipsecEnable ?? true,
       json.ipsecPsk,
+      json.allowRaw ?? false,
       json.ipRange ?? "10.0.2.10-10.0.2.50",
       json.localIp ?? "10.0.2.1",
       json.dns1 ?? "8.8.8.8",
@@ -2976,6 +2979,7 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
     return {
       ipsecEnable: this.ipsecEnable,
       ipsecPsk: this.ipsecPsk,
+      allowRaw: this.allowRaw,
       ipRange: this.ipRange,
       localIp: this.localIp,
       dns1: this.dns1,

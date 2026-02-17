@@ -45,6 +45,9 @@
                 placeholder="pre-shared key"
             ></a-input>
         </a-form-item>
+        <a-form-item label="Allow L2TP Raw (no PSK)">
+            <a-switch v-model="inbound.settings.allowRaw"></a-switch>
+        </a-form-item>
     </template>
 </a-form>
 {{end}}

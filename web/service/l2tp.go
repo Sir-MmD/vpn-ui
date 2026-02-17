@@ -33,6 +33,7 @@ type L2tpService struct {
 type l2tpSettings struct {
 	IpsecEnable bool         `json:"ipsecEnable"`
 	IpsecPsk    string       `json:"ipsecPsk"`
+	AllowRaw    bool         `json:"allowRaw"`
 	IpRange     string       `json:"ipRange"`
 	LocalIp     string       `json:"localIp"`
 	Dns1        string       `json:"dns1"`
@@ -258,6 +259,7 @@ func (s *L2tpService) GenerateChapSecrets(inbounds []*model.Inbound) error {
 // GenerateIPsecConfig writes /etc/ipsec.conf and /etc/ipsec.secrets for L2TP/IPsec.
 func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 	hasIpsec := false
+	allowRaw := false
 	var psks []string
 
 	for _, inbound := range inbounds {
@@ -268,6 +270,9 @@ func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 		if settings.IpsecEnable && settings.IpsecPsk != "" {
 			hasIpsec = true
 			psks = append(psks, settings.IpsecPsk)
+			if settings.AllowRaw {
+				allowRaw = true
+			}
 		}
 	}
 
@@ -290,9 +295,17 @@ func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 	b.WriteString("    keylife=1h\n")
 	b.WriteString("    type=transport\n")
 	b.WriteString("    left=%defaultroute\n")
-	b.WriteString("    leftprotoport=17/1701\n")
-	b.WriteString("    right=%any\n")
-	b.WriteString("    rightprotoport=17/%any\n")
+	if allowRaw {
+		// Use NAT-T (UDP/4500) for IPsec, leaving port 1701 open for raw L2TP
+		b.WriteString("    leftprotoport=17/%any\n")
+		b.WriteString("    right=%any\n")
+		b.WriteString("    rightprotoport=17/%any\n")
+		b.WriteString("    forceencaps=yes\n")
+	} else {
+		b.WriteString("    leftprotoport=17/1701\n")
+		b.WriteString("    right=%any\n")
+		b.WriteString("    rightprotoport=17/%any\n")
+	}
 	b.WriteString("    dpddelay=30\n")
 	b.WriteString("    dpdtimeout=120\n")
 	b.WriteString("    dpdaction=clear\n")

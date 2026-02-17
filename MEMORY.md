@@ -191,6 +191,7 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
 - L2TP client JS model: `_totalGB`/`_expiryTime` getters/setters, `limitIp` (was `ipLimit`), `reset`/`created_at`/`updated_at` fields
 - L2TP unique username enforcement (AddInbound, AddInboundClient, UpdateInboundClient)
 - L2TP client count in Inbounds section (added Protocols.L2TP to setInbounds)
+- L2TP Allow Raw mode: `allowRaw` toggle in IPsec settings, uses forceencaps+NAT-T so raw L2TP and PSK can coexist
 - Pre-built distro archive (vpn-ui-distro.tar.zst)
 - Enhanced telego client robustness and retries
 - Timeouts and delays for backup sends
