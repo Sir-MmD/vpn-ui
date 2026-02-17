@@ -20,6 +20,7 @@ type InboundController struct {
 	inboundService service.InboundService
 	xrayService    service.XrayService
 	l2tpService    service.L2tpService
+	pptpService    service.PptpService
 }
 
 // NewInboundController creates a new InboundController and sets up its routes.
@@ -66,6 +67,20 @@ func (a *InboundController) onL2tpChanged() {
 	}
 	if err := a.l2tpService.RestartServices(); err != nil {
 		logger.Warning("L2TP: service restart failed:", err)
+	}
+	a.xrayService.SetToNeedRestart()
+}
+
+// onPptpChanged regenerates PPTP configs and restarts services when a PPTP inbound is modified.
+func (a *InboundController) onPptpChanged() {
+	if err := a.pptpService.GenerateAllConfigs(); err != nil {
+		logger.Warning("PPTP: config generation failed:", err)
+	}
+	if err := a.pptpService.SetupAllTproxy(); err != nil {
+		logger.Warning("PPTP: TPROXY setup failed:", err)
+	}
+	if err := a.pptpService.RestartServices(); err != nil {
+		logger.Warning("PPTP: service restart failed:", err)
 	}
 	a.xrayService.SetToNeedRestart()
 }
@@ -142,6 +157,8 @@ func (a *InboundController) addInbound(c *gin.Context) {
 	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundCreateSuccess"), inbound, nil)
 	if inbound.Protocol == model.L2TP {
 		a.onL2tpChanged()
+	} else if inbound.Protocol == model.PPTP {
+		a.onPptpChanged()
 	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -157,11 +174,15 @@ func (a *InboundController) delInbound(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundDeleteSuccess"), err)
 		return
 	}
-	// Check if this is an L2TP inbound before deletion
+	// Check if this is an L2TP/PPTP inbound before deletion
 	oldInbound, _ := a.inboundService.GetInbound(id)
 	isL2tp := oldInbound != nil && oldInbound.Protocol == model.L2TP
+	isPptp := oldInbound != nil && oldInbound.Protocol == model.PPTP
 	if isL2tp {
 		a.l2tpService.CleanupTproxy(oldInbound)
+	}
+	if isPptp {
+		a.pptpService.CleanupTproxy(oldInbound)
 	}
 	needRestart, err := a.inboundService.DelInbound(id)
 	if err != nil {
@@ -171,6 +192,8 @@ func (a *InboundController) delInbound(c *gin.Context) {
 	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundDeleteSuccess"), id, nil)
 	if isL2tp {
 		a.onL2tpChanged()
+	} else if isPptp {
+		a.onPptpChanged()
 	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -203,6 +226,8 @@ func (a *InboundController) updateInbound(c *gin.Context) {
 	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), inbound, nil)
 	if inbound.Protocol == model.L2TP {
 		a.onL2tpChanged()
+	} else if inbound.Protocol == model.PPTP {
+		a.onPptpChanged()
 	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -285,6 +310,8 @@ func (a *InboundController) addInboundClient(c *gin.Context) {
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundClientAddSuccess"), nil)
 	if data.Protocol == model.L2TP {
 		a.onL2tpChanged()
+	} else if data.Protocol == model.PPTP {
+		a.onPptpChanged()
 	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -308,6 +335,8 @@ func (a *InboundController) delInboundClient(c *gin.Context) {
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundClientDeleteSuccess"), nil)
 	if oldInbound != nil && oldInbound.Protocol == model.L2TP {
 		a.onL2tpChanged()
+	} else if oldInbound != nil && oldInbound.Protocol == model.PPTP {
+		a.onPptpChanged()
 	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -332,6 +361,8 @@ func (a *InboundController) updateInboundClient(c *gin.Context) {
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundClientUpdateSuccess"), nil)
 	if inbound.Protocol == model.L2TP {
 		a.onL2tpChanged()
+	} else if inbound.Protocol == model.PPTP {
+		a.onPptpChanged()
 	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -356,6 +387,7 @@ func (a *InboundController) resetClientTraffic(c *gin.Context) {
 		a.xrayService.SetToNeedRestart()
 	}
 	a.onL2tpChanged()
+	a.onPptpChanged()
 }
 
 // resetAllTraffics resets all traffic counters across all inbounds.
@@ -369,6 +401,7 @@ func (a *InboundController) resetAllTraffics(c *gin.Context) {
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetAllTrafficSuccess"), nil)
 	a.onL2tpChanged()
+	a.onPptpChanged()
 }
 
 // resetAllClientTraffics resets traffic counters for all clients in a specific inbound.
@@ -388,6 +421,7 @@ func (a *InboundController) resetAllClientTraffics(c *gin.Context) {
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetAllClientTrafficSuccess"), nil)
 	a.onL2tpChanged()
+	a.onPptpChanged()
 }
 
 // importInbound imports an inbound configuration from provided data.

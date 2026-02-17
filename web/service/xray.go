@@ -26,6 +26,7 @@ type XrayService struct {
 	inboundService InboundService
 	settingService SettingService
 	l2tpService    L2tpService
+	pptpService    PptpService
 	xrayAPI        xray.XrayAPI
 }
 
@@ -114,9 +115,9 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		if !inbound.Enable {
 			continue
 		}
-		// Skip L2TP inbounds — they are not native Xray protocols.
-		// A paired dokodemo-door inbound is injected below instead.
-		if inbound.Protocol == "l2tp" {
+		// Skip L2TP/PPTP inbounds — they are not native Xray protocols.
+		// Paired dokodemo-door inbounds are injected below instead.
+		if inbound.Protocol == "l2tp" || inbound.Protocol == "pptp" {
 			continue
 		}
 		// get settings clients
@@ -205,6 +206,16 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 			continue
 		}
 		dokodemoConfig := s.l2tpService.GetDokodemoConfig(l2tpInbound)
+		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *dokodemoConfig)
+	}
+
+	// Inject paired dokodemo-door inbounds for PPTP
+	pptpInbounds, _ := s.pptpService.GetPptpInbounds()
+	for _, pptpInbound := range pptpInbounds {
+		if !pptpInbound.Enable {
+			continue
+		}
+		dokodemoConfig := s.pptpService.GetDokodemoConfig(pptpInbound)
 		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *dokodemoConfig)
 	}
 

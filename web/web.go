@@ -104,6 +104,7 @@ type Server struct {
 	xrayService    service.XrayService
 	settingService service.SettingService
 	l2tpService    service.L2tpService
+	pptpService    service.PptpService
 	tgbotService   service.Tgbot
 
 	wsHub *websocket.Hub
@@ -296,8 +297,9 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 // startTask schedules background jobs (Xray checks, traffic jobs, cron
 // jobs) which the panel relies on for periodic maintenance and monitoring.
 func (s *Server) startTask() {
-	// Initialize L2TP services before Xray so TPROXY rules are in place
+	// Initialize L2TP/PPTP services before Xray so TPROXY rules are in place
 	s.l2tpService.InitL2tp()
+	s.pptpService.InitPptp()
 
 	err := s.xrayService.RestartXray(true)
 	if err != nil {

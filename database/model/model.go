@@ -22,6 +22,7 @@ const (
 	Mixed       Protocol = "mixed"
 	WireGuard   Protocol = "wireguard"
 	L2TP        Protocol = "l2tp"
+	PPTP        Protocol = "pptp"
 )
 
 // User represents a user account in the 3x-ui panel.

@@ -105,6 +105,7 @@ type ServerService struct {
 	xrayService        XrayService
 	inboundService     InboundService
 	l2tpService        L2tpService
+	pptpService        PptpService
 	cachedIPv4         string
 	cachedIPv6         string
 	noIPv6             bool
@@ -1019,8 +1020,9 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 
 	s.inboundService.MigrateDB()
 
-	// Regenerate L2TP on-disk configs from the imported DB and restart services
+	// Regenerate L2TP/PPTP on-disk configs from the imported DB and restart services
 	s.l2tpService.InitL2tp()
+	s.pptpService.InitPptp()
 
 	// Start Xray
 	if err = s.RestartXrayService(); err != nil {

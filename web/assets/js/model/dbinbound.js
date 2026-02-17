@@ -66,6 +66,10 @@ class DBInbound {
     return this.protocol === Protocols.L2TP;
   }
 
+  get isPptp() {
+    return this.protocol === Protocols.PPTP;
+  }
+
   get address() {
     let address = location.hostname;
     if (!ObjectUtil.isEmpty(this.listen) && this.listen !== "0.0.0.0") {
@@ -128,6 +132,7 @@ class DBInbound {
       case Protocols.VLESS:
       case Protocols.TROJAN:
       case Protocols.L2TP:
+      case Protocols.PPTP:
         return true;
       case Protocols.SHADOWSOCKS:
         return this.toInbound().isSSMultiUser;

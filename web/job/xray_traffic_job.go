@@ -18,6 +18,7 @@ type XrayTrafficJob struct {
 	inboundService  service.InboundService
 	outboundService service.OutboundService
 	l2tpService     service.L2tpService
+	pptpService     service.PptpService
 }
 
 // NewXrayTrafficJob creates a new traffic collection job instance.
@@ -40,13 +41,22 @@ func (j *XrayTrafficJob) Run() {
 		clientTraffics = append(clientTraffics, l2tpTraffics...)
 	}
 
-	err, needRestart0, l2tpDisabledEmails := j.inboundService.AddTraffic(traffics, clientTraffics)
+	// Collect PPTP per-client traffic from iptables accounting and merge
+	if pptpTraffics := j.pptpService.CollectPptpTraffic(); len(pptpTraffics) > 0 {
+		clientTraffics = append(clientTraffics, pptpTraffics...)
+	}
+
+	err, needRestart0, l2tpDisabledEmails, pptpDisabledEmails := j.inboundService.AddTraffic(traffics, clientTraffics)
 	if err != nil {
 		logger.Warning("add inbound traffic failed:", err)
 	}
 	// Enforce limits on L2TP clients (kill sessions, regenerate chap-secrets)
 	if len(l2tpDisabledEmails) > 0 {
 		j.l2tpService.DisableClients(l2tpDisabledEmails)
+	}
+	// Enforce limits on PPTP clients
+	if len(pptpDisabledEmails) > 0 {
+		j.pptpService.DisableClients(pptpDisabledEmails)
 	}
 	err, needRestart1 := j.outboundService.AddTraffic(traffics, clientTraffics)
 	if err != nil {

@@ -1647,6 +1647,7 @@
                             Protocols.TROJAN,
                             Protocols.SHADOWSOCKS,
                             Protocols.L2TP,
+                            Protocols.PPTP,
                         ].includes(inbound.protocol)
                     ) {
                         if (dbInbound.isSS && !to_inbound.isSSMultiUser) {
@@ -2070,6 +2071,7 @@
                     case Protocols.TROJAN:
                     case Protocols.SHADOWSOCKS:
                     case Protocols.L2TP:
+                    case Protocols.PPTP:
                         return clients.findIndex(
                             (item) =>
                                 item &&
@@ -2211,6 +2213,7 @@
                 switch (protocol) {
                     case Protocols.TROJAN:
                     case Protocols.L2TP:
+                    case Protocols.PPTP:
                         return client.password;
                     case Protocols.SHADOWSOCKS:
                         return client.email;

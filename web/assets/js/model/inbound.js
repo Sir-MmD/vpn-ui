@@ -9,6 +9,7 @@ const Protocols = {
   WIREGUARD: "wireguard",
   TUN: "tun",
   L2TP: "l2tp",
+  PPTP: "pptp",
 };
 
 const SSMethods = {
@@ -1213,6 +1214,8 @@ class Inbound extends XrayCommonClass {
         return this.isSSMultiUser ? this.settings.shadowsockses : null;
       case Protocols.L2TP:
         return this.settings.l2tpUsers;
+      case Protocols.PPTP:
+        return this.settings.pptpUsers;
       default:
         return null;
     }
@@ -1998,6 +2001,8 @@ Inbound.Settings = class extends XrayCommonClass {
         return new Inbound.TunSettings(protocol);
       case Protocols.L2TP:
         return new Inbound.L2tpSettings(protocol);
+      case Protocols.PPTP:
+        return new Inbound.PptpSettings(protocol);
       default:
         return null;
     }
@@ -2025,6 +2030,8 @@ Inbound.Settings = class extends XrayCommonClass {
         return Inbound.TunSettings.fromJson(json);
       case Protocols.L2TP:
         return Inbound.L2tpSettings.fromJson(json);
+      case Protocols.PPTP:
+        return Inbound.PptpSettings.fromJson(json);
       default:
         return null;
     }
@@ -2141,6 +2148,152 @@ Inbound.VmessSettings.VMESS = class extends XrayCommonClass {
       this.expiryTime = t.valueOf();
     }
   }
+  get _totalGB() {
+    return NumberFormatter.toFixed(this.totalGB / SizeFormatter.ONE_GB, 2);
+  }
+
+  set _totalGB(gb) {
+    this.totalGB = NumberFormatter.toFixed(gb * SizeFormatter.ONE_GB, 0);
+  }
+};
+
+Inbound.PptpSettings = class extends Inbound.Settings {
+  constructor(
+    protocol,
+    ipRange = "10.1.2.10-10.1.2.50",
+    localIp = "10.1.2.1",
+    dns1 = "8.8.8.8",
+    dns2 = "8.8.4.4",
+    mtu = 1400,
+    pptpUsers = [new Inbound.PptpSettings.PptpUser()],
+  ) {
+    super(protocol);
+    this.ipRange = ipRange;
+    this.localIp = localIp;
+    this.dns1 = dns1;
+    this.dns2 = dns2;
+    this.mtu = mtu;
+    this.pptpUsers = pptpUsers;
+  }
+
+  static fromJson(json = {}) {
+    return new Inbound.PptpSettings(
+      Protocols.PPTP,
+      json.ipRange ?? "10.1.2.10-10.1.2.50",
+      json.localIp ?? "10.1.2.1",
+      json.dns1 ?? "8.8.8.8",
+      json.dns2 ?? "8.8.4.4",
+      json.mtu ?? 1400,
+      Inbound.PptpSettings.PptpUser.fromJson(json.clients),
+    );
+  }
+
+  toJson() {
+    return {
+      ipRange: this.ipRange,
+      localIp: this.localIp,
+      dns1: this.dns1,
+      dns2: this.dns2,
+      mtu: this.mtu,
+      clients: Inbound.PptpSettings.PptpUser.toJsonArray(this.pptpUsers),
+    };
+  }
+};
+
+Inbound.PptpSettings.PptpUser = class extends XrayCommonClass {
+  constructor(
+    id = RandomUtil.randomLowerAndNum(8),
+    password = RandomUtil.randomSeq(10),
+    email = RandomUtil.randomLowerAndNum(9),
+    enable = true,
+    expiryTime = 0,
+    tgId = "",
+    subId = "",
+    comment = "",
+    totalGB = 0,
+    limitIp = 0,
+    reset = 0,
+    created_at = undefined,
+    updated_at = undefined,
+  ) {
+    super();
+    this.id = id;
+    this.password = password;
+    this.email = email;
+    this.enable = enable;
+    this.expiryTime = expiryTime;
+    this.tgId = tgId;
+    this.subId = subId;
+    this.comment = comment;
+    this.totalGB = totalGB;
+    this.limitIp = limitIp;
+    this.reset = reset;
+    this.created_at = created_at;
+    this.updated_at = updated_at;
+  }
+
+  static fromJson(json = []) {
+    if (!Array.isArray(json)) return [new Inbound.PptpSettings.PptpUser()];
+    return json.map(
+      (j) =>
+        new Inbound.PptpSettings.PptpUser(
+          j.id,
+          j.password,
+          j.email,
+          j.enable ?? true,
+          j.expiryTime ?? 0,
+          j.tgId ?? "",
+          j.subId ?? "",
+          j.comment ?? "",
+          j.totalGB ?? 0,
+          j.limitIp ?? j.ipLimit ?? 0,
+          j.reset ?? 0,
+          j.created_at,
+          j.updated_at,
+        ),
+    );
+  }
+
+  static toJsonArray(users) {
+    return users.map((u) => u.toJson());
+  }
+
+  toJson() {
+    return {
+      id: this.id,
+      password: this.password,
+      email: this.email,
+      enable: this.enable,
+      expiryTime: this.expiryTime,
+      tgId: this.tgId,
+      subId: this.subId,
+      comment: this.comment,
+      totalGB: this.totalGB,
+      limitIp: this.limitIp,
+      reset: this.reset,
+      created_at: this.created_at,
+      updated_at: this.updated_at,
+    };
+  }
+
+  get _expiryTime() {
+    if (this.expiryTime === 0 || this.expiryTime === "") {
+      return null;
+    }
+    if (this.expiryTime < 0) {
+      return this.expiryTime / -86400000;
+    }
+    return moment(this.expiryTime);
+  }
+
+  set _expiryTime(t) {
+    if (t == null || t === "") {
+      this.expiryTime = 0;
+    } else {
+      this.expiryTime = t.valueOf();
+    }
+  }
+
   get _totalGB() {
     return NumberFormatter.toFixed(this.totalGB / SizeFormatter.ONE_GB, 2);
   }
