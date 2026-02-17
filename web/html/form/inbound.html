@@ -43,6 +43,12 @@
             :min="1"
             :max="65535"
         ></a-input-number>
+        <span
+            v-if="inbound.protocol === 'l2tp'"
+            :style="{ marginLeft: '8px', color: '#888' }"
+        >
+            Most clients use port 1701
+        </span>
     </a-form-item>
 
     <a-form-item>

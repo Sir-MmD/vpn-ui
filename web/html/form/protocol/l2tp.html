@@ -45,7 +45,17 @@
                 placeholder="pre-shared key"
             ></a-input>
         </a-form-item>
-        <a-form-item label="Allow L2TP Raw (no PSK)">
+        <a-form-item>
+            <template slot="label">
+                <a-tooltip>
+                    <template slot="title">
+                        Allow clients to connect without IPsec encryption (raw
+                        L2TP on port 1701)
+                    </template>
+                    Allow Raw (no PSK)
+                    <a-icon type="question-circle"></a-icon>
+                </a-tooltip>
+            </template>
             <a-switch v-model="inbound.settings.allowRaw"></a-switch>
         </a-form-item>
     </template>
