@@ -2997,7 +2997,10 @@ Inbound.L2tpSettings.L2tpUser = class extends XrayCommonClass {
     subId = "",
     comment = "",
     totalGB = 0,
-    ipLimit = 0,
+    limitIp = 0,
+    reset = 0,
+    created_at = undefined,
+    updated_at = undefined,
   ) {
     super();
     this.id = id;
@@ -3009,7 +3012,10 @@ Inbound.L2tpSettings.L2tpUser = class extends XrayCommonClass {
     this.subId = subId;
     this.comment = comment;
     this.totalGB = totalGB;
-    this.ipLimit = ipLimit;
+    this.limitIp = limitIp;
+    this.reset = reset;
+    this.created_at = created_at;
+    this.updated_at = updated_at;
   }
 
   static fromJson(json = []) {
@@ -3026,7 +3032,10 @@ Inbound.L2tpSettings.L2tpUser = class extends XrayCommonClass {
           j.subId ?? "",
           j.comment ?? "",
           j.totalGB ?? 0,
-          j.ipLimit ?? 0,
+          j.limitIp ?? j.ipLimit ?? 0,
+          j.reset ?? 0,
+          j.created_at,
+          j.updated_at,
         ),
     );
   }
@@ -3046,7 +3055,36 @@ Inbound.L2tpSettings.L2tpUser = class extends XrayCommonClass {
       subId: this.subId,
       comment: this.comment,
       totalGB: this.totalGB,
-      ipLimit: this.ipLimit,
+      limitIp: this.limitIp,
+      reset: this.reset,
+      created_at: this.created_at,
+      updated_at: this.updated_at,
     };
+  }
+
+  get _expiryTime() {
+    if (this.expiryTime === 0 || this.expiryTime === "") {
+      return null;
+    }
+    if (this.expiryTime < 0) {
+      return this.expiryTime / -86400000;
+    }
+    return moment(this.expiryTime);
+  }
+
+  set _expiryTime(t) {
+    if (t == null || t === "") {
+      this.expiryTime = 0;
+    } else {
+      this.expiryTime = t.valueOf();
+    }
+  }
+
+  get _totalGB() {
+    return NumberFormatter.toFixed(this.totalGB / SizeFormatter.ONE_GB, 2);
+  }
+
+  set _totalGB(gb) {
+    this.totalGB = NumberFormatter.toFixed(gb * SizeFormatter.ONE_GB, 0);
   }
 };

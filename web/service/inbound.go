@@ -165,6 +165,41 @@ func (s *InboundService) contains(slice []string, str string) bool {
 	return false
 }
 
+func (s *InboundService) getAllL2tpUsernames() ([]string, error) {
+	db := database.GetDB()
+	var usernames []string
+	err := db.Raw(`
+		SELECT JSON_EXTRACT(client.value, '$.id')
+		FROM inbounds,
+			JSON_EACH(JSON_EXTRACT(inbounds.settings, '$.clients')) AS client
+		WHERE inbounds.protocol = 'l2tp'
+		`).Scan(&usernames).Error
+	if err != nil {
+		return nil, err
+	}
+	return usernames, nil
+}
+
+func (s *InboundService) checkL2tpUsernamesForDuplicates(clients []model.Client) (string, error) {
+	allUsernames, err := s.getAllL2tpUsernames()
+	if err != nil {
+		return "", err
+	}
+	var usernames []string
+	for _, client := range clients {
+		if client.ID != "" {
+			if s.contains(usernames, client.ID) {
+				return client.ID, nil
+			}
+			if s.contains(allUsernames, client.ID) {
+				return client.ID, nil
+			}
+			usernames = append(usernames, client.ID)
+		}
+	}
+	return "", nil
+}
+
 func (s *InboundService) checkEmailsExistForClients(clients []model.Client) (string, error) {
 	allEmails, err := s.getAllEmails()
 	if err != nil {
@@ -274,6 +309,17 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 			if client.ID == "" {
 				return inbound, false, common.NewError("empty client ID")
 			}
+		}
+	}
+
+	// Check for duplicate L2TP usernames
+	if inbound.Protocol == "l2tp" {
+		dupUser, err := s.checkL2tpUsernamesForDuplicates(clients)
+		if err != nil {
+			return inbound, false, err
+		}
+		if dupUser != "" {
+			return inbound, false, common.NewError("Duplicate L2TP username:", dupUser)
 		}
 	}
 
@@ -613,6 +659,17 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 		}
 	}
 
+	// Check for duplicate L2TP usernames
+	if oldInbound.Protocol == "l2tp" {
+		dupUser, err := s.checkL2tpUsernamesForDuplicates(clients)
+		if err != nil {
+			return false, err
+		}
+		if dupUser != "" {
+			return false, common.NewError("Duplicate L2TP username:", dupUser)
+		}
+	}
+
 	var oldSettings map[string]any
 	err = json.Unmarshal([]byte(oldInbound.Settings), &oldSettings)
 	if err != nil {
@@ -827,6 +884,21 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 		}
 	}
 
+	// Check for duplicate L2TP usernames (allow keeping the same username)
+	if oldInbound.Protocol == "l2tp" {
+		oldUsername := oldClients[clientIndex].ID
+		newUsername := clients[0].ID
+		if newUsername != oldUsername {
+			dupUser, err := s.checkL2tpUsernamesForDuplicates(clients)
+			if err != nil {
+				return false, err
+			}
+			if dupUser != "" {
+				return false, common.NewError("Duplicate L2TP username:", dupUser)
+			}
+		}
+	}
+
 	var oldSettings map[string]any
 	err = json.Unmarshal([]byte(oldInbound.Settings), &oldSettings)
 	if err != nil {
@@ -939,7 +1011,7 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 	return needRestart, tx.Save(oldInbound).Error
 }
 
-func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraffics []*xray.ClientTraffic) (error, bool) {
+func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraffics []*xray.ClientTraffic) (error, bool, []string) {
 	var err error
 	db := database.GetDB()
 	tx := db.Begin()
@@ -953,11 +1025,11 @@ func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraff
 	}()
 	err = s.addInboundTraffic(tx, inboundTraffics)
 	if err != nil {
-		return err, false
+		return err, false, nil
 	}
 	err = s.addClientTraffic(tx, clientTraffics)
 	if err != nil {
-		return err, false
+		return err, false, nil
 	}
 
 	needRestart0, count, err := s.autoRenewClients(tx)
@@ -967,7 +1039,7 @@ func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraff
 		logger.Debugf("%v clients renewed", count)
 	}
 
-	needRestart1, count, err := s.disableInvalidClients(tx)
+	needRestart1, count, l2tpDisabledEmails, err := s.disableInvalidClients(tx)
 	if err != nil {
 		logger.Warning("Error in disabling invalid clients:", err)
 	} else if count > 0 {
@@ -980,7 +1052,7 @@ func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraff
 	} else if count > 0 {
 		logger.Debugf("%v inbounds disabled", count)
 	}
-	return nil, (needRestart0 || needRestart1 || needRestart2)
+	return nil, (needRestart0 || needRestart1 || needRestart2), l2tpDisabledEmails
 }
 
 func (s *InboundService) addInboundTraffic(tx *gorm.DB, traffics []*xray.Traffic) error {
@@ -1253,26 +1325,32 @@ func (s *InboundService) disableInvalidInbounds(tx *gorm.DB) (bool, int64, error
 	return needRestart, count, err
 }
 
-func (s *InboundService) disableInvalidClients(tx *gorm.DB) (bool, int64, error) {
+func (s *InboundService) disableInvalidClients(tx *gorm.DB) (bool, int64, []string, error) {
 	now := time.Now().Unix() * 1000
 	needRestart := false
+	var l2tpDisabledEmails []string
 
 	if p != nil {
 		var results []struct {
-			Tag   string
-			Email string
+			Tag      string
+			Email    string
+			Protocol string
 		}
 
 		err := tx.Table("inbounds").
-			Select("inbounds.tag, client_traffics.email").
+			Select("inbounds.tag, inbounds.protocol, client_traffics.email").
 			Joins("JOIN client_traffics ON inbounds.id = client_traffics.inbound_id").
 			Where("((client_traffics.total > 0 AND client_traffics.up + client_traffics.down >= client_traffics.total) OR (client_traffics.expiry_time > 0 AND client_traffics.expiry_time <= ?)) AND client_traffics.enable = ?", now, true).
 			Scan(&results).Error
 		if err != nil {
-			return false, 0, err
+			return false, 0, nil, err
 		}
 		s.xrayApi.Init(p.GetAPIPort())
 		for _, result := range results {
+			if result.Protocol == "l2tp" {
+				l2tpDisabledEmails = append(l2tpDisabledEmails, result.Email)
+				continue
+			}
 			err1 := s.xrayApi.RemoveUser(result.Tag, result.Email)
 			if err1 == nil {
 				logger.Debug("Client disabled by api:", result.Email)
@@ -1296,7 +1374,7 @@ func (s *InboundService) disableInvalidClients(tx *gorm.DB) (bool, int64, error)
 		Update("enable", false)
 	err := result.Error
 	count := result.RowsAffected
-	return needRestart, count, err
+	return needRestart, count, l2tpDisabledEmails, err
 }
 
 func (s *InboundService) GetInboundTags() (string, error) {

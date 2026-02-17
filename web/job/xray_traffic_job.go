@@ -40,9 +40,13 @@ func (j *XrayTrafficJob) Run() {
 		clientTraffics = append(clientTraffics, l2tpTraffics...)
 	}
 
-	err, needRestart0 := j.inboundService.AddTraffic(traffics, clientTraffics)
+	err, needRestart0, l2tpDisabledEmails := j.inboundService.AddTraffic(traffics, clientTraffics)
 	if err != nil {
 		logger.Warning("add inbound traffic failed:", err)
+	}
+	// Enforce limits on L2TP clients (kill sessions, regenerate chap-secrets)
+	if len(l2tpDisabledEmails) > 0 {
+		j.l2tpService.DisableClients(l2tpDisabledEmails)
 	}
 	err, needRestart1 := j.outboundService.AddTraffic(traffics, clientTraffics)
 	if err != nil {

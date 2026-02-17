@@ -355,6 +355,7 @@ func (a *InboundController) resetClientTraffic(c *gin.Context) {
 	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
+	a.onL2tpChanged()
 }
 
 // resetAllTraffics resets all traffic counters across all inbounds.
@@ -367,6 +368,7 @@ func (a *InboundController) resetAllTraffics(c *gin.Context) {
 		a.xrayService.SetToNeedRestart()
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetAllTrafficSuccess"), nil)
+	a.onL2tpChanged()
 }
 
 // resetAllClientTraffics resets traffic counters for all clients in a specific inbound.
@@ -385,6 +387,7 @@ func (a *InboundController) resetAllClientTraffics(c *gin.Context) {
 		a.xrayService.SetToNeedRestart()
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetAllClientTrafficSuccess"), nil)
+	a.onL2tpChanged()
 }
 
 // importInbound imports an inbound configuration from provided data.
