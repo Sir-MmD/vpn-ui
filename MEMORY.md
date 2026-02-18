@@ -231,11 +231,19 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
 - **Root cause**: xl2tpd listens on `0.0.0.0:1701` regardless of IPsec config. The `allowRaw` toggle only affected ipsec.conf `leftprotoport`/`forceencaps`, but didn't prevent direct UDP connections to xl2tpd.
 - **Fix**: New `SetupRawL2tpFilter()` method in `web/service/l2tp.go`. When `allowRaw=false`, adds: `iptables -I INPUT 1 -p udp --dport 1701 -m policy --dir in --pol none -j DROP`. The `-m policy --pol none` match drops packets that didn't arrive through IPsec. When `allowRaw=true`, rule is removed. Called from `GenerateAllConfigs()`.
 
+### Windows 10 L2TP PSK: xl2tpd require-chap conflict (commit bcbf085f)
+- **Root cause**: `GenerateXl2tpdConfig()` in `web/service/l2tp.go` wrote `require chap = yes` in xl2tpd.conf `[lns]` section. xl2tpd passes LNS options as pppd command-line args (`refuse-pap auth require-chap`), which took effect BEFORE the PPP options file (`refuse-chap` + `require-mschap-v2`). The `require-chap` from command line caused pppd to request plain CHAP auth from clients. Windows L2TP/IPsec expects MSCHAPv2 and may reject or have issues with plain CHAP.
+- **Fix**: Removed `require chap = yes` from xl2tpd.conf generation. Now xl2tpd only passes `refuse-pap auth` on the pppd command line, allowing the PPP options file's `require-mschap-v2` to take effect. Also added `flow bit = yes` for proper L2TP flow control.
+- **Verified**: pppd debug log confirms server now requests `<auth chap MS-v2>` in LCP ConfReq (MSCHAPv2), not plain CHAP.
+- **Key discovery**: pppd logs "Peer X authenticated with CHAP" even for MSCHAPv2 — the log message is generic for all CHAP variants.
+
 ### Key pattern reinforced
 - `DelInboundClient()` must use `password` as client_key for trojan/l2tp/pptp protocols (not `id`)
 - TPROXY dokodemo-door must listen on `0.0.0.0` (not `127.0.0.1`) for TPROXY to work
 - L2TP PPP options must NOT include `lock` (incompatible with pppol2tp kernel plugin)
 - IPsec `forceencaps=yes` is required for Windows/NAT compatibility — always enable it
+- xl2tpd.conf must NOT have `require chap = yes` — it overrides PPP options file auth settings
+- xl2tpd passes LNS section auth options as pppd command-line args, which have higher priority than options file
 
 ## L2TP Enforcement Architecture
 - Traffic/expiry limits detected by `disableInvalidClients()` in inbound.go (same SQL for all protocols)
