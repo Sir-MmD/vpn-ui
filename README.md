@@ -1,8 +1,8 @@
-# VPN-UI (3x-ui + L2TP/IPsec)
+# VPN-UI (3x-ui + L2TP/IPsec + PPTP)
 
-A fork of [3x-ui](https://github.com/MHSanaei/3x-ui) that adds **L2TP/IPsec** as a first-class inbound protocol alongside the existing Xray protocols (VMess, VLESS, Trojan, Shadowsocks, etc.).
+A fork of [3x-ui](https://github.com/MHSanaei/3x-ui) that adds **L2TP/IPsec** and **PPTP** as first-class inbound protocols alongside the existing Xray protocols (VMess, VLESS, Trojan, Shadowsocks, etc.).
 
-L2TP/IPsec clients are managed through the same panel UI, their traffic is routed through Xray's routing engine, and per-client traffic is tracked and displayed in real time.
+L2TP/IPsec and PPTP clients are managed through the same panel UI, their traffic is routed through Xray's routing engine, and per-client traffic is tracked and displayed in real time.
 
 ## What's New
 
@@ -15,31 +15,44 @@ L2TP/IPsec clients are managed through the same panel UI, their traffic is route
 - **Client management** — Traffic limits, expiry dates, enable/disable, IP limits — same as any other protocol
 - **Real-time stats** — Traffic counters update every 10 seconds, online status displayed in the UI
 
+### PPTP Protocol Support
+
+- **Full panel integration** — Create PPTP inbounds from the protocol dropdown, same UI as L2TP
+- **No IPsec** — PPTP uses MPPE encryption (MSCHAPv2 + 128-bit MPPE), no IPsec/PSK needed
+- **Xray routing** — Same TPROXY + dokodemo-door bridge as L2TP
+- **Per-client traffic tracking** — Same iptables accounting mechanism via `PPTP_ACCT` chain
+- **Client management** — Traffic limits, expiry dates, enable/disable, bulk creation — same as L2TP
+- **Shared chap-secrets** — Both L2TP and PPTP write to `/etc/ppp/chap-secrets`, distinguished by server name (`l2tp-{id}` vs `pptp-{id}`)
+- **Separate subnets** — PPTP uses `10.1.x.0/24` (L2TP uses `10.0.x.0/24`)
+
 ### How It Works
 
-L2TP is not a native Xray protocol, so a bridge architecture routes L2TP traffic through Xray:
+L2TP and PPTP are not native Xray protocols, so a bridge architecture routes their traffic through Xray:
 
 ```
-L2TP Client
-    |
-    | (UDP 1701, encrypted with IPsec)
-    v
-strongSwan (IPsec) --> xl2tpd --> pppd --> PPP interface (10.0.x.0/24)
-                                              |
-                                              | iptables TPROXY (mangle)
-                                              v
-                                    Xray dokodemo-door (port 123xx)
-                                              |
-                                              v
-                                    Xray Routing Engine
-                                              |
-                                    +---------+---------+
-                                    |         |         |
-                                  Direct   Proxy    Block
+L2TP Client                              PPTP Client
+    |                                        |
+    | (UDP 1701, encrypted with IPsec)       | (TCP 1723 + GRE)
+    v                                        v
+strongSwan (IPsec)                        pptpd
+    |                                        |
+    v                                        v
+xl2tpd --> pppd --> PPP (10.0.x.0/24)    pppd --> PPP (10.1.x.0/24)
+                        |                              |
+                        | iptables TPROXY (mangle)     |
+                        v                              v
+              Xray dokodemo-door (port 123xx)
+                        |
+                        v
+              Xray Routing Engine
+                        |
+              +---------+---------+
+              |         |         |
+            Direct   Proxy    Block
 ```
 
-Each L2TP inbound automatically gets:
-- A PPP subnet derived from the configured Local IP (e.g., `10.0.2.0/24`)
+Each L2TP/PPTP inbound automatically gets:
+- A PPP subnet derived from the configured Local IP (e.g., `10.0.2.0/24` for L2TP, `10.1.2.0/24` for PPTP)
 - A TPROXY port (`12300 + inbound ID`)
 - A paired dokodemo-door inbound in the Xray config with the same tag
 - iptables rules to redirect PPP traffic to Xray
@@ -49,18 +62,18 @@ Each L2TP inbound automatically gets:
 
 Since Xray's dokodemo-door sees all PPP traffic as a single stream without user identity, a separate mechanism tracks per-client traffic:
 
-1. **pppd ip-up hook** — When a user authenticates via CHAP, pppd runs `/etc/ppp/ip-up.d/l2tp-acct` which:
-   - Looks up the user's email from `/etc/x-ui/l2tp-usermap`
-   - Records `email IP interface` in `/etc/x-ui/l2tp-sessions`
-   - Adds per-IP iptables accounting rules in the `L2TP_ACCT` chain
+1. **pppd ip-up hook** — When a user authenticates via CHAP, pppd runs the protocol's ip-up script which:
+   - Looks up the user's email from the usermap file
+   - Records `email IP interface` in the sessions file
+   - Adds per-IP iptables accounting rules in the accounting chain (`L2TP_ACCT` or `PPTP_ACCT`)
 
-2. **Traffic collection** — Every 10 seconds, `XrayTrafficJob` calls `CollectL2tpTraffic()` which:
+2. **Traffic collection** — Every 10 seconds, `XrayTrafficJob` calls `CollectL2tpTraffic()` and `CollectPptpTraffic()` which:
    - Reads the sessions file to map IPs to client emails
-   - Reads iptables byte counters from the `L2TP_ACCT` chain
+   - Reads iptables byte counters from the accounting chain
    - Zeros the counters after reading
    - Returns per-client traffic deltas that feed into the existing traffic pipeline
 
-3. **pppd ip-down hook** — When a user disconnects, `/etc/ppp/ip-down.d/l2tp-acct` removes their session entry
+3. **pppd ip-down hook** — When a user disconnects, the ip-down script removes their session entry
 
 ## Architecture Diagram
 
@@ -68,15 +81,19 @@ Open [`docs/architecture.html`](docs/architecture.html) in a browser to see an i
 
 ## Prerequisites
 
-The L2TP integration requires the following packages on the server:
+The L2TP and PPTP integrations require the following packages on the server:
 
 ```bash
 # Debian/Ubuntu
-apt install xl2tpd ppp strongswan
+apt install xl2tpd ppp strongswan    # for L2TP/IPsec
+apt install pptpd                     # for PPTP
 
-# The kernel must have PPP modules (l2tp_ppp, ppp_generic)
+# The kernel must have PPP modules (l2tp_ppp, ppp_generic, ppp_mppe)
 # Cloud kernels (e.g., Hetzner) may lack these — install the full kernel:
 apt install linux-image-amd64
+
+# PPTP also needs these kernel modules (loaded automatically):
+# nf_conntrack_pptp, ip_gre, ppp_mppe
 ```
 
 ## Installation
@@ -152,65 +169,109 @@ Users can connect with any L2TP/IPsec client (Windows, macOS, iOS, Android, Linu
 - **Pre-Shared Key**: The IPsec PSK from the inbound settings
 - **Type**: L2TP/IPsec PSK
 
+### Creating a PPTP Inbound
+
+1. Open the panel at `http://your-server:2053`
+2. Click **Add Inbound**
+3. Select **pptp** from the Protocol dropdown
+4. Configure:
+   - **Port**: `1723` (standard PPTP)
+   - **IP Range**: Client IP pool (e.g., `10.1.2.10-10.1.2.50`)
+   - **Local IP**: Server-side tunnel IP (e.g., `10.1.2.1`)
+   - **DNS 1/2**: DNS servers pushed to clients
+   - **MTU**: Typically `1400` for PPTP
+5. Click **Add** to save
+
+### Managing PPTP Users
+
+Same as L2TP — click the **+** button on the PPTP inbound row, set Username, Password, Email, and optional limits. Bulk client creation is also supported.
+
+Users can connect with any PPTP client using:
+- **Server**: Your server's IP address
+- **Username/Password**: As configured in the panel
+- **Type**: PPTP (no PSK needed)
+
 ### Applying Xray Routing Rules
 
-L2TP traffic flows through Xray's routing engine. The L2TP inbound's **tag** (e.g., `inbound-1701`) can be used in routing rules:
+L2TP and PPTP traffic flows through Xray's routing engine. The inbound's **tag** (e.g., `inbound-1701` for L2TP, `inbound-1723` for PPTP) can be used in routing rules:
 
 ```json
 {
-  "inboundTag": ["inbound-1701"],
+  "inboundTag": ["inbound-1701", "inbound-1723"],
   "outboundTag": "block",
   "domain": ["geosite:category-ads"]
 }
 ```
 
-This blocks ads for all L2TP clients, just as it would for any Xray protocol.
+This blocks ads for all L2TP and PPTP clients, just as it would for any Xray protocol.
 
 ## Files Modified
 
-### Backend (Go) — 8 files modified, 1 new
+### Backend (Go) — 9 files modified, 2 new
 
 | File | Change |
 |------|--------|
-| `database/model/model.go` | `L2TP` protocol constant |
+| `database/model/model.go` | `L2TP` and `PPTP` protocol constants |
 | `web/service/l2tp.go` | **New** — L2TP service: config generation, TPROXY, traffic accounting |
-| `web/service/xray.go` | Skip L2TP inbounds + inject dokodemo-door |
-| `web/service/inbound.go` | Client-key switches for L2TP (password-based, like Trojan) |
-| `web/controller/inbound.go` | CRUD hooks trigger L2TP config regeneration |
-| `web/web.go` | L2TP initialization on startup |
-| `web/service/tgbot.go` | Exclude L2TP from Telegram bot protocol handling |
-| `web/job/xray_traffic_job.go` | Merge L2TP per-client traffic into collection pipeline |
+| `web/service/pptp.go` | **New** — PPTP service: mirrors L2TP without IPsec |
+| `web/service/xray.go` | Skip L2TP/PPTP inbounds + inject dokodemo-door |
+| `web/service/inbound.go` | Client-key switches for L2TP/PPTP (password-based, like Trojan) |
+| `web/service/server.go` | DB import restores L2TP + PPTP configs |
+| `web/controller/inbound.go` | CRUD hooks trigger L2TP/PPTP config regeneration |
+| `web/web.go` | L2TP + PPTP initialization on startup |
+| `web/service/tgbot.go` | Exclude L2TP/PPTP from Telegram bot protocol handling |
+| `web/job/xray_traffic_job.go` | Merge L2TP + PPTP per-client traffic into collection pipeline |
 
 ### Frontend (JS) — 2 files modified
 
 | File | Change |
 |------|--------|
-| `web/assets/js/model/inbound.js` | `L2tpSettings` class, `L2tpUser` class, protocol constants |
-| `web/assets/js/model/dbinbound.js` | `isL2tp` getter, multi-user support |
+| `web/assets/js/model/inbound.js` | `L2tpSettings`, `L2tpUser`, `PptpSettings`, `PptpUser` classes |
+| `web/assets/js/model/dbinbound.js` | `isL2tp`, `isPptp` getters, multi-user support |
 
-### Frontend (HTML) — 5 files modified, 1 new
+### Frontend (HTML) — 6 files modified, 2 new
 
 | File | Change |
 |------|--------|
 | `web/html/form/protocol/l2tp.html` | **New** — L2TP settings form (IPsec, IP range, DNS, MTU) |
-| `web/html/form/inbound.html` | Include L2TP form template |
-| `web/html/form/client.html` | Username + password fields for L2TP clients |
-| `web/html/inbounds.html` | Client identification for L2TP |
-| `web/html/modals/client_modal.html` | Client add/edit for L2TP |
+| `web/html/form/protocol/pptp.html` | **New** — PPTP settings form (IP range, DNS, MTU) |
+| `web/html/form/inbound.html` | Include L2TP + PPTP form templates |
+| `web/html/form/client.html` | Username + password fields for L2TP/PPTP clients |
+| `web/html/inbounds.html` | Client identification for L2TP/PPTP |
+| `web/html/modals/client_modal.html` | Client add/edit for L2TP/PPTP |
+| `web/html/modals/client_bulk_modal.html` | Bulk client creation for L2TP/PPTP |
 
 ### Generated Config Files (on server at runtime)
+
+#### L2TP
 
 | File | Purpose |
 |------|---------|
 | `/etc/xl2tpd/xl2tpd.conf` | xl2tpd LNS configuration |
 | `/etc/ppp/options.xl2tpd-<id>` | Per-inbound PPP options |
-| `/etc/ppp/chap-secrets` | L2TP user credentials |
 | `/etc/ipsec.conf` | IPsec connection definitions |
 | `/etc/ipsec.secrets` | IPsec pre-shared keys |
 | `/etc/x-ui/l2tp-usermap` | Username-to-email mapping |
 | `/etc/x-ui/l2tp-sessions` | Active session tracking |
 | `/etc/ppp/ip-up.d/l2tp-acct` | Session start hook |
 | `/etc/ppp/ip-down.d/l2tp-acct` | Session end hook |
+
+#### PPTP
+
+| File | Purpose |
+|------|---------|
+| `/etc/pptpd.conf` | pptpd configuration |
+| `/etc/ppp/pptpd-options-<id>` | Per-inbound PPP options |
+| `/etc/x-ui/pptp-usermap` | Username-to-email mapping |
+| `/etc/x-ui/pptp-sessions` | Active session tracking |
+| `/etc/ppp/ip-up.d/pptp-acct` | Session start hook |
+| `/etc/ppp/ip-down.d/pptp-acct` | Session end hook |
+
+#### Shared
+
+| File | Purpose |
+|------|---------|
+| `/etc/ppp/chap-secrets` | L2TP + PPTP user credentials (shared file) |
 
 ## Upstream
 
