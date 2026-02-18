@@ -747,7 +747,7 @@ func (s *InboundService) DelInboundClient(inboundId int, clientId string) (bool,
 
 	email := ""
 	client_key := "id"
-	if oldInbound.Protocol == "trojan" || oldInbound.Protocol == "l2tp" {
+	if oldInbound.Protocol == "trojan" || oldInbound.Protocol == "l2tp" || oldInbound.Protocol == "pptp" {
 		client_key = "password"
 	}
 	if oldInbound.Protocol == "shadowsocks" {

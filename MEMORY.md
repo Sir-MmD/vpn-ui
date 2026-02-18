@@ -3,7 +3,7 @@
 ## Meta
 - Memory location: /home/mmd/work/vpn-ui/MEMORY.md
 - Rule: Update this file after every significant step or discovery
-- Last updated: 2026-02-17
+- Last updated: 2026-02-18
 - Branch: mmd (main branch: main)
 
 ## Project Identity
@@ -196,7 +196,46 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
 - Enhanced telego client robustness and retries
 - Timeouts and delays for backup sends
 - Go 1.26 bump
-- Version: 2.8.11
+- Version: 2.8.12
+
+## Recent Bug Fixes & Improvements (2026-02-18)
+
+### PPTP client deletion broken
+- **Root cause**: `DelInboundClient()` in `web/service/inbound.go:750` used `client_key = "password"` for trojan/l2tp but missed pptp. Defaulted to `"id"`, so the lookup never matched and deletion silently failed.
+- **Fix**: Added `|| oldInbound.Protocol == "pptp"` to the condition.
+
+### PPTP dokodemo-door listen address
+- **Root cause**: `GetDokodemoConfig()` in `web/service/pptp.go` had `Listen: "127.0.0.1"` while L2TP correctly used `"0.0.0.0"`. TPROXY-redirected traffic from PPP interfaces can't reach localhost.
+- **Fix**: Changed to `"0.0.0.0"`.
+
+### Wide cipher/encryption support (PPTP + L2TP)
+- **PPTP PPP options** (`web/service/pptp.go` `GeneratePPPOptions`):
+  - Removed `refuse-mschap` (allows MSCHAPv1 fallback for older clients)
+  - Changed `require-mppe-128` → `require-mppe` (accepts 40/56/128-bit)
+  - Removed `nobsdcomp`, `novj`, `novjccomp` (allows compression negotiation)
+- **L2TP PPP options** (`web/service/l2tp.go` `GeneratePPPOptions`):
+  - Added `refuse-pap`, `refuse-chap` (blocks plaintext auth)
+  - Removed `debug` (noisy in production)
+  - No MPPE required (IPsec provides encryption; MPPE breaks `noccp` clients like macOS)
+  - Note: `lock` option is invalid for pppol2tp (kernel L2TP plugin), removed
+- **L2TP IPsec ciphers** (`web/service/l2tp.go` `GenerateIPsecConfig`):
+  - Removed `!` strict flag
+  - IKE: AES256/128 × SHA256/SHA1 × modp2048/1024, plus 3DES-SHA1 (Windows 7, old Android)
+  - ESP: AES256/128 × SHA256/SHA1, plus 3DES-SHA1
+
+### Windows 10 L2TP connection stuck
+- **Root cause**: `forceencaps=yes` was only set when `allowRaw=true`. Windows 10 (and most clients behind NAT) requires NAT-T (UDP/4500 encapsulation). Without it, server expects raw ESP which fails for NAT'd clients.
+- **Fix**: Always use `forceencaps=yes` and `leftprotoport=17/%any` regardless of allowRaw.
+
+### allowRaw=false not enforced (raw L2TP without PSK still worked)
+- **Root cause**: xl2tpd listens on `0.0.0.0:1701` regardless of IPsec config. The `allowRaw` toggle only affected ipsec.conf `leftprotoport`/`forceencaps`, but didn't prevent direct UDP connections to xl2tpd.
+- **Fix**: New `SetupRawL2tpFilter()` method in `web/service/l2tp.go`. When `allowRaw=false`, adds: `iptables -I INPUT 1 -p udp --dport 1701 -m policy --dir in --pol none -j DROP`. The `-m policy --pol none` match drops packets that didn't arrive through IPsec. When `allowRaw=true`, rule is removed. Called from `GenerateAllConfigs()`.
+
+### Key pattern reinforced
+- `DelInboundClient()` must use `password` as client_key for trojan/l2tp/pptp protocols (not `id`)
+- TPROXY dokodemo-door must listen on `0.0.0.0` (not `127.0.0.1`) for TPROXY to work
+- L2TP PPP options must NOT include `lock` (incompatible with pppol2tp kernel plugin)
+- IPsec `forceencaps=yes` is required for Windows/NAT compatibility — always enable it
 
 ## L2TP Enforcement Architecture
 - Traffic/expiry limits detected by `disableInvalidClients()` in inbound.go (same SQL for all protocols)

@@ -137,7 +137,42 @@ func (s *L2tpService) GenerateAllConfigs() error {
 		return err
 	}
 
+	s.SetupRawL2tpFilter(inbounds)
+
 	return nil
+}
+
+// SetupRawL2tpFilter manages an iptables rule to block direct (non-IPsec) L2TP connections.
+// When allowRaw is false for all IPsec-enabled inbounds, we drop UDP/1701 from external
+// sources that didn't arrive via IPsec (i.e. not from the decapsulated ESP path).
+// The iptables policy module marks IPsec-decapsulated packets, so we use -m policy
+// to distinguish them from raw UDP.
+func (s *L2tpService) SetupRawL2tpFilter(inbounds []*model.Inbound) {
+	// Determine if any inbound allows raw L2TP
+	allowRaw := false
+	hasIpsec := false
+	for _, inbound := range inbounds {
+		settings, err := s.parseSettings(inbound)
+		if err != nil {
+			continue
+		}
+		if settings.IpsecEnable {
+			hasIpsec = true
+			if settings.AllowRaw {
+				allowRaw = true
+			}
+		}
+	}
+
+	// Always remove the old rule first (idempotent)
+	s.runCmd("iptables", "-D", "INPUT", "-p", "udp", "--dport", "1701",
+		"-m", "policy", "--dir", "in", "--pol", "none", "-j", "DROP")
+
+	// If IPsec is enabled and raw is NOT allowed, block non-IPsec L2TP
+	if hasIpsec && !allowRaw {
+		s.runCmd("iptables", "-I", "INPUT", "1", "-p", "udp", "--dport", "1701",
+			"-m", "policy", "--dir", "in", "--pol", "none", "-j", "DROP")
+	}
 }
 
 // GenerateXl2tpdConfig writes /etc/xl2tpd/xl2tpd.conf with one [lns] section per L2TP inbound.
@@ -198,12 +233,13 @@ func (s *L2tpService) GeneratePPPOptions(inbound *model.Inbound) error {
 	}
 
 	var b strings.Builder
+	b.WriteString(fmt.Sprintf("name l2tp-%d\n", inbound.Id))
+	b.WriteString("refuse-pap\n")
+	b.WriteString("refuse-chap\n")
 	b.WriteString("require-mschap-v2\n")
 	b.WriteString(fmt.Sprintf("ms-dns %s\n", dns1))
 	b.WriteString(fmt.Sprintf("ms-dns %s\n", dns2))
 	b.WriteString("auth\n")
-	b.WriteString("debug\n")
-	b.WriteString(fmt.Sprintf("name l2tp-%d\n", inbound.Id))
 	b.WriteString("proxyarp\n")
 	b.WriteString("lcp-echo-interval 30\n")
 	b.WriteString("lcp-echo-failure 4\n")
@@ -280,7 +316,6 @@ func (s *L2tpService) GenerateChapSecrets(inbounds []*model.Inbound) error {
 // GenerateIPsecConfig writes /etc/ipsec.conf and /etc/ipsec.secrets for L2TP/IPsec.
 func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 	hasIpsec := false
-	allowRaw := false
 	var psks []string
 
 	for _, inbound := range inbounds {
@@ -291,9 +326,6 @@ func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 		if settings.IpsecEnable && settings.IpsecPsk != "" {
 			hasIpsec = true
 			psks = append(psks, settings.IpsecPsk)
-			if settings.AllowRaw {
-				allowRaw = true
-			}
 		}
 	}
 
@@ -316,22 +348,15 @@ func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 	b.WriteString("    keylife=1h\n")
 	b.WriteString("    type=transport\n")
 	b.WriteString("    left=%defaultroute\n")
-	if allowRaw {
-		// Use NAT-T (UDP/4500) for IPsec, leaving port 1701 open for raw L2TP
-		b.WriteString("    leftprotoport=17/%any\n")
-		b.WriteString("    right=%any\n")
-		b.WriteString("    rightprotoport=17/%any\n")
-		b.WriteString("    forceencaps=yes\n")
-	} else {
-		b.WriteString("    leftprotoport=17/1701\n")
-		b.WriteString("    right=%any\n")
-		b.WriteString("    rightprotoport=17/%any\n")
-	}
+	b.WriteString("    leftprotoport=17/%any\n")
+	b.WriteString("    right=%any\n")
+	b.WriteString("    rightprotoport=17/%any\n")
+	b.WriteString("    forceencaps=yes\n")
 	b.WriteString("    dpddelay=30\n")
 	b.WriteString("    dpdtimeout=120\n")
 	b.WriteString("    dpdaction=clear\n")
-	b.WriteString("    ike=aes256-sha256-modp2048,aes128-sha1-modp2048!\n")
-	b.WriteString("    esp=aes256-sha256,aes128-sha1!\n")
+	b.WriteString("    ike=aes256-sha256-modp2048,aes256-sha1-modp2048,aes128-sha256-modp2048,aes128-sha1-modp2048,aes256-sha256-modp1024,aes128-sha1-modp1024,3des-sha1-modp2048,3des-sha1-modp1024\n")
+	b.WriteString("    esp=aes256-sha256,aes256-sha1,aes128-sha256,aes128-sha1,3des-sha1\n")
 
 	if err := s.writeFile("/etc/ipsec.conf", b.String()); err != nil {
 		return err

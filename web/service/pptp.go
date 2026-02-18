@@ -85,7 +85,7 @@ func (s *PptpService) GetDokodemoConfig(inbound *model.Inbound) *xray.InboundCon
 	sniffing := `{"enabled":true,"destOverride":["http","tls"]}`
 
 	return &xray.InboundConfig{
-		Listen:         json_util.RawMessage(`"127.0.0.1"`),
+		Listen:         json_util.RawMessage(`"0.0.0.0"`),
 		Port:           port,
 		Protocol:       "dokodemo-door",
 		Settings:       json_util.RawMessage(settings),
@@ -193,17 +193,13 @@ func (s *PptpService) GeneratePPPOptions(inbound *model.Inbound) error {
 	b.WriteString(fmt.Sprintf("name pptp-%d\n", inbound.Id))
 	b.WriteString("refuse-pap\n")
 	b.WriteString("refuse-chap\n")
-	b.WriteString("refuse-mschap\n")
 	b.WriteString("require-mschap-v2\n")
-	b.WriteString("require-mppe-128\n")
+	b.WriteString("require-mppe\n")
 	b.WriteString(fmt.Sprintf("ms-dns %s\n", dns1))
 	b.WriteString(fmt.Sprintf("ms-dns %s\n", dns2))
 	b.WriteString("proxyarp\n")
 	b.WriteString("nodefaultroute\n")
 	b.WriteString("lock\n")
-	b.WriteString("nobsdcomp\n")
-	b.WriteString("novj\n")
-	b.WriteString("novjccomp\n")
 	b.WriteString("nologfd\n")
 	b.WriteString("lcp-echo-interval 30\n")
 	b.WriteString("lcp-echo-failure 4\n")
