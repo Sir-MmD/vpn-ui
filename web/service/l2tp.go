@@ -201,12 +201,12 @@ func (s *L2tpService) GenerateXl2tpdConfig(inbounds []*model.Inbound) error {
 		b.WriteString("[lns default]\n")
 		b.WriteString(fmt.Sprintf("ip range = %s\n", ipRange))
 		b.WriteString(fmt.Sprintf("local ip = %s\n", localIp))
-		b.WriteString("require chap = yes\n")
 		b.WriteString("refuse pap = yes\n")
 		b.WriteString("require authentication = yes\n")
 		b.WriteString(fmt.Sprintf("name = l2tp-%d\n", inbound.Id))
 		b.WriteString(fmt.Sprintf("pppoptfile = /etc/ppp/options.xl2tpd-%d\n", inbound.Id))
-		b.WriteString("length bit = yes\n\n")
+		b.WriteString("length bit = yes\n")
+		b.WriteString("flow bit = yes\n\n")
 	}
 
 	return s.writeFile("/etc/xl2tpd/xl2tpd.conf", b.String())
