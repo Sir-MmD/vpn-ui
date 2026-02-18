@@ -280,30 +280,49 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
 - pppd logs "Peer X authenticated with CHAP" even for MSCHAPv2 — generic log message
 - Windows registry `AssumeUDPEncapsulationContextOnSendRule=2` needed for NAT-T L2TP
 
-## L2TP Enforcement Architecture
-- Traffic/expiry limits detected by `disableInvalidClients()` in inbound.go (same SQL for all protocols)
-- For L2TP clients: `disableInvalidClients` returns their emails separately (skips useless `RemoveUser` call)
-- `AddTraffic` propagates L2TP disabled emails to caller
-- `XrayTrafficJob.Run()` calls `l2tpService.DisableClients(emails)` which:
-  1. Kills active PPP sessions (via /var/run/pppX.pid)
-  2. Regenerates chap-secrets (excludes disabled clients via `getDisabledEmails()` DB check)
-  3. Regenerates usermap (same exclusion)
-- `GenerateChapSecrets` and `GenerateUserMap` cross-check `client_traffics.enable` (not just JSON `Enable`)
-- Controller reset methods (`resetClientTraffic`, `resetAllTraffics`, `resetAllClientTraffics`) call `onL2tpChanged()` to re-add users after reset
+## Embedded RADIUS Server (2026-02-18, session 7)
+- **Architecture**: Replaced file-based auth (chap-secrets, usermap, ip-up/ip-down scripts, session files) with embedded Go RADIUS server
+- **New file**: `web/service/radius.go` (~530 lines) — RadiusService
+- **Library**: `layeh.com/radius` (v0.0.0-20231213012653-1006025d24f8)
+- **Ports**: 127.0.0.1:1812 (auth), 127.0.0.1:1813 (acct)
+- **Auth flow**: pppd → radius.so plugin → RADIUS Access-Request → Go queries SQLite → MS-CHAPv2 verify → Accept/Reject + MPPE keys
+- **Acct flow**: pppd → RADIUS Acct-Start → Go creates session + nft counters; Acct-Stop → cleanup
+- **Session tracking**: In-memory `map[string]*radiusSession` (key: Acct-Session-Id)
+- **Traffic counting**: nft counters (unchanged 10s granularity), IP→email from RADIUS sessions
+- **Disabled client**: RADIUS rejects auth, `KillSessionsByEmail()` kills active pppd processes
+- **Panel restart**: Orphan sessions cleaned up on restart; interim-updates (60s) re-add sessions if PPP survives
+- **Stale session cleanup**: `CleanStaleSessions()` runs every 60s, checks if PPP interface still exists
 
-## nftables Migration (2026-02-18, session 5)
-- **Migrated**: L2TP/PPTP from ~20 iptables commands to native nftables (`table ip vpn`)
-- **New file**: `web/service/nftables.go` — NftService with ApplyNftRules(), CollectAndResetTraffic(), CleanupLegacyIptables()
+### Key implementation details
+- **Dictionary fix (CRITICAL)**: pppd's `radius.so` has statically linked radiusclient that uses `INCLUDE` (no `$`) for sub-dictionaries, but `/etc/radcli/dictionary` uses `$INCLUDE`. Fix: generate self-contained dictionary at `/etc/ppp/radius/dictionary` with all standard + Microsoft VSA attributes inline.
+- **PPP options changes**: `refuse-pap`, `refuse-chap`, `require-mschap-v2`, `plugin radius.so`, `radius-config-file /etc/ppp/radius/{proto}-{id}.conf`. Removed `auth` line (RADIUS handles it).
+- **xl2tpd.conf**: Removed `require chap = yes` and `refuse pap = yes` (pppd options now enforce auth type)
+- **RADIUS client config**: Per-inbound at `/etc/ppp/radius/{proto}-{id}.conf`, shared `/etc/ppp/radius/servers`
+- **NAS-Identifier**: `l2tp-{id}` or `pptp-{id}` — identifies protocol + inbound for auth handler
+- **MS-CHAPv2**: `rfc2759.GenerateNTResponse()` for verification, `rfc3079.MakeKey()` for MPPE keys
+- **RADIUS secret**: Random 32-char hex, stored in settings DB (`GetRadiusSecret`/`SetRadiusSecret`)
+- **Acct-Interim-Interval**: 60s (minimum pppd allows), sent in Access-Accept
+
+### Files removed/modified
+- **Removed**: `GenerateChapSecrets()`, `GenerateUserMap()`, `GenerateIpUpDown()`, `readSessions()`, `readSessionList()`, session/usermap file constants — from both l2tp.go and pptp.go
+- **Modified**: `nftables.go` — added `AddClientAccounting()`/`RemoveClientAccounting()`, `CollectAndResetTraffic()` now takes session maps instead of reading files
+- **Modified**: `web.go` — starts RADIUS server, generates secret, passes to L2TP/PPTP services
+- **Modified**: `xray_traffic_job.go` — gets session maps from RadiusService, passes to NftService
+- **Modified**: `setting.go` — added `GetRadiusSecret`/`SetRadiusSecret`
+- **Added dependency**: `go.mod` — `layeh.com/radius`
+
+### Tested on sandbox
+- L2TP: auth accepted, acct-start/stop/interim, traffic counters, disable → reject ✅
+- PPTP: auth accepted, MPPE encryption, acct-start/stop, traffic counters, disable → reject ✅
+- Both protocols simultaneously ✅
+- Orphan session cleanup on panel restart ✅
+- No stale files (chap-secrets, usermap, ip-up/ip-down all eliminated) ✅
+
+## nftables (2026-02-18, session 5)
 - **Architecture**: Single `table ip vpn` with 5 chains: prerouting (TPROXY + jumps), postrouting (jumps), input (raw L2TP filter), l2tp_acct (dynamic per-client), pptp_acct (dynamic per-client)
-- **Key design**: Static chains (prerouting/postrouting/input) are flushed+rebuilt on config regen. Accounting chains (l2tp_acct/pptp_acct) are NEVER flushed — their dynamic per-client rules (added by ip-up.d) survive.
-- **Named counters**: `l2tp_up_10_0_2_10`, `l2tp_down_10_0_2_10`, etc. Created by ip-up.d, deleted by ip-down.d.
-- **Traffic collection**: `nft -j reset counters table ip vpn` — atomic read+reset, JSON output. Replaces fragile iptables text parsing and the race-prone separate -L/-Z calls.
+- **Key design**: Static chains flushed+rebuilt on config regen. Accounting chains NEVER flushed — dynamic per-client rules managed by RADIUS acct events (was ip-up/ip-down scripts, now `AddClientAccounting`/`RemoveClientAccounting`).
+- **Named counters**: `l2tp_up_10_0_2_10`, `l2tp_down_10_0_2_10`, etc. Created/deleted by RADIUS acct.
+- **Traffic collection**: `nft -j reset counters table ip vpn` — atomic read+reset, JSON output.
 - **Config file**: `/etc/x-ui/vpn.nft` — loaded atomically with `nft -f`
-- **IPsec filter**: `meta secpath exists` in nft (replaces `-m policy --dir in --pol none`)
-- **ip-up/ip-down scripts**: Each protocol's script exits early if username not in its usermap (prevents cross-protocol spurious counters)
-- **Removed from l2tp.go**: SetupRawL2tpFilter, SetupTproxy, CleanupTproxy, SetupAcctChain, CollectL2tpTraffic, l2tpAcctChain constant
-- **Removed from pptp.go**: SetupTproxy, CleanupTproxy, SetupAcctChain, CollectPptpTraffic, pptpAcctChain constant
-- **Removed from inbound.go**: CleanupTproxy calls in delInbound (nft regen handles it)
-- **xray_traffic_job.go**: Single `nftService.CollectAndResetTraffic()` replaces two separate collection calls
-- **Modprobe change**: `xt_TPROXY` → `nf_tproxy_ipv4` (nftables kernel module)
-- **Tested**: L2TP and PPTP connections, traffic counting, counter reset, disconnect cleanup, legacy iptables cleanup — all verified on x-server
+- **IPsec filter**: `meta secpath exists` (replaces `-m policy --dir in --pol none`)
+- **Modprobe**: `nf_tproxy_ipv4` (not `xt_TPROXY`)

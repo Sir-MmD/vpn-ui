@@ -135,10 +135,62 @@ type nftCounter struct {
 	Bytes   int64  `json:"bytes"`
 }
 
+// AddClientAccounting creates named nft counters and accounting rules for a PPP client.
+// Called by RADIUS Acct-Start to start traffic counting for a new session.
+func (s *NftService) AddClientAccounting(protocol, ip string) error {
+	counterIP := strings.ReplaceAll(ip, ".", "_")
+	upCounter := fmt.Sprintf("%s_up_%s", protocol, counterIP)
+	downCounter := fmt.Sprintf("%s_down_%s", protocol, counterIP)
+	chain := fmt.Sprintf("%s_acct", protocol)
+
+	// Create counters (idempotent)
+	s.runCmd("nft", "add", "counter", "ip", "vpn", upCounter)
+	s.runCmd("nft", "add", "counter", "ip", "vpn", downCounter)
+
+	// Check if rules already exist for this IP
+	output, _ := exec.Command("nft", "list", "chain", "ip", "vpn", chain).Output()
+	if !strings.Contains(string(output), "addr "+ip+" ") {
+		s.runCmd("nft", "add", "rule", "ip", "vpn", chain, "ip", "saddr", ip, "counter", "name", upCounter)
+		s.runCmd("nft", "add", "rule", "ip", "vpn", chain, "ip", "daddr", ip, "counter", "name", downCounter)
+	}
+
+	logger.Debugf("nft: added %s accounting for %s", protocol, ip)
+	return nil
+}
+
+// RemoveClientAccounting removes nft accounting rules and counters for a PPP client.
+// Called by RADIUS Acct-Stop to stop traffic counting when a session ends.
+func (s *NftService) RemoveClientAccounting(protocol, ip string) error {
+	counterIP := strings.ReplaceAll(ip, ".", "_")
+	chain := fmt.Sprintf("%s_acct", protocol)
+
+	// Remove rules by handle (find rules matching this IP)
+	output, err := exec.Command("nft", "-a", "list", "chain", "ip", "vpn", chain).Output()
+	if err == nil {
+		for _, line := range strings.Split(string(output), "\n") {
+			if strings.Contains(line, "addr "+ip+" ") {
+				// Extract handle number
+				if idx := strings.Index(line, "# handle "); idx >= 0 {
+					handle := strings.TrimSpace(line[idx+9:])
+					s.runCmd("nft", "delete", "rule", "ip", "vpn", chain, "handle", handle)
+				}
+			}
+		}
+	}
+
+	// Delete counters
+	s.runCmd("nft", "delete", "counter", "ip", "vpn", fmt.Sprintf("%s_up_%s", protocol, counterIP))
+	s.runCmd("nft", "delete", "counter", "ip", "vpn", fmt.Sprintf("%s_down_%s", protocol, counterIP))
+
+	logger.Debugf("nft: removed %s accounting for %s", protocol, ip)
+	return nil
+}
+
 // CollectAndResetTraffic atomically reads and resets all VPN traffic counters.
 // Uses `nft -j reset counters` for atomic read+reset (no race between read and zero).
+// Session maps (IP→email) are provided by the RADIUS service.
 // Returns separate L2TP and PPTP client traffic slices.
-func (s *NftService) CollectAndResetTraffic() ([]*xray.ClientTraffic, []*xray.ClientTraffic) {
+func (s *NftService) CollectAndResetTraffic(l2tpIPToEmail, pptpIPToEmail map[string]string) ([]*xray.ClientTraffic, []*xray.ClientTraffic) {
 	output, err := exec.Command("nft", "-j", "reset", "counters", "table", "ip", "vpn").Output()
 	if err != nil {
 		return nil, nil
@@ -149,10 +201,6 @@ func (s *NftService) CollectAndResetTraffic() ([]*xray.ClientTraffic, []*xray.Cl
 		logger.Debug("nft: failed to parse counter JSON:", err)
 		return nil, nil
 	}
-
-	// Build IP→email maps from session files
-	l2tpIPToEmail := readSessionFile("/etc/x-ui/l2tp-sessions")
-	pptpIPToEmail := readSessionFile("/etc/x-ui/pptp-sessions")
 
 	// Accumulate per-email traffic
 	type trafficPair struct{ up, down int64 }
@@ -234,22 +282,6 @@ func (s *NftService) CollectAndResetTraffic() ([]*xray.ClientTraffic, []*xray.Cl
 	}
 
 	return l2tpResult, pptpResult
-}
-
-// readSessionFile reads a sessions file (format: email IP interface) and returns IP→email map.
-func readSessionFile(path string) map[string]string {
-	ipToEmail := make(map[string]string)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ipToEmail
-	}
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 {
-			ipToEmail[fields[1]] = fields[0]
-		}
-	}
-	return ipToEmail
 }
 
 // CleanupLegacyIptables removes old iptables rules left from the pre-nftables implementation.

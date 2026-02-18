@@ -4,8 +4,10 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"embed"
+	"fmt"
 	"html/template"
 	"io"
 	"io/fs"
@@ -103,6 +105,7 @@ type Server struct {
 
 	xrayService    service.XrayService
 	settingService service.SettingService
+	radiusService  service.RadiusService
 	l2tpService    service.L2tpService
 	pptpService    service.PptpService
 	tgbotService   service.Tgbot
@@ -297,6 +300,17 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 // startTask schedules background jobs (Xray checks, traffic jobs, cron
 // jobs) which the panel relies on for periodic maintenance and monitoring.
 func (s *Server) startTask() {
+	// Generate or load RADIUS shared secret and start embedded RADIUS server
+	radiusSecret := s.getOrCreateRadiusSecret()
+	if radiusSecret != "" {
+		if err := s.radiusService.Start(radiusSecret); err != nil {
+			logger.Warning("RADIUS: failed to start:", err)
+		}
+		// Pass RADIUS service and secret to L2TP/PPTP services
+		s.l2tpService.SetRadius(s.radiusService, radiusSecret)
+		s.pptpService.SetRadius(s.radiusService, radiusSecret)
+	}
+
 	// Initialize L2TP/PPTP services before Xray so TPROXY rules are in place
 	s.l2tpService.InitL2tp()
 	s.pptpService.InitPptp()
@@ -323,6 +337,11 @@ func (s *Server) startTask() {
 		// Statistics every 10 seconds, start the delay for 5 seconds for the first time, and staggered with the time to restart xray
 		s.cron.AddJob("@every 10s", job.NewXrayTrafficJob())
 	}()
+
+	// Clean stale RADIUS sessions every 60 seconds
+	s.cron.AddFunc("@every 60s", func() {
+		s.radiusService.CleanStaleSessions()
+	})
 
 	// check client ips from log file every 10 sec
 	s.cron.AddJob("@every 10s", job.NewCheckClientIpJob())
@@ -457,9 +476,10 @@ func (s *Server) Start() (err error) {
 	return nil
 }
 
-// Stop gracefully shuts down the web server, stops Xray, cron jobs, and Telegram bot.
+// Stop gracefully shuts down the web server, stops Xray, RADIUS, cron jobs, and Telegram bot.
 func (s *Server) Stop() error {
 	s.cancel()
+	s.radiusService.Stop()
 	s.xrayService.StopXray()
 	if s.cron != nil {
 		s.cron.Stop()
@@ -495,4 +515,23 @@ func (s *Server) GetCron() *cron.Cron {
 // GetWSHub returns the WebSocket hub instance.
 func (s *Server) GetWSHub() any {
 	return s.wsHub
+}
+
+// getOrCreateRadiusSecret retrieves or generates the RADIUS shared secret from settings.
+func (s *Server) getOrCreateRadiusSecret() string {
+	secret, err := s.settingService.GetRadiusSecret()
+	if err == nil && secret != "" {
+		return secret
+	}
+	// Generate a random 32-byte hex secret
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		logger.Warning("RADIUS: failed to generate secret:", err)
+		return "default-radius-secret"
+	}
+	secret = fmt.Sprintf("%x", b)
+	if err := s.settingService.SetRadiusSecret(secret); err != nil {
+		logger.Warning("RADIUS: failed to save secret:", err)
+	}
+	return secret
 }

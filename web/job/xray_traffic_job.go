@@ -20,6 +20,7 @@ type XrayTrafficJob struct {
 	l2tpService     service.L2tpService
 	pptpService     service.PptpService
 	nftService      service.NftService
+	radiusService   service.RadiusService
 }
 
 // NewXrayTrafficJob creates a new traffic collection job instance.
@@ -38,7 +39,10 @@ func (j *XrayTrafficJob) Run() {
 	}
 
 	// Collect L2TP and PPTP per-client traffic from nftables counters (atomic read+reset)
-	if l2tpTraffics, pptpTraffics := j.nftService.CollectAndResetTraffic(); len(l2tpTraffics) > 0 || len(pptpTraffics) > 0 {
+	// Session maps (IP→email) come from the embedded RADIUS server
+	l2tpSessions := j.radiusService.GetSessions("l2tp")
+	pptpSessions := j.radiusService.GetSessions("pptp")
+	if l2tpTraffics, pptpTraffics := j.nftService.CollectAndResetTraffic(l2tpSessions, pptpSessions); len(l2tpTraffics) > 0 || len(pptpTraffics) > 0 {
 		clientTraffics = append(clientTraffics, l2tpTraffics...)
 		clientTraffics = append(clientTraffics, pptpTraffics...)
 	}

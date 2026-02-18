@@ -688,6 +688,14 @@ func (s *SettingService) GetLdapDefaultLimitIP() (int, error) {
 	return s.getInt("ldapDefaultLimitIP")
 }
 
+func (s *SettingService) GetRadiusSecret() (string, error) {
+	return s.getString("radiusSecret")
+}
+
+func (s *SettingService) SetRadiusSecret(secret string) error {
+	return s.setString("radiusSecret", secret)
+}
+
 func (s *SettingService) UpdateAllSetting(allSetting *entity.AllSetting) error {
 	if err := allSetting.CheckValid(); err != nil {
 		return err

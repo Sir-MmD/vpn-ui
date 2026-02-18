@@ -22,8 +22,16 @@ L2TP/IPsec and PPTP clients are managed through the same panel UI, their traffic
 - **Xray routing** — Same TPROXY + dokodemo-door bridge as L2TP
 - **Per-client traffic tracking** — Same nftables accounting mechanism via `pptp_acct` chain
 - **Client management** — Traffic limits, expiry dates, enable/disable, bulk creation — same as L2TP
-- **Shared chap-secrets** — Both L2TP and PPTP write to `/etc/ppp/chap-secrets`, distinguished by server name (`l2tp-{id}` vs `pptp-{id}`)
 - **Separate subnets** — PPTP uses `10.1.x.0/24` (L2TP uses `10.0.x.0/24`)
+
+### Embedded RADIUS Server
+
+Authentication and session management for both L2TP and PPTP use an embedded RADIUS server (Go, `layeh.com/radius`) running on `127.0.0.1:1812-1813`:
+
+- **Live auth** — pppd authenticates via RADIUS (MS-CHAPv2), which queries SQLite in real time — no flat credential files to regenerate
+- **Session lifecycle** — RADIUS Acct-Start/Stop events create and remove per-client nftables accounting counters automatically
+- **Disable = instant block** — Disabling a client in the panel takes effect on the next auth attempt; active sessions are killed
+- **Crash recovery** — If the panel restarts while PPP sessions are alive, periodic RADIUS Acct-Interim-Update re-registers them within 60 seconds
 
 ### How It Works
 
@@ -62,18 +70,17 @@ Each L2TP/PPTP inbound automatically gets:
 
 Since Xray's dokodemo-door sees all PPP traffic as a single stream without user identity, a separate mechanism tracks per-client traffic:
 
-1. **pppd ip-up hook** — When a user authenticates via CHAP, pppd runs the protocol's ip-up script which:
-   - Looks up the user's email from the usermap file
-   - Records `email IP interface` in the sessions file
-   - Adds per-IP nftables named counters and accounting rules in the `l2tp_acct` or `pptp_acct` chain
+1. **RADIUS Acct-Start** — When a user authenticates, pppd sends a RADIUS Accounting-Start. The embedded RADIUS server:
+   - Records the session (username → email → IP mapping) in memory
+   - Creates per-IP nftables named counters and accounting rules in the `l2tp_acct` or `pptp_acct` chain
 
 2. **Traffic collection** — Every 10 seconds, `XrayTrafficJob` calls `NftService.CollectAndResetTraffic()` which:
    - Atomically reads and resets all named counters via `nft -j reset counters table ip vpn`
    - Parses JSON output to map counter names to client IPs
-   - Maps IPs to client emails via session files
+   - Maps IPs to client emails via RADIUS session data
    - Returns separate L2TP and PPTP per-client traffic deltas
 
-3. **pppd ip-down hook** — When a user disconnects, the ip-down script removes their session entry
+3. **RADIUS Acct-Stop** — When a user disconnects, pppd sends a RADIUS Accounting-Stop, and the server removes their session and nft counters
 
 ## Architecture Diagram
 
@@ -85,8 +92,8 @@ The L2TP and PPTP integrations require the following packages on the server:
 
 ```bash
 # Debian/Ubuntu
-apt install xl2tpd ppp libreswan     # for L2TP/IPsec
-apt install pptpd                     # for PPTP
+apt install xl2tpd ppp libreswan libradcli4   # for L2TP/IPsec
+apt install pptpd                              # for PPTP
 
 # The kernel must have PPP modules (l2tp_ppp, ppp_generic, ppp_mppe)
 # Cloud kernels (e.g., Hetzner) may lack these — install the full kernel:
@@ -207,7 +214,7 @@ This blocks ads for all L2TP and PPTP clients, just as it would for any Xray pro
 
 ## Files Modified
 
-### Backend (Go) — 9 files modified, 3 new
+### Backend (Go) — 10 files modified, 4 new
 
 | File | Change |
 |------|--------|
@@ -215,11 +222,12 @@ This blocks ads for all L2TP and PPTP clients, just as it would for any Xray pro
 | `web/service/l2tp.go` | **New** — L2TP service: xl2tpd, Libreswan IPsec, PPP config generation |
 | `web/service/pptp.go` | **New** — PPTP service: mirrors L2TP without IPsec |
 | `web/service/nftables.go` | **New** — nftables service: TPROXY rules, traffic accounting, IPsec filter |
+| `web/service/radius.go` | **New** — Embedded RADIUS server: MS-CHAPv2 auth, accounting, session tracking |
 | `web/service/xray.go` | Skip L2TP/PPTP inbounds + inject dokodemo-door |
 | `web/service/inbound.go` | Client-key switches for L2TP/PPTP (password-based, like Trojan) |
 | `web/service/server.go` | DB import restores L2TP + PPTP configs |
 | `web/controller/inbound.go` | CRUD hooks trigger L2TP/PPTP config regeneration |
-| `web/web.go` | L2TP + PPTP initialization on startup |
+| `web/web.go` | L2TP + PPTP + RADIUS initialization on startup |
 | `web/service/tgbot.go` | Exclude L2TP/PPTP from Telegram bot protocol handling |
 | `web/job/xray_traffic_job.go` | Merge L2TP + PPTP per-client traffic into collection pipeline |
 
@@ -249,30 +257,30 @@ This blocks ads for all L2TP and PPTP clients, just as it would for any Xray pro
 | File | Purpose |
 |------|---------|
 | `/etc/xl2tpd/xl2tpd.conf` | xl2tpd LNS configuration |
-| `/etc/ppp/options.xl2tpd-<id>` | Per-inbound PPP options |
-| `/etc/ipsec.conf` | IPsec connection definitions |
+| `/etc/ppp/options.xl2tpd-<id>` | Per-inbound PPP options (includes `plugin radius.so`) |
+| `/etc/ipsec.conf` | Libreswan IPsec connection definitions |
 | `/etc/ipsec.secrets` | IPsec pre-shared keys |
-| `/etc/x-ui/l2tp-usermap` | Username-to-email mapping |
-| `/etc/x-ui/l2tp-sessions` | Active session tracking |
-| `/etc/ppp/ip-up.d/l2tp-acct` | Session start hook |
-| `/etc/ppp/ip-down.d/l2tp-acct` | Session end hook |
 
 #### PPTP
 
 | File | Purpose |
 |------|---------|
 | `/etc/pptpd.conf` | pptpd configuration |
-| `/etc/ppp/pptpd-options-<id>` | Per-inbound PPP options |
-| `/etc/x-ui/pptp-usermap` | Username-to-email mapping |
-| `/etc/x-ui/pptp-sessions` | Active session tracking |
-| `/etc/ppp/ip-up.d/pptp-acct` | Session start hook |
-| `/etc/ppp/ip-down.d/pptp-acct` | Session end hook |
+| `/etc/ppp/pptpd-options-<id>` | Per-inbound PPP options (includes `plugin radius.so`) |
 
-#### Shared
+#### RADIUS (shared by L2TP + PPTP)
 
 | File | Purpose |
 |------|---------|
-| `/etc/ppp/chap-secrets` | L2TP + PPTP user credentials (shared file) |
+| `/etc/ppp/radius/<proto>-<id>.conf` | Per-inbound RADIUS client config (NAS-Identifier, server, dictionary) |
+| `/etc/ppp/radius/servers` | Shared RADIUS secret file |
+| `/etc/ppp/radius/dictionary` | Self-contained RADIUS dictionary (standard + Microsoft VSAs) |
+
+#### nftables
+
+| File | Purpose |
+|------|---------|
+| `/etc/x-ui/vpn.nft` | nftables ruleset (`table ip vpn`) loaded atomically |
 
 ## Upstream
 

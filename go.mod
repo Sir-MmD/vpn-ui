@@ -97,5 +97,6 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260209200024-4cfbd4190f57 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gvisor.dev/gvisor v0.0.0-20260122175437-89a5d21be8f0 // indirect
+	layeh.com/radius v0.0.0-20231213012653-1006025d24f8 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
