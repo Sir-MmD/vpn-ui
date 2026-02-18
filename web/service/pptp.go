@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/mhsanaei/3x-ui/v2/database"
@@ -20,13 +19,13 @@ import (
 const (
 	pptpSessionsFile = "/etc/x-ui/pptp-sessions"
 	pptpUserMapFile  = "/etc/x-ui/pptp-usermap"
-	pptpAcctChain    = "PPTP_ACCT"
 )
 
 // PptpService manages PPTP VPN server configuration including pptpd, pppd,
 // and iptables TPROXY rules for routing traffic through Xray.
 type PptpService struct {
 	inboundService InboundService
+	nftService     NftService
 }
 
 // pptpSettings represents the PPTP-specific settings stored in the inbound's Settings JSON.
@@ -275,60 +274,8 @@ func (s *PptpService) GenerateChapSecrets() error {
 	return s.writeFile("/etc/ppp/chap-secrets", b.String())
 }
 
-// SetupTproxy adds iptables TPROXY rules for a specific PPTP inbound.
-func (s *PptpService) SetupTproxy(inbound *model.Inbound) error {
-	subnet := s.GetSubnetForInbound(inbound)
-	port := s.GetTproxyPort(inbound)
-	src := fmt.Sprintf("%s.0/24", subnet)
-
-	// Check if rules already exist
-	checkCmd := exec.Command("iptables", "-t", "mangle", "-C", "PREROUTING",
-		"-s", src, "-p", "tcp", "-m", "mark", "!", "--mark", "255",
-		"-j", "TPROXY", "--on-port", fmt.Sprintf("%d", port), "--tproxy-mark", "1/1")
-	if checkCmd.Run() == nil {
-		logger.Debugf("PPTP: TPROXY rules already exist for inbound %d", inbound.Id)
-		return nil
-	}
-
-	if err := s.runCmd("iptables", "-t", "mangle", "-A", "PREROUTING",
-		"-s", src, "-p", "tcp", "-m", "mark", "!", "--mark", "255",
-		"-j", "TPROXY", "--on-port", fmt.Sprintf("%d", port), "--tproxy-mark", "1/1"); err != nil {
-		return fmt.Errorf("failed to add TCP TPROXY rule: %w", err)
-	}
-	if err := s.runCmd("iptables", "-t", "mangle", "-A", "PREROUTING",
-		"-s", src, "-p", "udp", "-m", "mark", "!", "--mark", "255",
-		"-j", "TPROXY", "--on-port", fmt.Sprintf("%d", port), "--tproxy-mark", "1/1"); err != nil {
-		return fmt.Errorf("failed to add UDP TPROXY rule: %w", err)
-	}
-
-	logger.Infof("PPTP: TPROXY setup for inbound %d: %s → port %d", inbound.Id, src, port)
-	return nil
-}
-
-// CleanupTproxy removes iptables TPROXY rules for a specific PPTP inbound.
-func (s *PptpService) CleanupTproxy(inbound *model.Inbound) error {
-	subnet := s.GetSubnetForInbound(inbound)
-	port := s.GetTproxyPort(inbound)
-	src := fmt.Sprintf("%s.0/24", subnet)
-
-	s.runCmd("iptables", "-t", "mangle", "-D", "PREROUTING",
-		"-s", src, "-p", "tcp", "-m", "mark", "!", "--mark", "255",
-		"-j", "TPROXY", "--on-port", fmt.Sprintf("%d", port), "--tproxy-mark", "1/1")
-	s.runCmd("iptables", "-t", "mangle", "-D", "PREROUTING",
-		"-s", src, "-p", "udp", "-m", "mark", "!", "--mark", "255",
-		"-j", "TPROXY", "--on-port", fmt.Sprintf("%d", port), "--tproxy-mark", "1/1")
-
-	logger.Infof("PPTP: TPROXY cleanup for inbound %d", inbound.Id)
-	return nil
-}
-
-// SetupAllTproxy sets up TPROXY for all enabled PPTP inbounds (called on startup).
+// SetupAllTproxy sets up kernel modules, ip rules, and nftables rules for TPROXY.
 func (s *PptpService) SetupAllTproxy() error {
-	inbounds, err := s.GetPptpInbounds()
-	if err != nil {
-		return err
-	}
-
 	// Enable IP forwarding
 	s.runCmd("sysctl", "-w", "net.ipv4.ip_forward=1")
 
@@ -337,7 +284,7 @@ func (s *PptpService) SetupAllTproxy() error {
 	s.runCmd("modprobe", "ip_gre")
 	s.runCmd("modprobe", "ppp_generic")
 	s.runCmd("modprobe", "ppp_mppe")
-	s.runCmd("modprobe", "xt_TPROXY")
+	s.runCmd("modprobe", "nf_tproxy_ipv4")
 
 	// Set up ip rule and route table (check if already exists to avoid duplicates)
 	output, _ := exec.Command("ip", "rule", "show").Output()
@@ -346,15 +293,7 @@ func (s *PptpService) SetupAllTproxy() error {
 	}
 	s.runCmd("ip", "route", "replace", "local", "0.0.0.0/0", "dev", "lo", "table", "100")
 
-	for _, inbound := range inbounds {
-		if !inbound.Enable {
-			continue
-		}
-		if err := s.SetupTproxy(inbound); err != nil {
-			logger.Warning("PPTP: failed to setup TPROXY for inbound", inbound.Id, err)
-		}
-	}
-	return nil
+	return s.nftService.ApplyNftRules()
 }
 
 // RestartServices restarts pptpd.
@@ -384,15 +323,14 @@ func (s *PptpService) InitPptp() {
 
 	logger.Info("PPTP: initializing PPTP services for", len(inbounds), "inbound(s)")
 
+	s.nftService.CleanupLegacyIptables()
+
 	if err := s.GenerateAllConfigs(); err != nil {
 		logger.Warning("PPTP: failed to generate configs:", err)
 		return
 	}
 	if err := s.SetupAllTproxy(); err != nil {
 		logger.Warning("PPTP: failed to setup TPROXY:", err)
-	}
-	if err := s.SetupAcctChain(); err != nil {
-		logger.Warning("PPTP: failed to setup accounting chain:", err)
 	}
 	if err := s.RestartServices(); err != nil {
 		logger.Warning("PPTP: failed to restart services:", err)
@@ -438,13 +376,11 @@ USERNAME="$PEERNAME"
 [ -z "$USERNAME" ] && exit 0
 [ -z "$REMOTE_IP" ] && exit 0
 
-# Look up email from usermap
+# Look up email from usermap — exit if user is not a PPTP client
 USERMAP="` + pptpUserMapFile + `"
-EMAIL=""
-if [ -f "$USERMAP" ]; then
-    EMAIL=$(awk -v u="$USERNAME" '$1 == u {print $2; exit}' "$USERMAP")
-fi
-[ -z "$EMAIL" ] && EMAIL="$USERNAME"
+[ ! -f "$USERMAP" ] && exit 0
+EMAIL=$(awk -v u="$USERNAME" '$1 == u {print $2; exit}' "$USERMAP")
+[ -z "$EMAIL" ] && exit 0
 
 # Record session: email IP interface
 SESSIONS="` + pptpSessionsFile + `"
@@ -452,11 +388,14 @@ grep -v " $REMOTE_IP " "$SESSIONS" 2>/dev/null > "$SESSIONS.tmp" || true
 echo "$EMAIL $REMOTE_IP $IFACE" >> "$SESSIONS.tmp"
 mv "$SESSIONS.tmp" "$SESSIONS"
 
-# Add iptables accounting rules
-iptables -t mangle -C ` + pptpAcctChain + ` -s "$REMOTE_IP" 2>/dev/null || \
-    iptables -t mangle -A ` + pptpAcctChain + ` -s "$REMOTE_IP"
-iptables -t mangle -C ` + pptpAcctChain + ` -d "$REMOTE_IP" 2>/dev/null || \
-    iptables -t mangle -A ` + pptpAcctChain + ` -d "$REMOTE_IP"
+# Add nft counters and accounting rules
+COUNTER_IP=$(echo "$REMOTE_IP" | tr '.' '_')
+nft add counter ip vpn "pptp_up_${COUNTER_IP}" 2>/dev/null
+nft add counter ip vpn "pptp_down_${COUNTER_IP}" 2>/dev/null
+if ! nft list chain ip vpn pptp_acct 2>/dev/null | grep -q "addr ${REMOTE_IP} "; then
+    nft add rule ip vpn pptp_acct ip saddr "$REMOTE_IP" counter name "pptp_up_${COUNTER_IP}"
+    nft add rule ip vpn pptp_acct ip daddr "$REMOTE_IP" counter name "pptp_down_${COUNTER_IP}"
+fi
 `
 
 	ipDown := `#!/bin/sh
@@ -465,107 +404,29 @@ REMOTE_IP="$5"
 
 [ -z "$REMOTE_IP" ] && exit 0
 
-# Remove session entry
+# Only process if this IP is in PPTP sessions
 SESSIONS="` + pptpSessionsFile + `"
-if [ -f "$SESSIONS" ]; then
-    grep -v " $REMOTE_IP " "$SESSIONS" > "$SESSIONS.tmp" || true
-    mv "$SESSIONS.tmp" "$SESSIONS"
-fi
+[ ! -f "$SESSIONS" ] && exit 0
+grep -q " $REMOTE_IP " "$SESSIONS" || exit 0
+
+# Remove session entry
+grep -v " $REMOTE_IP " "$SESSIONS" > "$SESSIONS.tmp" || true
+mv "$SESSIONS.tmp" "$SESSIONS"
+
+# Remove nft accounting rules and counters
+COUNTER_IP=$(echo "$REMOTE_IP" | tr '.' '_')
+nft -a list chain ip vpn pptp_acct 2>/dev/null | grep "addr ${REMOTE_IP} " | while IFS= read -r line; do
+    handle=$(echo "$line" | sed -n 's/.*# handle \([0-9]*\).*/\1/p')
+    [ -n "$handle" ] && nft delete rule ip vpn pptp_acct handle "$handle" 2>/dev/null
+done
+nft delete counter ip vpn "pptp_up_${COUNTER_IP}" 2>/dev/null
+nft delete counter ip vpn "pptp_down_${COUNTER_IP}" 2>/dev/null
 `
 
 	if err := s.writeFileMode("/etc/ppp/ip-up.d/pptp-acct", ipUp, 0755); err != nil {
 		return err
 	}
 	return s.writeFileMode("/etc/ppp/ip-down.d/pptp-acct", ipDown, 0755)
-}
-
-// SetupAcctChain creates the PPTP_ACCT iptables chain in the mangle table.
-func (s *PptpService) SetupAcctChain() error {
-	s.runCmd("iptables", "-t", "mangle", "-N", pptpAcctChain)
-
-	s.runCmd("iptables", "-t", "mangle", "-D", "PREROUTING", "-j", pptpAcctChain)
-	if err := s.runCmd("iptables", "-t", "mangle", "-I", "PREROUTING", "1", "-j", pptpAcctChain); err != nil {
-		return fmt.Errorf("failed to insert PREROUTING jump to %s: %w", pptpAcctChain, err)
-	}
-
-	s.runCmd("iptables", "-t", "mangle", "-D", "POSTROUTING", "-j", pptpAcctChain)
-	if err := s.runCmd("iptables", "-t", "mangle", "-I", "POSTROUTING", "1", "-j", pptpAcctChain); err != nil {
-		return fmt.Errorf("failed to insert POSTROUTING jump to %s: %w", pptpAcctChain, err)
-	}
-
-	return nil
-}
-
-// CollectPptpTraffic reads iptables accounting counters and maps them to client emails.
-func (s *PptpService) CollectPptpTraffic() []*xray.ClientTraffic {
-	sessions := s.readSessions()
-	if len(sessions) == 0 {
-		return nil
-	}
-
-	ipToEmail := make(map[string]string)
-	for email, ip := range sessions {
-		ipToEmail[ip] = email
-	}
-
-	output, err := exec.Command("iptables", "-t", "mangle", "-L", pptpAcctChain, "-nvx").Output()
-	if err != nil {
-		logger.Debug("PPTP: failed to read accounting chain:", err)
-		return nil
-	}
-	exec.Command("iptables", "-t", "mangle", "-Z", pptpAcctChain).Run()
-
-	emailUp := make(map[string]int64)
-	emailDown := make(map[string]int64)
-
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		fields := strings.Fields(line)
-		if len(fields) < 7 {
-			continue
-		}
-		bytes, err := strconv.ParseInt(fields[1], 10, 64)
-		if err != nil || bytes == 0 {
-			continue
-		}
-
-		src := fields[len(fields)-2]
-		dst := fields[len(fields)-1]
-
-		if email, ok := ipToEmail[src]; ok && dst == "0.0.0.0/0" {
-			emailUp[email] += bytes
-		}
-		if email, ok := ipToEmail[dst]; ok && src == "0.0.0.0/0" {
-			emailDown[email] += bytes
-		}
-	}
-
-	var traffics []*xray.ClientTraffic
-	allEmails := make(map[string]bool)
-	for email := range emailUp {
-		allEmails[email] = true
-	}
-	for email := range emailDown {
-		allEmails[email] = true
-	}
-	for email := range allEmails {
-		up := emailUp[email]
-		down := emailDown[email]
-		if up > 0 || down > 0 {
-			traffics = append(traffics, &xray.ClientTraffic{
-				Email: email,
-				Up:    up,
-				Down:  down,
-			})
-		}
-	}
-
-	if len(traffics) > 0 {
-		logger.Debugf("PPTP: collected traffic for %d client(s)", len(traffics))
-	}
-
-	return traffics
 }
 
 type pptpSession struct {

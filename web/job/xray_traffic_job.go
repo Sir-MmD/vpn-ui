@@ -19,6 +19,7 @@ type XrayTrafficJob struct {
 	outboundService service.OutboundService
 	l2tpService     service.L2tpService
 	pptpService     service.PptpService
+	nftService      service.NftService
 }
 
 // NewXrayTrafficJob creates a new traffic collection job instance.
@@ -36,13 +37,9 @@ func (j *XrayTrafficJob) Run() {
 		return
 	}
 
-	// Collect L2TP per-client traffic from iptables accounting and merge
-	if l2tpTraffics := j.l2tpService.CollectL2tpTraffic(); len(l2tpTraffics) > 0 {
+	// Collect L2TP and PPTP per-client traffic from nftables counters (atomic read+reset)
+	if l2tpTraffics, pptpTraffics := j.nftService.CollectAndResetTraffic(); len(l2tpTraffics) > 0 || len(pptpTraffics) > 0 {
 		clientTraffics = append(clientTraffics, l2tpTraffics...)
-	}
-
-	// Collect PPTP per-client traffic from iptables accounting and merge
-	if pptpTraffics := j.pptpService.CollectPptpTraffic(); len(pptpTraffics) > 0 {
 		clientTraffics = append(clientTraffics, pptpTraffics...)
 	}
 

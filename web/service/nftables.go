@@ -1,0 +1,315 @@
+package service
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+
+	"github.com/mhsanaei/3x-ui/v2/logger"
+	"github.com/mhsanaei/3x-ui/v2/xray"
+)
+
+const nftConfigFile = "/etc/x-ui/vpn.nft"
+
+// NftService manages nftables rules for L2TP and PPTP VPN traffic accounting and TPROXY.
+type NftService struct{}
+
+// ApplyNftRules regenerates and atomically loads the nftables config for all VPN inbounds.
+// Static chains (prerouting/postrouting/input) are flushed and rebuilt.
+// Accounting chains (l2tp_acct/pptp_acct) are NEVER flushed — their dynamic per-client
+// rules (added by ip-up.d scripts) survive across regenerations.
+func (s *NftService) ApplyNftRules() error {
+	l2tp := L2tpService{}
+	pptp := PptpService{}
+
+	l2tpInbounds, err := l2tp.GetL2tpInbounds()
+	if err != nil {
+		return err
+	}
+	pptpInbounds, err := pptp.GetPptpInbounds()
+	if err != nil {
+		return err
+	}
+
+	// If no VPN inbounds, remove the table entirely
+	if len(l2tpInbounds) == 0 && len(pptpInbounds) == 0 {
+		s.runCmd("nft", "delete", "table", "ip", "vpn")
+		os.Remove(nftConfigFile)
+		return nil
+	}
+
+	var b strings.Builder
+
+	// Create table and chains (idempotent — 'add' doesn't error if they already exist)
+	b.WriteString("add table ip vpn\n")
+	b.WriteString("add chain ip vpn l2tp_acct\n")
+	b.WriteString("add chain ip vpn pptp_acct\n")
+	b.WriteString("add chain ip vpn prerouting { type filter hook prerouting priority mangle; policy accept; }\n")
+	b.WriteString("add chain ip vpn postrouting { type filter hook postrouting priority mangle; policy accept; }\n")
+	b.WriteString("add chain ip vpn input { type filter hook input priority filter; policy accept; }\n")
+
+	// Flush only static chains (accounting chains are dynamic, never flushed)
+	b.WriteString("flush chain ip vpn prerouting\n")
+	b.WriteString("flush chain ip vpn postrouting\n")
+	b.WriteString("flush chain ip vpn input\n")
+
+	// Accounting jumps (must be before TPROXY so packets are counted before accept)
+	b.WriteString("add rule ip vpn prerouting jump l2tp_acct\n")
+	b.WriteString("add rule ip vpn prerouting jump pptp_acct\n")
+	b.WriteString("add rule ip vpn postrouting jump l2tp_acct\n")
+	b.WriteString("add rule ip vpn postrouting jump pptp_acct\n")
+
+	// L2TP TPROXY rules
+	for _, inbound := range l2tpInbounds {
+		if !inbound.Enable {
+			continue
+		}
+		subnet := l2tp.GetSubnetForInbound(inbound)
+		port := l2tp.GetTproxyPort(inbound)
+		src := fmt.Sprintf("%s.0/24", subnet)
+		b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol tcp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
+		b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol udp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
+	}
+
+	// PPTP TPROXY rules
+	for _, inbound := range pptpInbounds {
+		if !inbound.Enable {
+			continue
+		}
+		subnet := pptp.GetSubnetForInbound(inbound)
+		port := pptp.GetTproxyPort(inbound)
+		src := fmt.Sprintf("%s.0/24", subnet)
+		b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol tcp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
+		b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol udp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
+	}
+
+	// Raw L2TP filter: block non-IPsec L2TP when ipsecEnable && !allowRaw
+	needFilter := false
+	for _, inbound := range l2tpInbounds {
+		settings, err := l2tp.parseSettings(inbound)
+		if err != nil {
+			continue
+		}
+		if settings.IpsecEnable && !settings.AllowRaw {
+			needFilter = true
+			break
+		}
+	}
+	if needFilter {
+		// Accept L2TP that arrived via IPsec, drop the rest
+		b.WriteString("add rule ip vpn input udp dport 1701 meta secpath exists accept\n")
+		b.WriteString("add rule ip vpn input udp dport 1701 drop\n")
+	}
+
+	// Write and load atomically
+	if err := os.MkdirAll("/etc/x-ui", 0755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(nftConfigFile, []byte(b.String()), 0644); err != nil {
+		return err
+	}
+	if err := s.runCmd("nft", "-f", nftConfigFile); err != nil {
+		return fmt.Errorf("failed to load nft rules: %w", err)
+	}
+
+	logger.Infof("nft: loaded VPN rules (%d L2TP, %d PPTP inbounds)", len(l2tpInbounds), len(pptpInbounds))
+	return nil
+}
+
+// nftCounterOutput represents the JSON output of `nft -j reset counters`.
+type nftCounterOutput struct {
+	Nftables []json.RawMessage `json:"nftables"`
+}
+
+type nftCounterEntry struct {
+	Counter *nftCounter `json:"counter"`
+}
+
+type nftCounter struct {
+	Family  string `json:"family"`
+	Name    string `json:"name"`
+	Table   string `json:"table"`
+	Packets int64  `json:"packets"`
+	Bytes   int64  `json:"bytes"`
+}
+
+// CollectAndResetTraffic atomically reads and resets all VPN traffic counters.
+// Uses `nft -j reset counters` for atomic read+reset (no race between read and zero).
+// Returns separate L2TP and PPTP client traffic slices.
+func (s *NftService) CollectAndResetTraffic() ([]*xray.ClientTraffic, []*xray.ClientTraffic) {
+	output, err := exec.Command("nft", "-j", "reset", "counters", "table", "ip", "vpn").Output()
+	if err != nil {
+		return nil, nil
+	}
+
+	var result nftCounterOutput
+	if err := json.Unmarshal(output, &result); err != nil {
+		logger.Debug("nft: failed to parse counter JSON:", err)
+		return nil, nil
+	}
+
+	// Build IP→email maps from session files
+	l2tpIPToEmail := readSessionFile("/etc/x-ui/l2tp-sessions")
+	pptpIPToEmail := readSessionFile("/etc/x-ui/pptp-sessions")
+
+	// Accumulate per-email traffic
+	type trafficPair struct{ up, down int64 }
+	l2tpTraffic := make(map[string]*trafficPair)
+	pptpTraffic := make(map[string]*trafficPair)
+
+	for _, raw := range result.Nftables {
+		var entry nftCounterEntry
+		if err := json.Unmarshal(raw, &entry); err != nil || entry.Counter == nil {
+			continue
+		}
+		c := entry.Counter
+		if c.Bytes == 0 {
+			continue
+		}
+
+		// Parse counter name: {protocol}_{direction}_{ip_octets_with_underscores}
+		// e.g. "l2tp_up_10_0_2_10" → protocol=l2tp, dir=up, ip=10.0.2.10
+		parts := strings.SplitN(c.Name, "_", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		protocol := parts[0]  // "l2tp" or "pptp"
+		direction := parts[1] // "up" or "down"
+		ip := strings.ReplaceAll(parts[2], "_", ".")
+
+		var ipMap map[string]string
+		var trafficMap map[string]*trafficPair
+		if protocol == "l2tp" {
+			ipMap = l2tpIPToEmail
+			trafficMap = l2tpTraffic
+		} else if protocol == "pptp" {
+			ipMap = pptpIPToEmail
+			trafficMap = pptpTraffic
+		} else {
+			continue
+		}
+
+		email, ok := ipMap[ip]
+		if !ok {
+			continue
+		}
+
+		pair := trafficMap[email]
+		if pair == nil {
+			pair = &trafficPair{}
+			trafficMap[email] = pair
+		}
+		if direction == "up" {
+			pair.up += c.Bytes
+		} else if direction == "down" {
+			pair.down += c.Bytes
+		}
+	}
+
+	// Convert maps to ClientTraffic slices
+	toSlice := func(m map[string]*trafficPair) []*xray.ClientTraffic {
+		var result []*xray.ClientTraffic
+		for email, pair := range m {
+			if pair.up > 0 || pair.down > 0 {
+				result = append(result, &xray.ClientTraffic{
+					Email: email,
+					Up:    pair.up,
+					Down:  pair.down,
+				})
+			}
+		}
+		return result
+	}
+
+	l2tpResult := toSlice(l2tpTraffic)
+	pptpResult := toSlice(pptpTraffic)
+
+	if len(l2tpResult) > 0 {
+		logger.Debugf("nft: collected L2TP traffic for %d client(s)", len(l2tpResult))
+	}
+	if len(pptpResult) > 0 {
+		logger.Debugf("nft: collected PPTP traffic for %d client(s)", len(pptpResult))
+	}
+
+	return l2tpResult, pptpResult
+}
+
+// readSessionFile reads a sessions file (format: email IP interface) and returns IP→email map.
+func readSessionFile(path string) map[string]string {
+	ipToEmail := make(map[string]string)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ipToEmail
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			ipToEmail[fields[1]] = fields[0]
+		}
+	}
+	return ipToEmail
+}
+
+// CleanupLegacyIptables removes old iptables rules left from the pre-nftables implementation.
+// All commands are idempotent (silent failure if rules don't exist).
+func (s *NftService) CleanupLegacyIptables() {
+	// Remove L2TP_ACCT chain
+	s.runCmd("iptables", "-t", "mangle", "-D", "PREROUTING", "-j", "L2TP_ACCT")
+	s.runCmd("iptables", "-t", "mangle", "-D", "POSTROUTING", "-j", "L2TP_ACCT")
+	s.runCmd("iptables", "-t", "mangle", "-F", "L2TP_ACCT")
+	s.runCmd("iptables", "-t", "mangle", "-X", "L2TP_ACCT")
+
+	// Remove PPTP_ACCT chain
+	s.runCmd("iptables", "-t", "mangle", "-D", "PREROUTING", "-j", "PPTP_ACCT")
+	s.runCmd("iptables", "-t", "mangle", "-D", "POSTROUTING", "-j", "PPTP_ACCT")
+	s.runCmd("iptables", "-t", "mangle", "-F", "PPTP_ACCT")
+	s.runCmd("iptables", "-t", "mangle", "-X", "PPTP_ACCT")
+
+	// Remove old raw L2TP filter
+	s.runCmd("iptables", "-D", "INPUT", "-p", "udp", "--dport", "1701",
+		"-m", "policy", "--dir", "in", "--pol", "none", "-j", "DROP")
+
+	// Remove old TPROXY rules for all VPN inbounds
+	l2tp := L2tpService{}
+	pptp := PptpService{}
+
+	l2tpInbounds, _ := l2tp.GetL2tpInbounds()
+	for _, inbound := range l2tpInbounds {
+		subnet := l2tp.GetSubnetForInbound(inbound)
+		port := l2tp.GetTproxyPort(inbound)
+		src := fmt.Sprintf("%s.0/24", subnet)
+		s.runCmd("iptables", "-t", "mangle", "-D", "PREROUTING",
+			"-s", src, "-p", "tcp", "-m", "mark", "!", "--mark", "255",
+			"-j", "TPROXY", "--on-port", fmt.Sprintf("%d", port), "--tproxy-mark", "1/1")
+		s.runCmd("iptables", "-t", "mangle", "-D", "PREROUTING",
+			"-s", src, "-p", "udp", "-m", "mark", "!", "--mark", "255",
+			"-j", "TPROXY", "--on-port", fmt.Sprintf("%d", port), "--tproxy-mark", "1/1")
+	}
+
+	pptpInbounds, _ := pptp.GetPptpInbounds()
+	for _, inbound := range pptpInbounds {
+		subnet := pptp.GetSubnetForInbound(inbound)
+		port := pptp.GetTproxyPort(inbound)
+		src := fmt.Sprintf("%s.0/24", subnet)
+		s.runCmd("iptables", "-t", "mangle", "-D", "PREROUTING",
+			"-s", src, "-p", "tcp", "-m", "mark", "!", "--mark", "255",
+			"-j", "TPROXY", "--on-port", fmt.Sprintf("%d", port), "--tproxy-mark", "1/1")
+		s.runCmd("iptables", "-t", "mangle", "-D", "PREROUTING",
+			"-s", src, "-p", "udp", "-m", "mark", "!", "--mark", "255",
+			"-j", "TPROXY", "--on-port", fmt.Sprintf("%d", port), "--tproxy-mark", "1/1")
+	}
+
+	logger.Info("nft: cleaned up legacy iptables rules")
+}
+
+func (s *NftService) runCmd(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.Debugf("nft: cmd '%s %s' failed: %s %v", name, strings.Join(args, " "), string(output), err)
+		return err
+	}
+	return nil
+}

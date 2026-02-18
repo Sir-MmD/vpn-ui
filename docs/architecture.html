@@ -407,7 +407,7 @@
 <div class="container">
 
   <h1>VPN-UI Architecture</h1>
-  <p class="subtitle">L2TP/IPsec integration with Xray routing engine via TPROXY bridge</p>
+  <p class="subtitle">L2TP/IPsec + PPTP integration with Xray routing engine via nftables TPROXY bridge</p>
 
   <!-- ===== MAIN TRAFFIC FLOW ===== -->
   <div class="section">
@@ -430,8 +430,8 @@
       <!-- IPsec -->
       <div class="node node-ipsec" style="min-width: 280px;">
         <div class="node-label">Encryption Layer</div>
-        <div class="node-title">strongSwan (IPsec)</div>
-        <div class="node-detail">IKEv1 + ESP transport mode, PSK authentication</div>
+        <div class="node-title">Libreswan (IPsec)</div>
+        <div class="node-detail">IKEv1 + ESP transport mode, PSK auth, broad cipher suite</div>
       </div>
 
       <div class="arrow">
@@ -469,7 +469,7 @@
         <div class="node node-panel" style="min-width: 220px;">
           <div class="node-label">Hook</div>
           <div class="node-title">ip-up.d/l2tp-acct</div>
-          <div class="node-detail">Records session, adds iptables accounting</div>
+          <div class="node-detail">Records session, adds nftables named counters</div>
         </div>
       </div>
 
@@ -482,8 +482,8 @@
       <!-- iptables -->
       <div class="node node-iptables" style="min-width: 280px;">
         <div class="node-label">Packet Mangling</div>
-        <div class="node-title">iptables TPROXY</div>
-        <div class="node-detail">mangle PREROUTING: mark + redirect to Xray socket</div>
+        <div class="node-title">nftables TPROXY</div>
+        <div class="node-detail">table ip vpn: mark + redirect to Xray socket</div>
       </div>
 
       <div class="arrow">
@@ -531,16 +531,16 @@
 
   <!-- ===== IPTABLES CHAIN LAYOUT ===== -->
   <div class="section">
-    <h2 class="section-title">iptables Chain Layout (mangle table)</h2>
+    <h2 class="section-title">nftables Chain Layout (table ip vpn)</h2>
 
     <div class="chain-diagram">
       <div class="chain-row">
         <span class="chain-label">Upload</span>
-        <div class="chain-box chain-mangle">PREROUTING</div>
+        <div class="chain-box chain-mangle">prerouting</div>
         <span class="chain-arrow">&rarr;</span>
-        <div class="chain-box chain-acct">L2TP_ACCT<br><small>-s CLIENT_IP</small></div>
+        <div class="chain-box chain-acct">l2tp_acct<br><small>ip saddr CLIENT_IP</small></div>
         <span class="chain-arrow">&rarr;</span>
-        <div class="chain-box chain-tproxy">TPROXY<br><small>-s 10.0.x.0/24 &rarr; port 123xx</small></div>
+        <div class="chain-box chain-tproxy">TPROXY<br><small>ip saddr 10.0.x.0/24 &rarr; port 123xx</small></div>
         <span class="chain-arrow">&rarr;</span>
         <div class="chain-box chain-xray">Xray (INPUT)</div>
         <span class="chain-desc">Client sends data through tunnel</span>
@@ -550,9 +550,9 @@
         <span class="chain-label">Download</span>
         <div class="chain-box chain-xray">Xray (OUTPUT)</div>
         <span class="chain-arrow">&rarr;</span>
-        <div class="chain-box chain-mangle">POSTROUTING</div>
+        <div class="chain-box chain-mangle">postrouting</div>
         <span class="chain-arrow">&rarr;</span>
-        <div class="chain-box chain-acct">L2TP_ACCT<br><small>-d CLIENT_IP</small></div>
+        <div class="chain-box chain-acct">l2tp_acct<br><small>ip daddr CLIENT_IP</small></div>
         <span class="chain-arrow">&rarr;</span>
         <div class="chain-box chain-tproxy">ppp0 interface</div>
         <span class="chain-desc">Xray sends response back to client</span>
@@ -577,30 +577,30 @@ EMAIL=$(awk -v u="$USERNAME" \
 echo "$EMAIL $REMOTE_IP $IFACE" \
   >> /etc/x-ui/l2tp-sessions
 
-# Add accounting rules
-iptables -t mangle -A L2TP_ACCT \
-  -s $REMOTE_IP
-iptables -t mangle -A L2TP_ACCT \
-  -d $REMOTE_IP</code>
+# Add nft named counters + rules
+IP=$(echo $REMOTE_IP | tr '.' '_')
+nft add counter ip vpn l2tp_up_$IP
+nft add counter ip vpn l2tp_down_$IP
+nft add rule ip vpn l2tp_acct \
+  ip saddr $REMOTE_IP counter name l2tp_up_$IP
+nft add rule ip vpn l2tp_acct \
+  ip daddr $REMOTE_IP counter name l2tp_down_$IP</code>
       </div>
 
       <div class="track-card step-2">
         <h3><span class="step-num">2</span> Counter Collection</h3>
-        <p>Every 10 seconds, <code style="display:inline; padding:2px 6px;">XrayTrafficJob</code> calls <code style="display:inline; padding:2px 6px;">CollectL2tpTraffic()</code>:</p>
-        <code># Read sessions file
-sessions = readSessions()
-  => {"user1@l2tp": "10.0.2.10"}
+        <p>Every 10 seconds, <code style="display:inline; padding:2px 6px;">XrayTrafficJob</code> calls <code style="display:inline; padding:2px 6px;">NftService.CollectAndResetTraffic()</code>:</p>
+        <code># Atomic read+reset all counters (JSON)
+nft -j reset counters table ip vpn
+  => l2tp_up_10_0_2_10: 1140 bytes
+  => l2tp_down_10_0_2_10: 1222 bytes
 
-# Read iptables byte counters
-iptables -t mangle -L L2TP_ACCT -nvx
-  => src 10.0.2.10: 1140 bytes (up)
-  => dst 10.0.2.10: 1222 bytes (down)
+# Read session files for IP->email map
+l2tp: readSessionFile("/etc/x-ui/l2tp-sessions")
+pptp: readSessionFile("/etc/x-ui/pptp-sessions")
 
-# Zero counters
-iptables -t mangle -Z L2TP_ACCT
-
-# Map IP -> email -> ClientTraffic
-return [{email, up: 1140, down: 1222}]</code>
+# Map counter name -> IP -> email
+return l2tpTraffics, pptpTraffics</code>
       </div>
 
       <div class="track-card step-3">
@@ -608,11 +608,11 @@ return [{email, up: 1140, down: 1222}]</code>
         <p>L2TP traffic merges into the existing Xray traffic pipeline:</p>
         <code># In XrayTrafficJob.Run():
 xrayTraffics = GetXrayTraffic()
-l2tpTraffics = CollectL2tpTraffic()
+l2tp, pptp = nft.CollectAndResetTraffic()
 
 # Merge into single pipeline
 clientTraffics = append(
-  xrayTraffics, l2tpTraffics...)
+  xrayTraffics, l2tp..., pptp...)
 
 # Update DB (accumulative)
 AddTraffic(traffics, clientTraffics)
@@ -662,7 +662,7 @@ AddTraffic(traffics, clientTraffics)
             </div>
             <div class="chain-box" style="background: rgba(63, 185, 80, 0.1); color: var(--accent-green); border: 1px solid rgba(63, 185, 80, 0.3); text-align: left;">
               <strong>TPROXY Setup</strong><br>
-              <small style="color: var(--text-dim);">iptables mangle rules, ip rule/route, TPROXY redirect</small>
+              <small style="color: var(--text-dim);">nftables table ip vpn, ip rule/route, TPROXY redirect</small>
             </div>
             <div class="chain-box" style="background: rgba(63, 185, 80, 0.1); color: var(--accent-green); border: 1px solid rgba(63, 185, 80, 0.3); text-align: left;">
               <strong>Service Management</strong><br>
@@ -685,7 +685,17 @@ AddTraffic(traffics, clientTraffics)
           <li>
             <span class="badge badge-new">new</span>
             <span class="file-name">web/service/l2tp.go</span>
-            <span class="file-desc">L2TP service: config gen, TPROXY, traffic accounting</span>
+            <span class="file-desc">L2TP service: xl2tpd, Libreswan IPsec, PPP config gen</span>
+          </li>
+          <li>
+            <span class="badge badge-new">new</span>
+            <span class="file-name">web/service/pptp.go</span>
+            <span class="file-desc">PPTP service: pptpd, PPP config gen (mirrors L2TP)</span>
+          </li>
+          <li>
+            <span class="badge badge-new">new</span>
+            <span class="file-name">web/service/nftables.go</span>
+            <span class="file-desc">nftables: TPROXY, traffic accounting, IPsec filter</span>
           </li>
           <li>
             <span class="badge badge-mod">mod</span>
@@ -772,18 +782,23 @@ AddTraffic(traffics, clientTraffics)
           <li><span class="file-name">/etc/xl2tpd/xl2tpd.conf</span> <span class="file-desc">xl2tpd LNS config</span></li>
           <li><span class="file-name">/etc/ppp/options.xl2tpd-&lt;id&gt;</span> <span class="file-desc">PPP options per inbound</span></li>
           <li><span class="file-name">/etc/ppp/chap-secrets</span> <span class="file-desc">User credentials</span></li>
-          <li><span class="file-name">/etc/ipsec.conf</span> <span class="file-desc">IPsec connections</span></li>
+          <li><span class="file-name">/etc/ipsec.conf</span> <span class="file-desc">Libreswan IPsec connections</span></li>
           <li><span class="file-name">/etc/ipsec.secrets</span> <span class="file-desc">Pre-shared keys</span></li>
+          <li><span class="file-name">/etc/x-ui/vpn.nft</span> <span class="file-desc">nftables rules (table ip vpn)</span></li>
         </ul>
       </div>
 
       <div class="file-group">
         <h3><span class="dot" style="background: var(--accent-purple);"></span> Traffic Tracking</h3>
         <ul class="file-list">
-          <li><span class="file-name">/etc/x-ui/l2tp-usermap</span> <span class="file-desc">username &rarr; email map</span></li>
-          <li><span class="file-name">/etc/x-ui/l2tp-sessions</span> <span class="file-desc">Active sessions (email, IP, iface)</span></li>
-          <li><span class="file-name">/etc/ppp/ip-up.d/l2tp-acct</span> <span class="file-desc">Session start hook</span></li>
-          <li><span class="file-name">/etc/ppp/ip-down.d/l2tp-acct</span> <span class="file-desc">Session end hook</span></li>
+          <li><span class="file-name">/etc/x-ui/l2tp-usermap</span> <span class="file-desc">L2TP username &rarr; email map</span></li>
+          <li><span class="file-name">/etc/x-ui/l2tp-sessions</span> <span class="file-desc">L2TP active sessions (email, IP, iface)</span></li>
+          <li><span class="file-name">/etc/x-ui/pptp-usermap</span> <span class="file-desc">PPTP username &rarr; email map</span></li>
+          <li><span class="file-name">/etc/x-ui/pptp-sessions</span> <span class="file-desc">PPTP active sessions (email, IP, iface)</span></li>
+          <li><span class="file-name">/etc/ppp/ip-up.d/l2tp-acct</span> <span class="file-desc">L2TP session start hook (nft counters)</span></li>
+          <li><span class="file-name">/etc/ppp/ip-down.d/l2tp-acct</span> <span class="file-desc">L2TP session end hook</span></li>
+          <li><span class="file-name">/etc/ppp/ip-up.d/pptp-acct</span> <span class="file-desc">PPTP session start hook (nft counters)</span></li>
+          <li><span class="file-name">/etc/ppp/ip-down.d/pptp-acct</span> <span class="file-desc">PPTP session end hook</span></li>
         </ul>
       </div>
     </div>

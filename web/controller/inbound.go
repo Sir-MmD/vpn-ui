@@ -180,12 +180,6 @@ func (a *InboundController) delInbound(c *gin.Context) {
 	oldInbound, _ := a.inboundService.GetInbound(id)
 	isL2tp := oldInbound != nil && oldInbound.Protocol == model.L2TP
 	isPptp := oldInbound != nil && oldInbound.Protocol == model.PPTP
-	if isL2tp {
-		a.l2tpService.CleanupTproxy(oldInbound)
-	}
-	if isPptp {
-		a.pptpService.CleanupTproxy(oldInbound)
-	}
 	needRestart, err := a.inboundService.DelInbound(id)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)

@@ -11,7 +11,7 @@ L2TP/IPsec and PPTP clients are managed through the same panel UI, their traffic
 - **Full panel integration** — Create L2TP inbounds from the protocol dropdown, add/remove users with username and password
 - **IPsec encryption** — Optional IPsec with configurable pre-shared key (PSK)
 - **Xray routing** — L2TP traffic passes through Xray's routing rules via TPROXY + dokodemo-door bridge
-- **Per-client traffic tracking** — Upload/download bytes tracked per user via iptables accounting
+- **Per-client traffic tracking** — Upload/download bytes tracked per user via nftables accounting
 - **Client management** — Traffic limits, expiry dates, enable/disable, IP limits — same as any other protocol
 - **Real-time stats** — Traffic counters update every 10 seconds, online status displayed in the UI
 
@@ -20,7 +20,7 @@ L2TP/IPsec and PPTP clients are managed through the same panel UI, their traffic
 - **Full panel integration** — Create PPTP inbounds from the protocol dropdown, same UI as L2TP
 - **No IPsec** — PPTP uses MPPE encryption (MSCHAPv2 + 128-bit MPPE), no IPsec/PSK needed
 - **Xray routing** — Same TPROXY + dokodemo-door bridge as L2TP
-- **Per-client traffic tracking** — Same iptables accounting mechanism via `PPTP_ACCT` chain
+- **Per-client traffic tracking** — Same nftables accounting mechanism via `pptp_acct` chain
 - **Client management** — Traffic limits, expiry dates, enable/disable, bulk creation — same as L2TP
 - **Shared chap-secrets** — Both L2TP and PPTP write to `/etc/ppp/chap-secrets`, distinguished by server name (`l2tp-{id}` vs `pptp-{id}`)
 - **Separate subnets** — PPTP uses `10.1.x.0/24` (L2TP uses `10.0.x.0/24`)
@@ -34,12 +34,12 @@ L2TP Client                              PPTP Client
     |                                        |
     | (UDP 1701, encrypted with IPsec)       | (TCP 1723 + GRE)
     v                                        v
-strongSwan (IPsec)                        pptpd
+Libreswan (IPsec)                        pptpd
     |                                        |
     v                                        v
 xl2tpd --> pppd --> PPP (10.0.x.0/24)    pppd --> PPP (10.1.x.0/24)
                         |                              |
-                        | iptables TPROXY (mangle)     |
+                        | nftables TPROXY (mangle)     |
                         v                              v
               Xray dokodemo-door (port 123xx)
                         |
@@ -55,8 +55,8 @@ Each L2TP/PPTP inbound automatically gets:
 - A PPP subnet derived from the configured Local IP (e.g., `10.0.2.0/24` for L2TP, `10.1.2.0/24` for PPTP)
 - A TPROXY port (`12300 + inbound ID`)
 - A paired dokodemo-door inbound in the Xray config with the same tag
-- iptables rules to redirect PPP traffic to Xray
-- Per-client iptables accounting rules for traffic measurement
+- nftables rules to redirect PPP traffic to Xray
+- Per-client nftables accounting rules (named counters) for traffic measurement
 
 ### Per-Client Traffic Tracking
 
@@ -65,13 +65,13 @@ Since Xray's dokodemo-door sees all PPP traffic as a single stream without user 
 1. **pppd ip-up hook** — When a user authenticates via CHAP, pppd runs the protocol's ip-up script which:
    - Looks up the user's email from the usermap file
    - Records `email IP interface` in the sessions file
-   - Adds per-IP iptables accounting rules in the accounting chain (`L2TP_ACCT` or `PPTP_ACCT`)
+   - Adds per-IP nftables named counters and accounting rules in the `l2tp_acct` or `pptp_acct` chain
 
-2. **Traffic collection** — Every 10 seconds, `XrayTrafficJob` calls `CollectL2tpTraffic()` and `CollectPptpTraffic()` which:
-   - Reads the sessions file to map IPs to client emails
-   - Reads iptables byte counters from the accounting chain
-   - Zeros the counters after reading
-   - Returns per-client traffic deltas that feed into the existing traffic pipeline
+2. **Traffic collection** — Every 10 seconds, `XrayTrafficJob` calls `NftService.CollectAndResetTraffic()` which:
+   - Atomically reads and resets all named counters via `nft -j reset counters table ip vpn`
+   - Parses JSON output to map counter names to client IPs
+   - Maps IPs to client emails via session files
+   - Returns separate L2TP and PPTP per-client traffic deltas
 
 3. **pppd ip-down hook** — When a user disconnects, the ip-down script removes their session entry
 
@@ -85,7 +85,7 @@ The L2TP and PPTP integrations require the following packages on the server:
 
 ```bash
 # Debian/Ubuntu
-apt install xl2tpd ppp strongswan    # for L2TP/IPsec
+apt install xl2tpd ppp libreswan     # for L2TP/IPsec
 apt install pptpd                     # for PPTP
 
 # The kernel must have PPP modules (l2tp_ppp, ppp_generic, ppp_mppe)
@@ -207,13 +207,14 @@ This blocks ads for all L2TP and PPTP clients, just as it would for any Xray pro
 
 ## Files Modified
 
-### Backend (Go) — 9 files modified, 2 new
+### Backend (Go) — 9 files modified, 3 new
 
 | File | Change |
 |------|--------|
 | `database/model/model.go` | `L2TP` and `PPTP` protocol constants |
-| `web/service/l2tp.go` | **New** — L2TP service: config generation, TPROXY, traffic accounting |
+| `web/service/l2tp.go` | **New** — L2TP service: xl2tpd, Libreswan IPsec, PPP config generation |
 | `web/service/pptp.go` | **New** — PPTP service: mirrors L2TP without IPsec |
+| `web/service/nftables.go` | **New** — nftables service: TPROXY rules, traffic accounting, IPsec filter |
 | `web/service/xray.go` | Skip L2TP/PPTP inbounds + inject dokodemo-door |
 | `web/service/inbound.go` | Client-key switches for L2TP/PPTP (password-based, like Trojan) |
 | `web/service/server.go` | DB import restores L2TP + PPTP configs |

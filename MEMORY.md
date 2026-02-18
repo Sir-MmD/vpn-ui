@@ -231,19 +231,54 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
 - **Root cause**: xl2tpd listens on `0.0.0.0:1701` regardless of IPsec config. The `allowRaw` toggle only affected ipsec.conf `leftprotoport`/`forceencaps`, but didn't prevent direct UDP connections to xl2tpd.
 - **Fix**: New `SetupRawL2tpFilter()` method in `web/service/l2tp.go`. When `allowRaw=false`, adds: `iptables -I INPUT 1 -p udp --dport 1701 -m policy --dir in --pol none -j DROP`. The `-m policy --pol none` match drops packets that didn't arrive through IPsec. When `allowRaw=true`, rule is removed. Called from `GenerateAllConfigs()`.
 
-### Windows 10 L2TP PSK: xl2tpd require-chap conflict (commit bcbf085f)
-- **Root cause**: `GenerateXl2tpdConfig()` in `web/service/l2tp.go` wrote `require chap = yes` in xl2tpd.conf `[lns]` section. xl2tpd passes LNS options as pppd command-line args (`refuse-pap auth require-chap`), which took effect BEFORE the PPP options file (`refuse-chap` + `require-mschap-v2`). The `require-chap` from command line caused pppd to request plain CHAP auth from clients. Windows L2TP/IPsec expects MSCHAPv2 and may reject or have issues with plain CHAP.
-- **Fix**: Removed `require chap = yes` from xl2tpd.conf generation. Now xl2tpd only passes `refuse-pap auth` on the pppd command line, allowing the PPP options file's `require-mschap-v2` to take effect. Also added `flow bit = yes` for proper L2TP flow control.
-- **Verified**: pppd debug log confirms server now requests `<auth chap MS-v2>` in LCP ConfReq (MSCHAPv2), not plain CHAP.
-- **Key discovery**: pppd logs "Peer X authenticated with CHAP" even for MSCHAPv2 — the log message is generic for all CHAP variants.
+### SoftEther/hwdsl2-aligned L2TP config (commit f5785464)
+- **Context**: Windows 10 L2TP PSK still not connecting. Researched SoftEther VPN source and hwdsl2/setup-ipsec-vpn (most popular L2TP setup script). Applied their configuration patterns.
+- **PPP options** now match hwdsl2 exactly:
+  - `+mschap-v2` (additive, not `require-mschap-v2` which is exclusive)
+  - `ipcp-accept-local` + `ipcp-accept-remote` (flexible IP negotiation)
+  - `noccp` (disable CCP, avoids MPPE negotiation issues)
+  - `connect-delay 5000` (5s delay for slow clients)
+  - Removed `refuse-pap`, `refuse-chap` (xl2tpd handles via `require chap = yes`)
+- **xl2tpd.conf**: Restored `require chap = yes` (matches hwdsl2), kept `flow bit = yes`
+- **IPsec config** changes:
+  - Added `keyexchange=ikev1` (explicit IKEv1)
+  - Changed `leftprotoport=17/1701` (specific L2TP port, matches hwdsl2)
+  - Increased `ikelifetime=24h`, `keylife=24h` (matches hwdsl2)
+  - Use `sha2` shorthand in cipher proposals
 
-### Key pattern reinforced
+### StrongSwan → Libreswan Migration: SOLVED Windows L2TP
+- **Status**: SOLVED as of 2026-02-18 (session 6)
+- **Root cause**: StrongSwan 6.x has a fundamental incompatibility with Windows 10/11 L2TP/IPsec in transport mode with NAT-T. IPsec SA establishes but Windows never sends L2TP packets through it (zero bytes on every SA). This is NOT a config issue — XFRM state is correct server-side.
+- **Solution**: Replaced StrongSwan with **Libreswan 5.2** (same as hwdsl2 project uses)
+- **Results**:
+  - Windows 10 LTSC: WORKS (AES_CBC_256-HMAC_SHA1_96, confirmed traffic flow)
+  - Windows 11: Fixed by removing `sha2-truncbug=yes` (truncates SHA2-256 to 96 bits, breaks Win11 which uses correct 128-bit)
+  - iPhone/iOS: Added ECP DH groups (DH19/DH20) for IKE proposals
+- **Code changes** (`web/service/l2tp.go`):
+  - `GenerateIPsecConfig()` now writes `/etc/ipsec.conf` (Libreswan format) + `/etc/ipsec.secrets` (mode 0600)
+  - Old swanctl config at `/etc/swanctl/conf.d/l2tp.conf` is cleaned up
+  - `RestartServices()` just calls `ipsec restart` (no more `swanctl --load-all`)
+- **Libreswan config format**:
+  - `config setup`: `uniqueids=no`, `ikev1-policy=accept`, `logfile=/var/log/pluto.log`
+  - `conn l2tp-psk`: `type=transport`, `authby=secret`, `pfs=no`, `rekey=no`, `keyexchange=ikev1`
+  - IKE: `aes256-sha2;modp2048,...,aes256-sha2;dh20,aes256-sha2;dh19,...` (MODP2048 for Windows, ECP for iOS)
+  - ESP: `aes256-sha2,aes128-sha2,aes256-sha1,aes128-sha1,3des-sha1`
+- **Key lessons**:
+  - `sha2-truncbug=yes` breaks Windows 11 (uses correct 128-bit SHA2-256 truncation)
+  - Libreswan 5.2 dropped `modp1024` support — use `modp2048` minimum
+  - Libreswan 5.2 drops IKEv1 by default — must set `ikev1-policy=accept`
+  - `dpdaction=clear` is obsolete in Libreswan 5.2
+  - Server has both StrongSwan (disabled) and Libreswan installed — StrongSwan can be removed
+- **Dependencies**: `apt-get install libreswan` (replaces strongswan for L2TP)
+
+### Key patterns reinforced
 - `DelInboundClient()` must use `password` as client_key for trojan/l2tp/pptp protocols (not `id`)
 - TPROXY dokodemo-door must listen on `0.0.0.0` (not `127.0.0.1`) for TPROXY to work
 - L2TP PPP options must NOT include `lock` (incompatible with pppol2tp kernel plugin)
 - IPsec `forceencaps=yes` is required for Windows/NAT compatibility — always enable it
-- xl2tpd.conf must NOT have `require chap = yes` — it overrides PPP options file auth settings
-- xl2tpd passes LNS section auth options as pppd command-line args, which have higher priority than options file
+- xl2tpd `require chap = yes` works fine with PPP `+mschap-v2` (additive); it conflicted with `require-mschap-v2` (exclusive)
+- pppd logs "Peer X authenticated with CHAP" even for MSCHAPv2 — generic log message
+- Windows registry `AssumeUDPEncapsulationContextOnSendRule=2` needed for NAT-T L2TP
 
 ## L2TP Enforcement Architecture
 - Traffic/expiry limits detected by `disableInvalidClients()` in inbound.go (same SQL for all protocols)
@@ -255,3 +290,20 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
   3. Regenerates usermap (same exclusion)
 - `GenerateChapSecrets` and `GenerateUserMap` cross-check `client_traffics.enable` (not just JSON `Enable`)
 - Controller reset methods (`resetClientTraffic`, `resetAllTraffics`, `resetAllClientTraffics`) call `onL2tpChanged()` to re-add users after reset
+
+## nftables Migration (2026-02-18, session 5)
+- **Migrated**: L2TP/PPTP from ~20 iptables commands to native nftables (`table ip vpn`)
+- **New file**: `web/service/nftables.go` — NftService with ApplyNftRules(), CollectAndResetTraffic(), CleanupLegacyIptables()
+- **Architecture**: Single `table ip vpn` with 5 chains: prerouting (TPROXY + jumps), postrouting (jumps), input (raw L2TP filter), l2tp_acct (dynamic per-client), pptp_acct (dynamic per-client)
+- **Key design**: Static chains (prerouting/postrouting/input) are flushed+rebuilt on config regen. Accounting chains (l2tp_acct/pptp_acct) are NEVER flushed — their dynamic per-client rules (added by ip-up.d) survive.
+- **Named counters**: `l2tp_up_10_0_2_10`, `l2tp_down_10_0_2_10`, etc. Created by ip-up.d, deleted by ip-down.d.
+- **Traffic collection**: `nft -j reset counters table ip vpn` — atomic read+reset, JSON output. Replaces fragile iptables text parsing and the race-prone separate -L/-Z calls.
+- **Config file**: `/etc/x-ui/vpn.nft` — loaded atomically with `nft -f`
+- **IPsec filter**: `meta secpath exists` in nft (replaces `-m policy --dir in --pol none`)
+- **ip-up/ip-down scripts**: Each protocol's script exits early if username not in its usermap (prevents cross-protocol spurious counters)
+- **Removed from l2tp.go**: SetupRawL2tpFilter, SetupTproxy, CleanupTproxy, SetupAcctChain, CollectL2tpTraffic, l2tpAcctChain constant
+- **Removed from pptp.go**: SetupTproxy, CleanupTproxy, SetupAcctChain, CollectPptpTraffic, pptpAcctChain constant
+- **Removed from inbound.go**: CleanupTproxy calls in delInbound (nft regen handles it)
+- **xray_traffic_job.go**: Single `nftService.CollectAndResetTraffic()` replaces two separate collection calls
+- **Modprobe change**: `xt_TPROXY` → `nf_tproxy_ipv4` (nftables kernel module)
+- **Tested**: L2TP and PPTP connections, traffic counting, counter reset, disconnect cleanup, legacy iptables cleanup — all verified on x-server
