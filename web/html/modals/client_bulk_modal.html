@@ -338,6 +338,8 @@
                     return new Inbound.L2tpSettings.L2tpUser();
                 case Protocols.PPTP:
                     return new Inbound.PptpSettings.PptpUser();
+                case Protocols.OPENVPN:
+                    return new Inbound.OpenvpnSettings.OpenvpnUser();
                 default:
                     return null;
             }

@@ -1,8 +1,8 @@
-# VPN-UI (3x-ui + L2TP/IPsec + PPTP)
+# VPN-UI (3x-ui + L2TP/IPsec + PPTP + OpenVPN)
 
-A fork of [3x-ui](https://github.com/MHSanaei/3x-ui) that adds **L2TP/IPsec** and **PPTP** as first-class inbound protocols alongside the existing Xray protocols (VMess, VLESS, Trojan, Shadowsocks, etc.).
+A fork of [3x-ui](https://github.com/MHSanaei/3x-ui) that adds **L2TP/IPsec**, **PPTP**, and **OpenVPN** as first-class inbound protocols alongside the existing Xray protocols (VMess, VLESS, Trojan, Shadowsocks, etc.).
 
-L2TP/IPsec and PPTP clients are managed through the same panel UI, their traffic is routed through Xray's routing engine, and per-client traffic is tracked and displayed in real time.
+All VPN clients are managed through the same panel UI, with per-client traffic tracking and real-time stats.
 
 ## What's New
 
@@ -24,39 +24,46 @@ L2TP/IPsec and PPTP clients are managed through the same panel UI, their traffic
 - **Client management** — Traffic limits, expiry dates, enable/disable, bulk creation — same as L2TP
 - **Separate subnets** — PPTP uses `10.1.x.0/24` (L2TP uses `10.0.x.0/24`)
 
+### OpenVPN Protocol Support
+
+- **Full panel integration** — Create OpenVPN inbounds from the protocol dropdown, same user management UI
+- **Dual protocol** — Each inbound runs two OpenVPN instances: UDP (default 1194) and TCP (configurable port)
+- **Certificate management** — Generate self-signed CA + server cert + tls-crypt key from the panel, or paste your own
+- **Client config download** — Download `.ovpn` files (UDP or TCP) directly from the panel
+- **Direct NAT routing** — OpenVPN traffic is NATed directly to the internet (no Xray/TPROXY)
+- **Per-client traffic tracking** — Same nftables accounting as L2TP/PPTP
+- **Separate subnets** — UDP uses `10.2.x.0/24`, TCP uses `10.3.x.0/24`
+
 ### Embedded RADIUS Server
 
-Authentication and session management for both L2TP and PPTP use an embedded RADIUS server (Go, `layeh.com/radius`) running on `127.0.0.1:1812-1813`:
+Authentication and session management for L2TP, PPTP, and OpenVPN use an embedded RADIUS server (Go, `layeh.com/radius`) running on `127.0.0.1:1812-1813`:
 
-- **Live auth** — pppd authenticates via RADIUS (MS-CHAPv2), which queries SQLite in real time — no flat credential files to regenerate
+- **Live auth** — pppd authenticates via RADIUS (MS-CHAPv2 for L2TP/PPTP, PAP for OpenVPN), which queries SQLite in real time — no flat credential files to regenerate
 - **Session lifecycle** — RADIUS Acct-Start/Stop events create and remove per-client nftables accounting counters automatically
-- **Disable = instant block** — Disabling a client in the panel takes effect on the next auth attempt; active sessions are killed
+- **Disable = instant block** — Disabling a client in the panel takes effect on the next auth attempt; active sessions are killed (PPP sessions via signal, OpenVPN via management socket)
 - **Crash recovery** — If the panel restarts while PPP sessions are alive, periodic RADIUS Acct-Interim-Update re-registers them within 60 seconds
 
 ### How It Works
 
-L2TP and PPTP are not native Xray protocols, so a bridge architecture routes their traffic through Xray:
+L2TP and PPTP are not native Xray protocols, so a bridge architecture routes their traffic through Xray. OpenVPN uses direct NAT routing (no Xray).
 
 ```
-L2TP Client                              PPTP Client
-    |                                        |
-    | (UDP 1701, encrypted with IPsec)       | (TCP 1723 + GRE)
-    v                                        v
-Libreswan (IPsec)                        pptpd
-    |                                        |
-    v                                        v
-xl2tpd --> pppd --> PPP (10.0.x.0/24)    pppd --> PPP (10.1.x.0/24)
-                        |                              |
-                        | nftables TPROXY (mangle)     |
-                        v                              v
-              Xray dokodemo-door (port 123xx)
-                        |
-                        v
-              Xray Routing Engine
-                        |
-              +---------+---------+
-              |         |         |
-            Direct   Proxy    Block
+L2TP Client              PPTP Client              OpenVPN Client
+    |                        |                        |
+    | (UDP 1701 + IPsec)    | (TCP 1723 + GRE)      | (UDP 1194 / TCP 443)
+    v                        v                        v
+Libreswan (IPsec)        pptpd                   openvpn
+    |                        |                        |
+    v                        v                        v
+xl2tpd --> pppd          pppd                    tun device
+PPP (10.0.x.0/24)        PPP (10.1.x.0/24)       (10.2.x.0/24 UDP, 10.3.x.0/24 TCP)
+    |                        |                        |
+    | nftables TPROXY        |                        | nftables MASQUERADE
+    v                        v                        v
+Xray dokodemo-door       Xray dokodemo-door       Direct NAT
+    |                        |                        |
+    v                        v                        v
+Xray Routing Engine      Xray Routing Engine       Internet
 ```
 
 Each L2TP/PPTP inbound automatically gets:
@@ -65,6 +72,12 @@ Each L2TP/PPTP inbound automatically gets:
 - A paired dokodemo-door inbound in the Xray config with the same tag
 - nftables rules to redirect PPP traffic to Xray
 - Per-client nftables accounting rules (named counters) for traffic measurement
+
+Each OpenVPN inbound automatically gets:
+- Two OpenVPN server instances (UDP + TCP) with separate tun devices
+- NAT masquerade rules for the OpenVPN subnets
+- Per-client nftables accounting rules (same as L2TP/PPTP)
+- Auth/session scripts that integrate with the embedded RADIUS server
 
 ### Per-Client Traffic Tracking
 
@@ -88,12 +101,13 @@ Open [`docs/architecture.html`](docs/architecture.html) in a browser to see an i
 
 ## Prerequisites
 
-The L2TP and PPTP integrations require the following packages on the server:
+The VPN integrations require the following packages on the server:
 
 ```bash
 # Debian/Ubuntu
 apt install xl2tpd ppp libreswan libradcli4   # for L2TP/IPsec
 apt install pptpd                              # for PPTP
+apt install openvpn                            # for OpenVPN
 
 # The kernel must have PPP modules (l2tp_ppp, ppp_generic, ppp_mppe)
 # Cloud kernels (e.g., Hetzner) may lack these — install the full kernel:
@@ -198,9 +212,31 @@ Users can connect with any PPTP client using:
 - **Username/Password**: As configured in the panel
 - **Type**: PPTP (no PSK needed)
 
+### Creating an OpenVPN Inbound
+
+1. Open the panel at `http://your-server:2053`
+2. Click **Add Inbound**
+3. Select **openvpn** from the Protocol dropdown
+4. Configure:
+   - **Port**: `1194` (UDP port, standard OpenVPN)
+   - **TCP Port**: `443` (TCP port for the second instance)
+   - **DNS 1/2**: DNS servers pushed to clients
+   - **MTU**: Typically `1500` for OpenVPN
+5. Click **Add** to save
+6. Click the inbound row to expand settings, then click **Generate Self-Signed CA** to create certificates
+7. Add clients with Username and Password
+
+### Managing OpenVPN Users
+
+Same as L2TP/PPTP — click the **+** button on the OpenVPN inbound row, set Username, Password, Email, and optional limits.
+
+To download client configs, expand the inbound settings and click **Download UDP Config** or **Download TCP Config**. The `.ovpn` file includes all certificates and settings — users just need to import it and enter their username/password when connecting.
+
 ### Applying Xray Routing Rules
 
-L2TP and PPTP traffic flows through Xray's routing engine. The inbound's **tag** (e.g., `inbound-1701` for L2TP, `inbound-1723` for PPTP) can be used in routing rules:
+L2TP and PPTP traffic flows through Xray's routing engine. The inbound's **tag** (e.g., `inbound-1701` for L2TP, `inbound-1723` for PPTP) can be used in routing rules.
+
+**Note**: OpenVPN traffic uses direct NAT routing and does not pass through Xray.
 
 ```json
 {
@@ -214,41 +250,44 @@ This blocks ads for all L2TP and PPTP clients, just as it would for any Xray pro
 
 ## Files Modified
 
-### Backend (Go) — 10 files modified, 4 new
+### Backend (Go) — 11 files modified, 5 new
 
 | File | Change |
 |------|--------|
-| `database/model/model.go` | `L2TP` and `PPTP` protocol constants |
+| `database/model/model.go` | `L2TP`, `PPTP`, `OPENVPN` protocol constants |
 | `web/service/l2tp.go` | **New** — L2TP service: xl2tpd, Libreswan IPsec, PPP config generation |
 | `web/service/pptp.go` | **New** — PPTP service: mirrors L2TP without IPsec |
-| `web/service/nftables.go` | **New** — nftables service: TPROXY rules, traffic accounting, IPsec filter |
-| `web/service/radius.go` | **New** — Embedded RADIUS server: MS-CHAPv2 auth, accounting, session tracking |
+| `web/service/openvpn.go` | **New** — OpenVPN service: dual UDP/TCP instances, cert gen, management socket |
+| `web/service/nftables.go` | **New** — nftables service: TPROXY rules, traffic accounting, NAT, IPsec filter |
+| `web/service/radius.go` | **New** — Embedded RADIUS server: MS-CHAPv2 + PAP auth, accounting, session tracking |
 | `web/service/xray.go` | Skip L2TP/PPTP inbounds + inject dokodemo-door |
-| `web/service/inbound.go` | Client-key switches for L2TP/PPTP (password-based, like Trojan) |
-| `web/service/server.go` | DB import restores L2TP + PPTP configs |
-| `web/controller/inbound.go` | CRUD hooks trigger L2TP/PPTP config regeneration |
-| `web/web.go` | L2TP + PPTP + RADIUS initialization on startup |
-| `web/service/tgbot.go` | Exclude L2TP/PPTP from Telegram bot protocol handling |
-| `web/job/xray_traffic_job.go` | Merge L2TP + PPTP per-client traffic into collection pipeline |
+| `web/service/inbound.go` | Client-key switches for L2TP/PPTP/OpenVPN (password-based, like Trojan) |
+| `web/service/server.go` | DB import restores L2TP + PPTP + OpenVPN configs |
+| `web/controller/inbound.go` | CRUD hooks trigger L2TP/PPTP/OpenVPN config regeneration, cert/config download routes |
+| `web/web.go` | L2TP + PPTP + OpenVPN + RADIUS initialization on startup |
+| `web/service/tgbot.go` | Exclude L2TP/PPTP/OpenVPN from Telegram bot protocol handling |
+| `web/job/xray_traffic_job.go` | Merge L2TP + PPTP + OpenVPN per-client traffic into collection pipeline |
+| `main.go` | OpenVPN RADIUS client subcommands (`openvpn-auth`, `openvpn-connect`, `openvpn-disconnect`) |
 
 ### Frontend (JS) — 2 files modified
 
 | File | Change |
 |------|--------|
-| `web/assets/js/model/inbound.js` | `L2tpSettings`, `L2tpUser`, `PptpSettings`, `PptpUser` classes |
-| `web/assets/js/model/dbinbound.js` | `isL2tp`, `isPptp` getters, multi-user support |
+| `web/assets/js/model/inbound.js` | `L2tpSettings`, `L2tpUser`, `PptpSettings`, `PptpUser`, `OpenVpnSettings`, `OpenVpnUser` classes |
+| `web/assets/js/model/dbinbound.js` | `isL2tp`, `isPptp`, `isOpenVpn` getters, multi-user support |
 
-### Frontend (HTML) — 6 files modified, 2 new
+### Frontend (HTML) — 6 files modified, 3 new
 
 | File | Change |
 |------|--------|
 | `web/html/form/protocol/l2tp.html` | **New** — L2TP settings form (IPsec, IP range, DNS, MTU) |
 | `web/html/form/protocol/pptp.html` | **New** — PPTP settings form (IP range, DNS, MTU) |
-| `web/html/form/inbound.html` | Include L2TP + PPTP form templates |
-| `web/html/form/client.html` | Username + password fields for L2TP/PPTP clients |
-| `web/html/inbounds.html` | Client identification for L2TP/PPTP |
-| `web/html/modals/client_modal.html` | Client add/edit for L2TP/PPTP |
-| `web/html/modals/client_bulk_modal.html` | Bulk client creation for L2TP/PPTP |
+| `web/html/form/protocol/openvpn.html` | **New** — OpenVPN settings form (TCP port, DNS, MTU, certs, config download) |
+| `web/html/form/inbound.html` | Include L2TP + PPTP + OpenVPN form templates |
+| `web/html/form/client.html` | Username + password fields for L2TP/PPTP/OpenVPN clients |
+| `web/html/inbounds.html` | Client identification for L2TP/PPTP/OpenVPN |
+| `web/html/modals/client_modal.html` | Client add/edit for L2TP/PPTP/OpenVPN |
+| `web/html/modals/client_bulk_modal.html` | Bulk client creation for L2TP/PPTP/OpenVPN |
 
 ### Generated Config Files (on server at runtime)
 
@@ -275,6 +314,17 @@ This blocks ads for all L2TP and PPTP clients, just as it would for any Xray pro
 | `/etc/ppp/radius/<proto>-<id>.conf` | Per-inbound RADIUS client config (NAS-Identifier, server, dictionary) |
 | `/etc/ppp/radius/servers` | Shared RADIUS secret file |
 | `/etc/ppp/radius/dictionary` | Self-contained RADIUS dictionary (standard + Microsoft VSAs) |
+
+#### OpenVPN
+
+| File | Purpose |
+|------|---------|
+| `/etc/openvpn/server/server-<id>-udp.conf` | Per-inbound UDP server config |
+| `/etc/openvpn/server/server-<id>-tcp.conf` | Per-inbound TCP server config |
+| `/etc/openvpn/server-<id>/ca.crt` | CA certificate |
+| `/etc/openvpn/server-<id>/server.crt` | Server certificate |
+| `/etc/openvpn/server-<id>/server.key` | Server private key |
+| `/etc/openvpn/server-<id>/tc.key` | tls-crypt key |
 
 #### nftables
 

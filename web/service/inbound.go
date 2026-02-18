@@ -644,7 +644,7 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 	// Secure client ID
 	for _, client := range clients {
 		switch oldInbound.Protocol {
-		case "trojan", "l2tp", "pptp":
+		case "trojan", "l2tp", "pptp", "openvpn":
 			if client.Password == "" {
 				return false, common.NewError("empty client ID")
 			}
@@ -659,8 +659,8 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 		}
 	}
 
-	// Check for duplicate L2TP/PPTP usernames
-	if oldInbound.Protocol == "l2tp" || oldInbound.Protocol == "pptp" {
+	// Check for duplicate L2TP/PPTP/OpenVPN usernames
+	if oldInbound.Protocol == "l2tp" || oldInbound.Protocol == "pptp" || oldInbound.Protocol == "openvpn" {
 		dupUser, err := s.checkPPPUsernamesForDuplicates(string(oldInbound.Protocol), clients)
 		if err != nil {
 			return false, err
@@ -747,7 +747,7 @@ func (s *InboundService) DelInboundClient(inboundId int, clientId string) (bool,
 
 	email := ""
 	client_key := "id"
-	if oldInbound.Protocol == "trojan" || oldInbound.Protocol == "l2tp" || oldInbound.Protocol == "pptp" {
+	if oldInbound.Protocol == "trojan" || oldInbound.Protocol == "l2tp" || oldInbound.Protocol == "pptp" || oldInbound.Protocol == "openvpn" {
 		client_key = "password"
 	}
 	if oldInbound.Protocol == "shadowsocks" {
@@ -852,7 +852,7 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 	for index, oldClient := range oldClients {
 		oldClientId := ""
 		switch oldInbound.Protocol {
-		case "trojan", "l2tp", "pptp":
+		case "trojan", "l2tp", "pptp", "openvpn":
 			oldClientId = oldClient.Password
 			newClientId = clients[0].Password
 		case "shadowsocks":
@@ -884,8 +884,8 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 		}
 	}
 
-	// Check for duplicate L2TP/PPTP usernames (allow keeping the same username)
-	if oldInbound.Protocol == "l2tp" || oldInbound.Protocol == "pptp" {
+	// Check for duplicate L2TP/PPTP/OpenVPN usernames (allow keeping the same username)
+	if oldInbound.Protocol == "l2tp" || oldInbound.Protocol == "pptp" || oldInbound.Protocol == "openvpn" {
 		oldUsername := oldClients[clientIndex].ID
 		newUsername := clients[0].ID
 		if newUsername != oldUsername {
@@ -1011,7 +1011,7 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 	return needRestart, tx.Save(oldInbound).Error
 }
 
-func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraffics []*xray.ClientTraffic) (error, bool, []string, []string) {
+func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraffics []*xray.ClientTraffic) (error, bool, []string, []string, []string) {
 	var err error
 	db := database.GetDB()
 	tx := db.Begin()
@@ -1025,11 +1025,11 @@ func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraff
 	}()
 	err = s.addInboundTraffic(tx, inboundTraffics)
 	if err != nil {
-		return err, false, nil, nil
+		return err, false, nil, nil, nil
 	}
 	err = s.addClientTraffic(tx, clientTraffics)
 	if err != nil {
-		return err, false, nil, nil
+		return err, false, nil, nil, nil
 	}
 
 	needRestart0, count, err := s.autoRenewClients(tx)
@@ -1039,7 +1039,7 @@ func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraff
 		logger.Debugf("%v clients renewed", count)
 	}
 
-	needRestart1, count, l2tpDisabledEmails, pptpDisabledEmails, err := s.disableInvalidClients(tx)
+	needRestart1, count, l2tpDisabledEmails, pptpDisabledEmails, ovpnDisabledEmails, err := s.disableInvalidClients(tx)
 	if err != nil {
 		logger.Warning("Error in disabling invalid clients:", err)
 	} else if count > 0 {
@@ -1052,7 +1052,7 @@ func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraff
 	} else if count > 0 {
 		logger.Debugf("%v inbounds disabled", count)
 	}
-	return nil, (needRestart0 || needRestart1 || needRestart2), l2tpDisabledEmails, pptpDisabledEmails
+	return nil, (needRestart0 || needRestart1 || needRestart2), l2tpDisabledEmails, pptpDisabledEmails, ovpnDisabledEmails
 }
 
 func (s *InboundService) addInboundTraffic(tx *gorm.DB, traffics []*xray.Traffic) error {
@@ -1325,11 +1325,12 @@ func (s *InboundService) disableInvalidInbounds(tx *gorm.DB) (bool, int64, error
 	return needRestart, count, err
 }
 
-func (s *InboundService) disableInvalidClients(tx *gorm.DB) (bool, int64, []string, []string, error) {
+func (s *InboundService) disableInvalidClients(tx *gorm.DB) (bool, int64, []string, []string, []string, error) {
 	now := time.Now().Unix() * 1000
 	needRestart := false
 	var l2tpDisabledEmails []string
 	var pptpDisabledEmails []string
+	var ovpnDisabledEmails []string
 
 	if p != nil {
 		var results []struct {
@@ -1344,7 +1345,7 @@ func (s *InboundService) disableInvalidClients(tx *gorm.DB) (bool, int64, []stri
 			Where("((client_traffics.total > 0 AND client_traffics.up + client_traffics.down >= client_traffics.total) OR (client_traffics.expiry_time > 0 AND client_traffics.expiry_time <= ?)) AND client_traffics.enable = ?", now, true).
 			Scan(&results).Error
 		if err != nil {
-			return false, 0, nil, nil, err
+			return false, 0, nil, nil, nil, err
 		}
 		s.xrayApi.Init(p.GetAPIPort())
 		for _, result := range results {
@@ -1354,6 +1355,10 @@ func (s *InboundService) disableInvalidClients(tx *gorm.DB) (bool, int64, []stri
 			}
 			if result.Protocol == "pptp" {
 				pptpDisabledEmails = append(pptpDisabledEmails, result.Email)
+				continue
+			}
+			if result.Protocol == "openvpn" {
+				ovpnDisabledEmails = append(ovpnDisabledEmails, result.Email)
 				continue
 			}
 			err1 := s.xrayApi.RemoveUser(result.Tag, result.Email)
@@ -1379,7 +1384,7 @@ func (s *InboundService) disableInvalidClients(tx *gorm.DB) (bool, int64, []stri
 		Update("enable", false)
 	err := result.Error
 	count := result.RowsAffected
-	return needRestart, count, l2tpDisabledEmails, pptpDisabledEmails, err
+	return needRestart, count, l2tpDisabledEmails, pptpDisabledEmails, ovpnDisabledEmails, err
 }
 
 func (s *InboundService) GetInboundTags() (string, error) {

@@ -1,0 +1,107 @@
+{{define "form/openvpn"}}
+<a-form
+    :colon="false"
+    :label-col="{ md: {span:8} }"
+    :wrapper-col="{ md: {span:14} }"
+>
+    <a-form-item label="TCP Port">
+        <a-input-number
+            v-model.number="inbound.settings.tcpPort"
+            :min="1"
+            :max="65535"
+            placeholder="443"
+        ></a-input-number>
+        <span :style="{ marginLeft: '8px', color: '#888' }">
+            UDP port uses the inbound port above
+        </span>
+    </a-form-item>
+    <a-form-item label="DNS 1">
+        <a-input
+            v-model.trim="inbound.settings.dns1"
+            placeholder="8.8.8.8"
+        ></a-input>
+    </a-form-item>
+    <a-form-item label="DNS 2">
+        <a-input
+            v-model.trim="inbound.settings.dns2"
+            placeholder="8.8.4.4"
+        ></a-input>
+    </a-form-item>
+    <a-form-item label="MTU">
+        <a-input-number
+            v-model.number="inbound.settings.mtu"
+            :min="1200"
+            :max="1500"
+        ></a-input-number>
+    </a-form-item>
+    <a-divider>Certificates</a-divider>
+    <a-form-item label="CA Certificate">
+        <a-textarea
+            v-model="inbound.settings.caCert"
+            :rows="3"
+            placeholder="-----BEGIN CERTIFICATE-----"
+        ></a-textarea>
+    </a-form-item>
+    <a-form-item label="CA Key">
+        <a-textarea
+            v-model="inbound.settings.caKey"
+            :rows="3"
+            placeholder="-----BEGIN EC PRIVATE KEY-----"
+        ></a-textarea>
+    </a-form-item>
+    <a-form-item label="Server Certificate">
+        <a-textarea
+            v-model="inbound.settings.serverCert"
+            :rows="3"
+            :read-only="true"
+            placeholder="Auto-generated from CA"
+        ></a-textarea>
+    </a-form-item>
+    <a-form-item label="Server Key">
+        <a-textarea
+            v-model="inbound.settings.serverKey"
+            :rows="3"
+            :read-only="true"
+            placeholder="Auto-generated from CA"
+        ></a-textarea>
+    </a-form-item>
+    <a-form-item label="TLS-Crypt Key">
+        <a-textarea
+            v-model="inbound.settings.tlsCrypt"
+            :rows="3"
+            :read-only="true"
+            placeholder="Auto-generated"
+        ></a-textarea>
+    </a-form-item>
+    <a-form-item :wrapper-col="{ md: {offset:8, span:14} }">
+        <a-button
+            type="primary"
+            @click="generateOpenVpnCerts"
+            :disabled="!inbound.id"
+        >
+            Generate Self-Signed CA
+        </a-button>
+        <span v-if="!inbound.id" :style="{ marginLeft: '8px', color: '#888' }">
+            Save the inbound first
+        </span>
+    </a-form-item>
+    <template v-if="inbound.id && inbound.settings.caCert">
+        <a-divider>Client Config</a-divider>
+        <a-form-item :wrapper-col="{ md: {offset:8, span:14} }">
+            <a-button
+                icon="download"
+                @click="downloadOvpn('udp')"
+                :style="{ marginRight: '8px' }"
+            >
+                UDP Config (.ovpn)
+            </a-button>
+            <a-button
+                icon="download"
+                @click="downloadOvpn('tcp')"
+            >
+                TCP Config (.ovpn)
+            </a-button>
+        </a-form-item>
+    </template>
+</a-form>
+{{end}}

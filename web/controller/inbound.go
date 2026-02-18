@@ -17,10 +17,11 @@ import (
 
 // InboundController handles HTTP requests related to Xray inbounds management.
 type InboundController struct {
-	inboundService service.InboundService
-	xrayService    service.XrayService
-	l2tpService    service.L2tpService
-	pptpService    service.PptpService
+	inboundService  service.InboundService
+	xrayService     service.XrayService
+	l2tpService     service.L2tpService
+	pptpService     service.PptpService
+	openvpnService  service.OpenVpnService
 }
 
 // NewInboundController creates a new InboundController and sets up its routes.
@@ -55,6 +56,8 @@ func (a *InboundController) initRouter(g *gin.RouterGroup) {
 	g.POST("/lastOnline", a.lastOnline)
 	g.POST("/updateClientTraffic/:email", a.updateClientTraffic)
 	g.POST("/:id/delClientByEmail/:email", a.delInboundClientByEmail)
+	g.GET("/:id/ovpn/:proto", a.downloadOvpn)
+	g.POST("/:id/generate-openvpn-certs", a.generateOpenVpnCerts)
 }
 
 // onL2tpChanged regenerates L2TP configs and restarts services when an L2TP inbound is modified.
@@ -85,6 +88,20 @@ func (a *InboundController) onPptpChanged() {
 	}
 	a.pptpService.KillDisabledSessions()
 	a.xrayService.SetToNeedRestart()
+}
+
+// onOpenVpnChanged regenerates OpenVPN configs and restarts services when an OpenVPN inbound is modified.
+func (a *InboundController) onOpenVpnChanged() {
+	if err := a.openvpnService.GenerateAllConfigs(); err != nil {
+		logger.Warning("OpenVPN: config generation failed:", err)
+	}
+	if err := a.openvpnService.SetupNAT(); err != nil {
+		logger.Warning("OpenVPN: NAT setup failed:", err)
+	}
+	if err := a.openvpnService.RestartServices(); err != nil {
+		logger.Warning("OpenVPN: service restart failed:", err)
+	}
+	a.openvpnService.KillDisabledSessions()
 }
 
 // getInbounds retrieves the list of inbounds for the logged-in user.
@@ -161,6 +178,8 @@ func (a *InboundController) addInbound(c *gin.Context) {
 		a.onL2tpChanged()
 	} else if inbound.Protocol == model.PPTP {
 		a.onPptpChanged()
+	} else if inbound.Protocol == model.OPENVPN {
+		a.onOpenVpnChanged()
 	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -176,10 +195,11 @@ func (a *InboundController) delInbound(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundDeleteSuccess"), err)
 		return
 	}
-	// Check if this is an L2TP/PPTP inbound before deletion
+	// Check if this is an L2TP/PPTP/OpenVPN inbound before deletion
 	oldInbound, _ := a.inboundService.GetInbound(id)
 	isL2tp := oldInbound != nil && oldInbound.Protocol == model.L2TP
 	isPptp := oldInbound != nil && oldInbound.Protocol == model.PPTP
+	isOpenVpn := oldInbound != nil && oldInbound.Protocol == model.OPENVPN
 	needRestart, err := a.inboundService.DelInbound(id)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
@@ -190,6 +210,8 @@ func (a *InboundController) delInbound(c *gin.Context) {
 		a.onL2tpChanged()
 	} else if isPptp {
 		a.onPptpChanged()
+	} else if isOpenVpn {
+		a.onOpenVpnChanged()
 	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -224,6 +246,8 @@ func (a *InboundController) updateInbound(c *gin.Context) {
 		a.onL2tpChanged()
 	} else if inbound.Protocol == model.PPTP {
 		a.onPptpChanged()
+	} else if inbound.Protocol == model.OPENVPN {
+		a.onOpenVpnChanged()
 	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -316,6 +340,8 @@ func (a *InboundController) addInboundClient(c *gin.Context) {
 		a.onL2tpChanged()
 	} else if data.Protocol == model.PPTP {
 		a.onPptpChanged()
+	} else if data.Protocol == model.OPENVPN {
+		a.onOpenVpnChanged()
 	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -341,6 +367,8 @@ func (a *InboundController) delInboundClient(c *gin.Context) {
 		a.onL2tpChanged()
 	} else if oldInbound != nil && oldInbound.Protocol == model.PPTP {
 		a.onPptpChanged()
+	} else if oldInbound != nil && oldInbound.Protocol == model.OPENVPN {
+		a.onOpenVpnChanged()
 	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -375,6 +403,8 @@ func (a *InboundController) updateInboundClient(c *gin.Context) {
 		a.onL2tpChanged()
 	} else if inbound.Protocol == model.PPTP {
 		a.onPptpChanged()
+	} else if inbound.Protocol == model.OPENVPN {
+		a.onOpenVpnChanged()
 	} else if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
@@ -400,6 +430,7 @@ func (a *InboundController) resetClientTraffic(c *gin.Context) {
 	}
 	a.onL2tpChanged()
 	a.onPptpChanged()
+	a.onOpenVpnChanged()
 }
 
 // resetAllTraffics resets all traffic counters across all inbounds.
@@ -414,6 +445,7 @@ func (a *InboundController) resetAllTraffics(c *gin.Context) {
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetAllTrafficSuccess"), nil)
 	a.onL2tpChanged()
 	a.onPptpChanged()
+	a.onOpenVpnChanged()
 }
 
 // resetAllClientTraffics resets traffic counters for all clients in a specific inbound.
@@ -434,6 +466,7 @@ func (a *InboundController) resetAllClientTraffics(c *gin.Context) {
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetAllClientTrafficSuccess"), nil)
 	a.onL2tpChanged()
 	a.onPptpChanged()
+	a.onOpenVpnChanged()
 }
 
 // importInbound imports an inbound configuration from provided data.
@@ -516,6 +549,88 @@ func (a *InboundController) updateClientTraffic(c *gin.Context) {
 	}
 
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundClientUpdateSuccess"), nil)
+}
+
+// downloadOvpn generates and returns an .ovpn client config file.
+func (a *InboundController) downloadOvpn(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		jsonMsg(c, "Invalid inbound ID", err)
+		return
+	}
+	proto := c.Param("proto") // "udp" or "tcp"
+	if proto != "udp" && proto != "tcp" {
+		jsonMsg(c, "Invalid protocol, must be udp or tcp", nil)
+		return
+	}
+
+	inbound, err := a.inboundService.GetInbound(id)
+	if err != nil {
+		jsonMsg(c, "Inbound not found", err)
+		return
+	}
+
+	content, err := a.openvpnService.GenerateClientConfig(inbound, proto)
+	if err != nil {
+		jsonMsg(c, "Failed to generate client config", err)
+		return
+	}
+
+	filename := fmt.Sprintf("client-%s.ovpn", proto)
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+	c.Data(200, "application/x-openvpn-profile", []byte(content))
+}
+
+// generateOpenVpnCerts generates a self-signed CA and server certificates for OpenVPN.
+func (a *InboundController) generateOpenVpnCerts(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		jsonMsg(c, "Invalid inbound ID", err)
+		return
+	}
+
+	caCert, caKey, serverCert, serverKey, tlsCrypt, err := a.openvpnService.GenerateSelfSignedCA()
+	if err != nil {
+		jsonMsg(c, "Failed to generate certificates", err)
+		return
+	}
+
+	// Update the inbound settings with the generated certs
+	inbound, err := a.inboundService.GetInbound(id)
+	if err != nil {
+		jsonMsg(c, "Inbound not found", err)
+		return
+	}
+
+	var settings map[string]any
+	if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
+		jsonMsg(c, "Failed to parse settings", err)
+		return
+	}
+
+	settings["caCert"] = caCert
+	settings["caKey"] = caKey
+	settings["serverCert"] = serverCert
+	settings["serverKey"] = serverKey
+	settings["tlsCrypt"] = tlsCrypt
+
+	settingsJSON, _ := json.Marshal(settings)
+	inbound.Settings = string(settingsJSON)
+
+	if _, _, err := a.inboundService.UpdateInbound(inbound); err != nil {
+		jsonMsg(c, "Failed to save certificates", err)
+		return
+	}
+
+	jsonObj(c, map[string]string{
+		"caCert":     caCert,
+		"caKey":      caKey,
+		"serverCert": serverCert,
+		"serverKey":  serverKey,
+		"tlsCrypt":   tlsCrypt,
+	}, nil)
+
+	a.onOpenVpnChanged()
 }
 
 // delInboundClientByEmail deletes a client from an inbound by email address.

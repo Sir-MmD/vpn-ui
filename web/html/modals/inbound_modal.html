@@ -291,6 +291,25 @@
             resetTestseed() {
                 // Reset testseed to default values using Vue.set for reactivity
                 this.$set(this.inbound.settings, 'testseed', [900, 500, 900, 256]);
+            },
+            async generateOpenVpnCerts() {
+                if (!inModal.inbound.id) return;
+                inModal.loading(true);
+                const msg = await HttpUtil.post('/panel/inbound/' + inModal.inbound.id + '/generate-openvpn-certs');
+                inModal.loading(false);
+                if (msg.success) {
+                    const obj = msg.obj;
+                    inModal.inbound.settings.caCert = obj.caCert;
+                    inModal.inbound.settings.caKey = obj.caKey;
+                    inModal.inbound.settings.serverCert = obj.serverCert;
+                    inModal.inbound.settings.serverKey = obj.serverKey;
+                    inModal.inbound.settings.tlsCrypt = obj.tlsCrypt;
+                }
+            },
+            downloadOvpn(proto) {
+                if (!inModal.inbound.id) return;
+                const url = '/panel/inbound/' + inModal.inbound.id + '/ovpn/' + proto;
+                window.open(basePath.replace(/\/$/, '') + url, '_blank');
             }
         },
     });

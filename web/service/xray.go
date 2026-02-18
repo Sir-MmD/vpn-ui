@@ -115,9 +115,10 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		if !inbound.Enable {
 			continue
 		}
-		// Skip L2TP/PPTP inbounds — they are not native Xray protocols.
-		// Paired dokodemo-door inbounds are injected below instead.
-		if inbound.Protocol == "l2tp" || inbound.Protocol == "pptp" {
+		// Skip L2TP/PPTP/OpenVPN inbounds — they are not native Xray protocols.
+		// L2TP/PPTP use paired dokodemo-door inbounds injected below.
+		// OpenVPN uses direct NAT (no Xray integration).
+		if inbound.Protocol == "l2tp" || inbound.Protocol == "pptp" || inbound.Protocol == "openvpn" {
 			continue
 		}
 		// get settings clients

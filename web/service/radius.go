@@ -39,7 +39,7 @@ type RadiusService struct {
 type radiusSession struct {
 	email    string
 	ip       string
-	protocol string // "l2tp" or "pptp"
+	protocol string // "l2tp", "pptp", or "openvpn"
 }
 
 // Start launches the RADIUS auth (1812) and accounting (1813) servers on localhost.
@@ -112,6 +112,20 @@ func (s *RadiusService) handleAuth(w radius.ResponseWriter, r *radius.Request) {
 	if err != nil {
 		logger.Debugf("RADIUS: auth rejected — %s user=%s nas=%s", err, username, nasID)
 		w.Write(r.Response(radius.CodeAccessReject))
+		return
+	}
+
+	// PAP authentication (OpenVPN sends plaintext password via User-Password)
+	userPassword := rfc2865.UserPassword_GetString(r.Packet)
+	if userPassword != "" {
+		if userPassword == password {
+			accept := r.Response(radius.CodeAccessAccept)
+			logger.Infof("RADIUS: auth accepted (PAP) user=%s nas=%s", username, nasID)
+			w.Write(accept)
+		} else {
+			logger.Debugf("RADIUS: auth rejected (PAP) — wrong password user=%s nas=%s", username, nasID)
+			w.Write(r.Response(radius.CodeAccessReject))
+		}
 		return
 	}
 
@@ -431,7 +445,7 @@ func (s *RadiusService) CleanStaleSessions() {
 	s.mu.Lock()
 	var stale []string
 	for sid, sess := range s.sessions {
-		if !s.isIPActive(sess.ip) {
+		if !s.isIPActive(sess.ip, sess.protocol) {
 			stale = append(stale, sid)
 		}
 	}
@@ -447,12 +461,22 @@ func (s *RadiusService) CleanStaleSessions() {
 }
 
 // isIPActive checks if a PPP client IP is still assigned to an interface.
-func (s *RadiusService) isIPActive(ip string) bool {
-	output, err := exec.Command("ip", "-o", "addr", "show").Output()
-	if err != nil {
-		return true // assume active on error
+func (s *RadiusService) isIPActive(ip string, protocol string) bool {
+	// For L2TP/PPTP: check if the IP is assigned to a local PPP interface
+	if protocol != "openvpn" {
+		output, err := exec.Command("ip", "-o", "addr", "show").Output()
+		if err != nil {
+			return true // assume active on error
+		}
+		return strings.Contains(string(output), ip)
 	}
-	return strings.Contains(string(output), ip)
+
+	// For OpenVPN: check if a route to the IP exists through a tun device
+	output, err := exec.Command("ip", "route", "get", ip).Output()
+	if err != nil {
+		return false // no route = not active
+	}
+	return strings.Contains(string(output), "tun-ovpn")
 }
 
 // parseNASIdentifier extracts protocol and inbound ID from "l2tp-{id}" or "pptp-{id}".
@@ -463,7 +487,7 @@ func parseNASIdentifier(nasID string) (protocol string, inboundId int, err error
 	}
 
 	protocol = parts[0]
-	if protocol != "l2tp" && protocol != "pptp" {
+	if protocol != "l2tp" && protocol != "pptp" && protocol != "openvpn" {
 		return "", 0, fmt.Errorf("unknown protocol in NAS-Identifier: %s", protocol)
 	}
 

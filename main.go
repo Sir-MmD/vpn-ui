@@ -3,11 +3,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	_ "unsafe"
 
@@ -22,6 +26,9 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/op/go-logging"
+	"layeh.com/radius"
+	"layeh.com/radius/rfc2865"
+	"layeh.com/radius/rfc2866"
 )
 
 // runWebServer initializes and starts the web server for the 3x-ui panel.
@@ -394,6 +401,164 @@ func migrateDb() {
 	fmt.Println("Migration done!")
 }
 
+// readRadiusSecret reads the RADIUS shared secret from /etc/ppp/radius/servers.
+func readRadiusSecret() string {
+	data, err := os.ReadFile("/etc/ppp/radius/servers")
+	if err != nil {
+		return ""
+	}
+	// Format: "127.0.0.1\t{secret}\n"
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "127.0.0.1" {
+			return fields[1]
+		}
+	}
+	return ""
+}
+
+// openvpnAuth handles OpenVPN auth-user-pass-verify via RADIUS PAP.
+// Usage: x-ui openvpn-auth {inbound_id} {credentials_file}
+// The credentials file has username on line 1, password on line 2.
+func openvpnAuth() {
+	if len(os.Args) < 4 {
+		fmt.Fprintln(os.Stderr, "usage: x-ui openvpn-auth <inbound_id> <cred_file>")
+		os.Exit(1)
+	}
+
+	inboundId, err := strconv.Atoi(os.Args[2])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "invalid inbound_id:", os.Args[2])
+		os.Exit(1)
+	}
+
+	credFile := os.Args[3]
+	data, err := os.ReadFile(credFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "failed to read credentials file:", err)
+		os.Exit(1)
+	}
+
+	lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+	if len(lines) < 2 {
+		fmt.Fprintln(os.Stderr, "credentials file must have username and password on separate lines")
+		os.Exit(1)
+	}
+	username := strings.TrimSpace(lines[0])
+	password := strings.TrimSpace(lines[1])
+
+	secret := readRadiusSecret()
+	if secret == "" {
+		fmt.Fprintln(os.Stderr, "RADIUS secret not found")
+		os.Exit(1)
+	}
+
+	// Send PAP Access-Request
+	packet := radius.New(radius.CodeAccessRequest, []byte(secret))
+	rfc2865.UserName_SetString(packet, username)
+	rfc2865.UserPassword_SetString(packet, password)
+	rfc2865.NASIdentifier_SetString(packet, fmt.Sprintf("openvpn-%d", inboundId))
+
+	resp, err := radius.Exchange(context.Background(), packet, "127.0.0.1:1812")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "RADIUS exchange failed:", err)
+		os.Exit(1)
+	}
+
+	if resp.Code == radius.CodeAccessAccept {
+		os.Exit(0) // Accept
+	}
+	os.Exit(1) // Reject
+}
+
+// openvpnConnect handles OpenVPN client-connect via RADIUS Acct-Start.
+// Usage: x-ui openvpn-connect {inbound_id}
+// Reads common_name and ifconfig_pool_remote_ip from environment.
+func openvpnConnect() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: x-ui openvpn-connect <inbound_id>")
+		os.Exit(1)
+	}
+
+	inboundId, _ := strconv.Atoi(os.Args[2])
+	username := os.Getenv("common_name")
+	ip := os.Getenv("ifconfig_pool_remote_ip")
+
+	if username == "" || ip == "" {
+		os.Exit(0) // Nothing to do
+	}
+
+	secret := readRadiusSecret()
+	if secret == "" {
+		os.Exit(0)
+	}
+
+	sessionID := fmt.Sprintf("openvpn-%d-%s-%s", inboundId, username, ip)
+
+	packet := radius.New(radius.CodeAccountingRequest, []byte(secret))
+	rfc2866.AcctStatusType_Set(packet, rfc2866.AcctStatusType_Value_Start)
+	rfc2866.AcctSessionID_SetString(packet, sessionID)
+	rfc2865.UserName_SetString(packet, username)
+	rfc2865.NASIdentifier_SetString(packet, fmt.Sprintf("openvpn-%d", inboundId))
+	rfc2865.FramedIPAddress_Set(packet, net.ParseIP(ip))
+
+	resp, err := radius.Exchange(context.Background(), packet, "127.0.0.1:1813")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "RADIUS acct-start failed: %v\n", err)
+		os.Exit(0)
+	}
+	if resp.Code != radius.CodeAccountingResponse {
+		fmt.Fprintf(os.Stderr, "RADIUS acct-start unexpected code: %v\n", resp.Code)
+	}
+	os.Exit(0)
+}
+
+// openvpnDisconnect handles OpenVPN client-disconnect via RADIUS Acct-Stop.
+// Usage: x-ui openvpn-disconnect {inbound_id}
+// Reads common_name and ifconfig_pool_remote_ip from environment.
+func openvpnDisconnect() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: x-ui openvpn-disconnect <inbound_id>")
+		os.Exit(1)
+	}
+
+	inboundId, _ := strconv.Atoi(os.Args[2])
+	username := os.Getenv("common_name")
+	ip := os.Getenv("ifconfig_pool_remote_ip")
+
+	if username == "" || ip == "" {
+		os.Exit(0)
+	}
+
+	secret := readRadiusSecret()
+	if secret == "" {
+		os.Exit(0)
+	}
+
+	sessionID := fmt.Sprintf("openvpn-%d-%s-%s", inboundId, username, ip)
+
+	// Read session duration from env (OpenVPN provides time_duration in seconds)
+	var sessionTime uint32
+	if dur := os.Getenv("time_duration"); dur != "" {
+		if d, err := strconv.ParseUint(dur, 10, 32); err == nil {
+			sessionTime = uint32(d)
+		}
+	}
+
+	packet := radius.New(radius.CodeAccountingRequest, []byte(secret))
+	rfc2866.AcctStatusType_Set(packet, rfc2866.AcctStatusType_Value_Stop)
+	rfc2866.AcctSessionID_SetString(packet, sessionID)
+	rfc2865.UserName_SetString(packet, username)
+	rfc2865.NASIdentifier_SetString(packet, fmt.Sprintf("openvpn-%d", inboundId))
+	rfc2865.FramedIPAddress_Set(packet, net.ParseIP(ip))
+	if sessionTime > 0 {
+		rfc2866.AcctSessionTime_Set(packet, rfc2866.AcctSessionTime(sessionTime))
+	}
+
+	radius.Exchange(context.Background(), packet, "127.0.0.1:1813")
+	os.Exit(0)
+}
+
 // main is the entry point of the 3x-ui application.
 // It parses command-line arguments to run the web server, migrate database, or update settings.
 func main() {
@@ -504,6 +669,12 @@ func main() {
 		} else {
 			updateCert(webCertFile, webKeyFile)
 		}
+	case "openvpn-auth":
+		openvpnAuth()
+	case "openvpn-connect":
+		openvpnConnect()
+	case "openvpn-disconnect":
+		openvpnDisconnect()
 	default:
 		fmt.Println("Invalid subcommands")
 		fmt.Println()

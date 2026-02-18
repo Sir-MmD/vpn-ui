@@ -90,6 +90,7 @@
                 case Protocols.TROJAN:
                 case Protocols.L2TP:
                 case Protocols.PPTP:
+                case Protocols.OPENVPN:
                     return client.password;
                 case Protocols.SHADOWSOCKS:
                     return client.email;
@@ -118,6 +119,10 @@
                     return clients.push(new Inbound.L2tpSettings.L2tpUser());
                 case Protocols.PPTP:
                     return clients.push(new Inbound.PptpSettings.PptpUser());
+                case Protocols.OPENVPN:
+                    return clients.push(
+                        new Inbound.OpenvpnSettings.OpenvpnUser(),
+                    );
                 default:
                     return null;
             }

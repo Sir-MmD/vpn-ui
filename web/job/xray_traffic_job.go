@@ -19,35 +19,48 @@ type XrayTrafficJob struct {
 	outboundService service.OutboundService
 	l2tpService     service.L2tpService
 	pptpService     service.PptpService
+	openvpnService  service.OpenVpnService
 	nftService      service.NftService
-	radiusService   service.RadiusService
+	radiusService   *service.RadiusService
 }
 
 // NewXrayTrafficJob creates a new traffic collection job instance.
-func NewXrayTrafficJob() *XrayTrafficJob {
-	return new(XrayTrafficJob)
+func NewXrayTrafficJob(rs *service.RadiusService) *XrayTrafficJob {
+	return &XrayTrafficJob{radiusService: rs}
 }
 
 // Run collects traffic statistics from Xray and updates the database, triggering restart if needed.
 func (j *XrayTrafficJob) Run() {
-	if !j.xrayService.IsXrayRunning() {
-		return
-	}
-	traffics, clientTraffics, err := j.xrayService.GetXrayTraffic()
-	if err != nil {
-		return
+	var traffics []*xray.Traffic
+	var clientTraffics []*xray.ClientTraffic
+
+	if j.xrayService.IsXrayRunning() {
+		var err error
+		traffics, clientTraffics, err = j.xrayService.GetXrayTraffic()
+		if err != nil {
+			traffics = nil
+			clientTraffics = nil
+		}
 	}
 
-	// Collect L2TP and PPTP per-client traffic from nftables counters (atomic read+reset)
+	// Collect L2TP, PPTP, and OpenVPN per-client traffic from nftables counters (atomic read+reset)
 	// Session maps (IP→email) come from the embedded RADIUS server
+	// This runs regardless of Xray status — VPN traffic is independent
 	l2tpSessions := j.radiusService.GetSessions("l2tp")
 	pptpSessions := j.radiusService.GetSessions("pptp")
-	if l2tpTraffics, pptpTraffics := j.nftService.CollectAndResetTraffic(l2tpSessions, pptpSessions); len(l2tpTraffics) > 0 || len(pptpTraffics) > 0 {
+	ovpnSessions := j.radiusService.GetSessions("openvpn")
+	if l2tpTraffics, pptpTraffics, ovpnTraffics := j.nftService.CollectAndResetTraffic(l2tpSessions, pptpSessions, ovpnSessions); len(l2tpTraffics) > 0 || len(pptpTraffics) > 0 || len(ovpnTraffics) > 0 {
 		clientTraffics = append(clientTraffics, l2tpTraffics...)
 		clientTraffics = append(clientTraffics, pptpTraffics...)
+		clientTraffics = append(clientTraffics, ovpnTraffics...)
 	}
 
-	err, needRestart0, l2tpDisabledEmails, pptpDisabledEmails := j.inboundService.AddTraffic(traffics, clientTraffics)
+	// Skip DB update if no traffic to process
+	if len(traffics) == 0 && len(clientTraffics) == 0 {
+		return
+	}
+
+	err, needRestart0, l2tpDisabledEmails, pptpDisabledEmails, ovpnDisabledEmails := j.inboundService.AddTraffic(traffics, clientTraffics)
 	if err != nil {
 		logger.Warning("add inbound traffic failed:", err)
 	}
@@ -58,6 +71,10 @@ func (j *XrayTrafficJob) Run() {
 	// Enforce limits on PPTP clients
 	if len(pptpDisabledEmails) > 0 {
 		j.pptpService.DisableClients(pptpDisabledEmails)
+	}
+	// Enforce limits on OpenVPN clients
+	if len(ovpnDisabledEmails) > 0 {
+		j.openvpnService.DisableClients(ovpnDisabledEmails)
 	}
 	err, needRestart1 := j.outboundService.AddTraffic(traffics, clientTraffics)
 	if err != nil {

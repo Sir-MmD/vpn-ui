@@ -108,6 +108,7 @@ type Server struct {
 	radiusService  service.RadiusService
 	l2tpService    service.L2tpService
 	pptpService    service.PptpService
+	openvpnService service.OpenVpnService
 	tgbotService   service.Tgbot
 
 	wsHub *websocket.Hub
@@ -306,14 +307,16 @@ func (s *Server) startTask() {
 		if err := s.radiusService.Start(radiusSecret); err != nil {
 			logger.Warning("RADIUS: failed to start:", err)
 		}
-		// Pass RADIUS service and secret to L2TP/PPTP services
+		// Pass RADIUS service and secret to L2TP/PPTP/OpenVPN services
 		s.l2tpService.SetRadius(s.radiusService, radiusSecret)
 		s.pptpService.SetRadius(s.radiusService, radiusSecret)
+		s.openvpnService.SetRadius(s.radiusService, radiusSecret)
 	}
 
-	// Initialize L2TP/PPTP services before Xray so TPROXY rules are in place
+	// Initialize L2TP/PPTP/OpenVPN services before Xray so TPROXY/NAT rules are in place
 	s.l2tpService.InitL2tp()
 	s.pptpService.InitPptp()
+	s.openvpnService.InitOpenVpn()
 
 	err := s.xrayService.RestartXray(true)
 	if err != nil {
@@ -335,7 +338,7 @@ func (s *Server) startTask() {
 	go func() {
 		time.Sleep(time.Second * 5)
 		// Statistics every 10 seconds, start the delay for 5 seconds for the first time, and staggered with the time to restart xray
-		s.cron.AddJob("@every 10s", job.NewXrayTrafficJob())
+		s.cron.AddJob("@every 10s", job.NewXrayTrafficJob(&s.radiusService))
 	}()
 
 	// Clean stale RADIUS sessions every 60 seconds

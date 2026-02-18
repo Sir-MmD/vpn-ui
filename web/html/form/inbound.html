@@ -55,6 +55,12 @@
         >
             Most clients use port 1723
         </span>
+        <span
+            v-if="inbound.protocol === 'openvpn'"
+            :style="{ marginLeft: '8px', color: '#888' }"
+        >
+            UDP port (default: 1194)
+        </span>
     </a-form-item>
 
     <a-form-item>
@@ -206,6 +212,11 @@
 <!-- pptp -->
 <template v-if="inbound.protocol === Protocols.PPTP">
     {{template "form/pptp"}}
+</template>
+
+<!-- openvpn -->
+<template v-if="inbound.protocol === Protocols.OPENVPN">
+    {{template "form/openvpn"}}
 </template>
 
 <!-- stream settings -->

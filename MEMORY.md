@@ -99,6 +99,8 @@ main.go                          Entry point (CLI + web server)
 - **Trojan** (password-based)
 - **Shadowsocks** (AES-128/256-GCM, ChaCha20, 2022 variants)
 - **L2TP/IPsec** (first-class, paired with dokodemo-door)
+- **PPTP** (first-class, PPP with MPPE)
+- **OpenVPN** (first-class, dual UDP+TCP, RADIUS auth)
 - **HTTP**, **SOCKS**, **Mixed**
 - **WireGuard**, **TUN**, **Tunnel** (dokodemo-door)
 
@@ -187,16 +189,14 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
 
 ## Custom Additions (mmd branch)
 - L2TP/IPsec as first-class inbound protocol
-- L2TP traffic/expiry limit enforcement (DisableClients, chap-secrets regen, PPP session kill)
-- L2TP client JS model: `_totalGB`/`_expiryTime` getters/setters, `limitIp` (was `ipLimit`), `reset`/`created_at`/`updated_at` fields
-- L2TP unique username enforcement (AddInbound, AddInboundClient, UpdateInboundClient)
-- L2TP client count in Inbounds section (added Protocols.L2TP to setInbounds)
-- L2TP Allow Raw mode: `allowRaw` toggle in IPsec settings, uses forceencaps+NAT-T so raw L2TP and PSK can coexist
+- PPTP as first-class inbound protocol
+- OpenVPN as first-class inbound protocol (v2.8.13)
+- Embedded RADIUS server for all VPN auth
+- nftables-based traffic accounting
 - Pre-built distro archive (vpn-ui-distro.tar.zst)
 - Enhanced telego client robustness and retries
-- Timeouts and delays for backup sends
 - Go 1.26 bump
-- Version: 2.8.12
+- Version: 2.8.13
 
 ## Recent Bug Fixes & Improvements (2026-02-18)
 
@@ -317,6 +317,64 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
 - Both protocols simultaneously ✅
 - Orphan session cleanup on panel restart ✅
 - No stale files (chap-secrets, usermap, ip-up/ip-down all eliminated) ✅
+
+## OpenVPN Protocol Support (v2.8.13, session 8)
+- **Architecture**: First-class inbound protocol, RADIUS auth (PAP), nftables accounting, management socket kill
+- **New file**: `web/service/openvpn.go` (~700 lines) — OpenVpnService
+- **Subnets**: UDP `10.2.{id}.0/24`, TCP `10.3.{id}.0/24`
+- **Dual protocol**: Each inbound runs 2 OpenVPN instances (UDP on `inbound.Port`, TCP on `settings.tcpPort`)
+- **Systemd**: `openvpn-server@server-{id}-udp` and `openvpn-server@server-{id}-tcp`
+- **Configs**: `/etc/openvpn/server/server-{id}-{udp|tcp}.conf`, certs at `/etc/openvpn/server-{id}/`
+- **Status files**: `/run/openvpn/status-{id}-{udp|tcp}.log`, mgmt sockets at `/run/openvpn/mgmt-{id}-{udp|tcp}.sock`
+- **Auth**: `auth-user-pass-verify "/usr/local/x-ui/x-ui openvpn-auth {id}" via-file` → PAP to RADIUS
+- **Sessions**: `client-connect` / `client-disconnect` scripts → RADIUS Acct-Start/Stop via x-ui subcommands
+- **Traffic routing**: Direct NAT (MASQUERADE), no Xray/TPROXY — nftables `nat_post` chain
+- **Disable**: Kill via management unix socket (`kill {username}`)
+- **Certs**: Panel-generated self-signed CA (ECDSA P-384), server cert, tls-crypt key
+- **Client config**: `.ovpn` download via `GET /panel/api/inbounds/:id/ovpn/{udp|tcp}`
+- **Cert generation**: `POST /panel/api/inbounds/:id/generate-openvpn-certs`
+
+### Files changed for OpenVPN
+- `web/service/openvpn.go` (NEW, ~700 lines)
+- `web/html/form/protocol/openvpn.html` (NEW, ~120 lines)
+- `main.go` — 3 subcommands: `openvpn-auth`, `openvpn-connect`, `openvpn-disconnect`
+- `database/model/model.go` — `OPENVPN Protocol = "openvpn"`
+- `web/service/radius.go` — PAP support, `"openvpn"` in `parseNASIdentifier()`, `isIPActive()` protocol-aware
+- `web/service/nftables.go` — `openvpn_acct` chain, NAT MASQUERADE, 3rd param in `CollectAndResetTraffic()`
+- `web/service/inbound.go` — `"openvpn"` in client_key/disable/username checks
+- `web/controller/inbound.go` — `onOpenVpnChanged()`, cert/config download routes
+- `web/job/xray_traffic_job.go` — OpenVPN traffic collection, `RadiusService` pointer
+- `web/web.go` — `InitOpenVpn()` on startup
+- `web/assets/js/model/inbound.js` — `OpenVpnSettings`, `OpenVpnUser` classes
+- `web/html/form/inbound.html` — protocol form include
+- `web/html/form/client.html` — OPENVPN in v-if conditions
+- `web/html/modals/client_modal.html` + `client_bulk_modal.html` — OPENVPN cases
+- `config/version` — bumped to 2.8.13
+
+### Bugs fixed during OpenVPN testing
+- **`radius.Exchange(nil, ...)` panic**: Go RADIUS library requires non-nil context. Fixed: `context.Background()`.
+- **Traffic job blocked by Xray**: `IsXrayRunning()` early return blocked ALL traffic collection. Restructured to collect VPN traffic independently.
+- **Stale session cleanup removing OpenVPN**: `isIPActive()` checked `ip addr show` — OpenVPN client IPs not on interfaces (routed through tun). Fixed: route check (`ip route get`) for OpenVPN.
+- **RadiusService instance mismatch**: Traffic job had zero-value struct, separate from RADIUS server instance. Fixed: changed to `*service.RadiusService` pointer.
+- **OpenVPN `dh none` missing**: OpenVPN 2.6 requires explicit `dh none` with ECDSA certs.
+
+### Key patterns learned
+- OpenVPN client IPs are NOT on server interfaces — only routed through tun device
+- `RadiusService` is stateful (sessions map) — must pass as pointer, not value type
+- OpenVPN `redirect-gateway def1` causes SSH loss to VPN client — access via tunnel IP from server
+- OpenVPN systemd has `PrivateTmp=true` — temp files are namespaced
+- Gin `Recovery()` with `DefaultErrorWriter=io.Discard` silently swallows panics → empty 500 response
+- `layeh.com/radius` `Exchange()` requires non-nil `context.Context`
+- OpenVPN `verify-client-cert none` + `username-as-common-name` = username/password only auth
+
+### Tested on sandbox
+- OpenVPN UDP client connection from x-client ✅
+- RADIUS PAP auth (accept + reject) ✅
+- nft counter creation on connect, removal on disconnect ✅
+- Traffic collection pipeline (nft → RADIUS sessions → DB) ✅
+- Disable client → kill via management socket → RADIUS reject reconnect ✅
+- NAT masquerade (client traffic routed through server IP) ✅
+- OpenVPN packages: `openvpn` on x-server, `openvpn` on x-client
 
 ## nftables (2026-02-18, session 5)
 - **Architecture**: Single `table ip vpn` with 5 chains: prerouting (TPROXY + jumps), postrouting (jumps), input (raw L2TP filter), l2tp_acct (dynamic per-client), pptp_acct (dynamic per-client)

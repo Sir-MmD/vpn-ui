@@ -13,7 +13,7 @@ import (
 
 const nftConfigFile = "/etc/x-ui/vpn.nft"
 
-// NftService manages nftables rules for L2TP and PPTP VPN traffic accounting and TPROXY.
+// NftService manages nftables rules for L2TP, PPTP, and OpenVPN traffic accounting, TPROXY, and NAT.
 type NftService struct{}
 
 // ApplyNftRules regenerates and atomically loads the nftables config for all VPN inbounds.
@@ -23,6 +23,7 @@ type NftService struct{}
 func (s *NftService) ApplyNftRules() error {
 	l2tp := L2tpService{}
 	pptp := PptpService{}
+	ovpn := OpenVpnService{}
 
 	l2tpInbounds, err := l2tp.GetL2tpInbounds()
 	if err != nil {
@@ -32,9 +33,13 @@ func (s *NftService) ApplyNftRules() error {
 	if err != nil {
 		return err
 	}
+	ovpnInbounds, err := ovpn.GetOpenVpnInbounds()
+	if err != nil {
+		return err
+	}
 
 	// If no VPN inbounds, remove the table entirely
-	if len(l2tpInbounds) == 0 && len(pptpInbounds) == 0 {
+	if len(l2tpInbounds) == 0 && len(pptpInbounds) == 0 && len(ovpnInbounds) == 0 {
 		s.runCmd("nft", "delete", "table", "ip", "vpn")
 		os.Remove(nftConfigFile)
 		return nil
@@ -46,6 +51,7 @@ func (s *NftService) ApplyNftRules() error {
 	b.WriteString("add table ip vpn\n")
 	b.WriteString("add chain ip vpn l2tp_acct\n")
 	b.WriteString("add chain ip vpn pptp_acct\n")
+	b.WriteString("add chain ip vpn openvpn_acct\n")
 	b.WriteString("add chain ip vpn prerouting { type filter hook prerouting priority mangle; policy accept; }\n")
 	b.WriteString("add chain ip vpn postrouting { type filter hook postrouting priority mangle; policy accept; }\n")
 	b.WriteString("add chain ip vpn input { type filter hook input priority filter; policy accept; }\n")
@@ -58,8 +64,10 @@ func (s *NftService) ApplyNftRules() error {
 	// Accounting jumps (must be before TPROXY so packets are counted before accept)
 	b.WriteString("add rule ip vpn prerouting jump l2tp_acct\n")
 	b.WriteString("add rule ip vpn prerouting jump pptp_acct\n")
+	b.WriteString("add rule ip vpn prerouting jump openvpn_acct\n")
 	b.WriteString("add rule ip vpn postrouting jump l2tp_acct\n")
 	b.WriteString("add rule ip vpn postrouting jump pptp_acct\n")
+	b.WriteString("add rule ip vpn postrouting jump openvpn_acct\n")
 
 	// L2TP TPROXY rules
 	for _, inbound := range l2tpInbounds {
@@ -103,6 +111,20 @@ func (s *NftService) ApplyNftRules() error {
 		b.WriteString("add rule ip vpn input udp dport 1701 drop\n")
 	}
 
+	// NAT for OpenVPN subnets (direct internet, no TPROXY)
+	if len(ovpnInbounds) > 0 {
+		b.WriteString("add chain ip vpn nat_post { type nat hook postrouting priority srcnat; policy accept; }\n")
+		b.WriteString("flush chain ip vpn nat_post\n")
+		for _, inbound := range ovpnInbounds {
+			if !inbound.Enable {
+				continue
+			}
+			// UDP subnet: 10.2.{id}.0/24, TCP subnet: 10.3.{id}.0/24
+			b.WriteString(fmt.Sprintf("add rule ip vpn nat_post ip saddr 10.2.%d.0/24 masquerade\n", inbound.Id))
+			b.WriteString(fmt.Sprintf("add rule ip vpn nat_post ip saddr 10.3.%d.0/24 masquerade\n", inbound.Id))
+		}
+	}
+
 	// Write and load atomically
 	if err := os.MkdirAll("/etc/x-ui", 0755); err != nil {
 		return err
@@ -114,7 +136,7 @@ func (s *NftService) ApplyNftRules() error {
 		return fmt.Errorf("failed to load nft rules: %w", err)
 	}
 
-	logger.Infof("nft: loaded VPN rules (%d L2TP, %d PPTP inbounds)", len(l2tpInbounds), len(pptpInbounds))
+	logger.Infof("nft: loaded VPN rules (%d L2TP, %d PPTP, %d OpenVPN inbounds)", len(l2tpInbounds), len(pptpInbounds), len(ovpnInbounds))
 	return nil
 }
 
@@ -190,22 +212,23 @@ func (s *NftService) RemoveClientAccounting(protocol, ip string) error {
 // Uses `nft -j reset counters` for atomic read+reset (no race between read and zero).
 // Session maps (IP→email) are provided by the RADIUS service.
 // Returns separate L2TP and PPTP client traffic slices.
-func (s *NftService) CollectAndResetTraffic(l2tpIPToEmail, pptpIPToEmail map[string]string) ([]*xray.ClientTraffic, []*xray.ClientTraffic) {
+func (s *NftService) CollectAndResetTraffic(l2tpIPToEmail, pptpIPToEmail, ovpnIPToEmail map[string]string) ([]*xray.ClientTraffic, []*xray.ClientTraffic, []*xray.ClientTraffic) {
 	output, err := exec.Command("nft", "-j", "reset", "counters", "table", "ip", "vpn").Output()
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	var result nftCounterOutput
 	if err := json.Unmarshal(output, &result); err != nil {
 		logger.Debug("nft: failed to parse counter JSON:", err)
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Accumulate per-email traffic
 	type trafficPair struct{ up, down int64 }
 	l2tpTraffic := make(map[string]*trafficPair)
 	pptpTraffic := make(map[string]*trafficPair)
+	ovpnTraffic := make(map[string]*trafficPair)
 
 	for _, raw := range result.Nftables {
 		var entry nftCounterEntry
@@ -223,7 +246,7 @@ func (s *NftService) CollectAndResetTraffic(l2tpIPToEmail, pptpIPToEmail map[str
 		if len(parts) < 3 {
 			continue
 		}
-		protocol := parts[0]  // "l2tp" or "pptp"
+		protocol := parts[0]  // "l2tp", "pptp", or "openvpn"
 		direction := parts[1] // "up" or "down"
 		ip := strings.ReplaceAll(parts[2], "_", ".")
 
@@ -235,6 +258,9 @@ func (s *NftService) CollectAndResetTraffic(l2tpIPToEmail, pptpIPToEmail map[str
 		} else if protocol == "pptp" {
 			ipMap = pptpIPToEmail
 			trafficMap = pptpTraffic
+		} else if protocol == "openvpn" {
+			ipMap = ovpnIPToEmail
+			trafficMap = ovpnTraffic
 		} else {
 			continue
 		}
@@ -273,6 +299,7 @@ func (s *NftService) CollectAndResetTraffic(l2tpIPToEmail, pptpIPToEmail map[str
 
 	l2tpResult := toSlice(l2tpTraffic)
 	pptpResult := toSlice(pptpTraffic)
+	ovpnResult := toSlice(ovpnTraffic)
 
 	if len(l2tpResult) > 0 {
 		logger.Debugf("nft: collected L2TP traffic for %d client(s)", len(l2tpResult))
@@ -280,8 +307,11 @@ func (s *NftService) CollectAndResetTraffic(l2tpIPToEmail, pptpIPToEmail map[str
 	if len(pptpResult) > 0 {
 		logger.Debugf("nft: collected PPTP traffic for %d client(s)", len(pptpResult))
 	}
+	if len(ovpnResult) > 0 {
+		logger.Debugf("nft: collected OpenVPN traffic for %d client(s)", len(ovpnResult))
+	}
 
-	return l2tpResult, pptpResult
+	return l2tpResult, pptpResult, ovpnResult
 }
 
 // CleanupLegacyIptables removes old iptables rules left from the pre-nftables implementation.
