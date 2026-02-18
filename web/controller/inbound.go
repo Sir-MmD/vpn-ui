@@ -68,6 +68,7 @@ func (a *InboundController) onL2tpChanged() {
 	if err := a.l2tpService.RestartServices(); err != nil {
 		logger.Warning("L2TP: service restart failed:", err)
 	}
+	a.l2tpService.KillDisabledSessions()
 	a.xrayService.SetToNeedRestart()
 }
 
@@ -82,6 +83,7 @@ func (a *InboundController) onPptpChanged() {
 	if err := a.pptpService.RestartServices(); err != nil {
 		logger.Warning("PPTP: service restart failed:", err)
 	}
+	a.pptpService.KillDisabledSessions()
 	a.xrayService.SetToNeedRestart()
 }
 
@@ -308,6 +310,14 @@ func (a *InboundController) addInboundClient(c *gin.Context) {
 		return
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundClientAddSuccess"), nil)
+
+	// The request body may not include protocol, so look it up from the DB.
+	if data.Protocol == "" {
+		if dbInbound, err := a.inboundService.GetInbound(data.Id); err == nil {
+			data.Protocol = dbInbound.Protocol
+		}
+	}
+
 	if data.Protocol == model.L2TP {
 		a.onL2tpChanged()
 	} else if data.Protocol == model.PPTP {
@@ -359,6 +369,14 @@ func (a *InboundController) updateInboundClient(c *gin.Context) {
 		return
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundClientUpdateSuccess"), nil)
+
+	// The request body may not include protocol, so look it up from the DB.
+	if inbound.Protocol == "" {
+		if dbInbound, err := a.inboundService.GetInbound(inbound.Id); err == nil {
+			inbound.Protocol = dbInbound.Protocol
+		}
+	}
+
 	if inbound.Protocol == model.L2TP {
 		a.onL2tpChanged()
 	} else if inbound.Protocol == model.PPTP {

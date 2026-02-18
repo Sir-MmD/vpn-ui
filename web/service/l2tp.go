@@ -728,6 +728,45 @@ func (s *L2tpService) readSessions() map[string]string {
 	return sessions
 }
 
+// KillDisabledSessions kills active PPP sessions for clients that are no longer
+// allowed to connect (disabled in settings or disabled in client_traffics).
+func (s *L2tpService) KillDisabledSessions() {
+	inbounds, err := s.GetL2tpInbounds()
+	if err != nil {
+		return
+	}
+	disabledEmails := s.getDisabledEmails()
+
+	// Collect emails of clients that should be active
+	allowed := make(map[string]bool)
+	for _, inbound := range inbounds {
+		settings, err := s.parseSettings(inbound)
+		if err != nil {
+			continue
+		}
+		for _, client := range settings.Clients {
+			if client.Enable && !disabledEmails[client.Email] {
+				allowed[client.Email] = true
+			}
+		}
+	}
+
+	// Kill sessions for clients NOT in the allowed set
+	for _, sess := range s.readSessionList() {
+		if !allowed[sess.Email] && sess.Interface != "" {
+			pidFile := fmt.Sprintf("/var/run/%s.pid", sess.Interface)
+			pidData, err := os.ReadFile(pidFile)
+			if err == nil {
+				pid := strings.TrimSpace(string(pidData))
+				if pid != "" {
+					s.runCmd("kill", pid)
+					logger.Infof("L2TP: killed disabled session %s (email=%s, ip=%s)", sess.Interface, sess.Email, sess.IP)
+				}
+			}
+		}
+	}
+}
+
 // DisableClients enforces limits for the given client emails:
 // kills their active PPP sessions, regenerates chap-secrets (which will
 // exclude them), and updates the user map.

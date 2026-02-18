@@ -89,6 +89,7 @@
             switch (protocol) {
                 case Protocols.TROJAN:
                 case Protocols.L2TP:
+                case Protocols.PPTP:
                     return client.password;
                 case Protocols.SHADOWSOCKS:
                     return client.email;
@@ -115,6 +116,8 @@
                     );
                 case Protocols.L2TP:
                     return clients.push(new Inbound.L2tpSettings.L2tpUser());
+                case Protocols.PPTP:
+                    return clients.push(new Inbound.PptpSettings.PptpUser());
                 default:
                     return null;
             }

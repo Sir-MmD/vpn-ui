@@ -607,6 +607,43 @@ func (s *PptpService) readSessions() map[string]string {
 	return sessions
 }
 
+// KillDisabledSessions kills active PPP sessions for clients that are no longer
+// allowed to connect (disabled in settings or disabled in client_traffics).
+func (s *PptpService) KillDisabledSessions() {
+	inbounds, err := s.GetPptpInbounds()
+	if err != nil {
+		return
+	}
+	disabledEmails := s.getDisabledEmails()
+
+	allowed := make(map[string]bool)
+	for _, inbound := range inbounds {
+		settings, err := s.parseSettings(inbound)
+		if err != nil {
+			continue
+		}
+		for _, client := range settings.Clients {
+			if client.Enable && !disabledEmails[client.Email] {
+				allowed[client.Email] = true
+			}
+		}
+	}
+
+	for _, sess := range s.readSessionList() {
+		if !allowed[sess.Email] && sess.Interface != "" {
+			pidFile := fmt.Sprintf("/var/run/%s.pid", sess.Interface)
+			pidData, err := os.ReadFile(pidFile)
+			if err == nil {
+				pid := strings.TrimSpace(string(pidData))
+				if pid != "" {
+					s.runCmd("kill", pid)
+					logger.Infof("PPTP: killed disabled session %s (email=%s, ip=%s)", sess.Interface, sess.Email, sess.IP)
+				}
+			}
+		}
+	}
+}
+
 // DisableClients enforces limits for the given client emails.
 func (s *PptpService) DisableClients(emails []string) {
 	if len(emails) == 0 {
