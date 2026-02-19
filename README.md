@@ -99,120 +99,63 @@ Since Xray's dokodemo-door sees all PPP traffic as a single stream without user 
 
 Open [`docs/architecture.html`](docs/architecture.html) in a browser to see an interactive diagram of the L2TP integration architecture.
 
-## Fresh Server Setup (Debian 13)
+## Fresh Server Setup (Debian 12+ / Ubuntu 22.04+)
 
-This is a step-by-step guide for deploying vpn-ui on a fresh Debian 13 (Trixie) server.
+### Automated Setup
 
-### 1. Install System Packages
+The setup script installs all VPN backend dependencies, loads kernel modules, configures sysctl, and verifies the installation:
 
 ```bash
-apt-get update
-
-# VPN server daemons
-apt-get install -y xl2tpd ppp libreswan pptpd openvpn
-
-# Firewall and networking
-apt-get install -y nftables iproute2
-
-# Build tools (needed to compile the binary on the server)
-apt-get install -y gcc libc6-dev git
+sudo ./setup-vpn-backend.sh
 ```
 
-**Important**: Use **Libreswan** for IPsec, not StrongSwan. StrongSwan 6.x has a known incompatibility with Windows 10/11 L2TP/IPsec NAT-T.
+The script is idempotent (safe to run multiple times) and will:
+- Install packages: `xl2tpd`, `libreswan`, `pptpd`, `openvpn`, `ppp`, `nftables`
+- Load and persist required kernel modules
+- Enable IP forwarding
+- Detect and offer to remove StrongSwan (incompatible with Windows L2TP)
+- Disable auto-start for VPN daemons (the panel manages their lifecycle)
+- Create required directories
+- Verify the installation
 
-### 2. Install Go 1.26+
-
-Debian's packaged Go is usually too old. Install manually:
+### Build & Deploy
 
 ```bash
+# Install Go 1.26+ (if not already installed)
 curl -fsSL https://go.dev/dl/go1.26.0.linux-amd64.tar.gz -o /tmp/go.tar.gz
 rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz
-rm /tmp/go.tar.gz
-
-# Add to PATH (also add to ~/.bashrc or ~/.profile for persistence)
 export PATH=/usr/local/go/bin:$PATH
 
-go version  # should print go1.26.0
-```
+# Install build tools
+apt-get install -y gcc libc6-dev git
 
-### 3. Check Kernel Modules
-
-The following kernel modules are required. Most standard Debian kernels include them, but **cloud/minimal kernels (e.g., Hetzner cloud) may not**:
-
-```bash
-# PPP (required for L2TP and PPTP)
-modprobe ppp_generic
-modprobe l2tp_ppp
-modprobe ppp_mppe
-
-# PPTP connection tracking
-modprobe nf_conntrack_pptp
-modprobe ip_gre
-
-# TPROXY (for routing L2TP/PPTP traffic through Xray)
-modprobe nf_tproxy_ipv4
-
-# IPsec
-modprobe af_key
-```
-
-If any of these fail with `FATAL: Module not found`, install the full kernel:
-
-```bash
-apt-get install -y linux-image-amd64
-reboot
-```
-
-### 4. Build the Binary
-
-```bash
+# Build the binary (CGO required for SQLite)
 git clone https://github.com/Sir-MmD/vpn-ui.git
 cd vpn-ui
 CGO_ENABLED=1 go build -o x-ui main.go
-```
 
-CGO is required (SQLite driver uses C bindings).
-
-### 5. Install Xray
-
-Download the latest Xray release and place the binary:
-
-```bash
+# Install Xray
 mkdir -p /usr/local/x-ui/bin
-
-# Download latest Xray (check https://github.com/XTLS/Xray-core/releases for current version)
 XRAY_VERSION="25.1.1"
 curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip
 unzip -o /tmp/xray.zip -d /tmp/xray
 cp /tmp/xray/xray /usr/local/x-ui/bin/xray-linux-amd64
 chmod +x /usr/local/x-ui/bin/xray-linux-amd64
+cp /tmp/xray/geo*.dat /usr/local/x-ui/bin/ 2>/dev/null || true
 rm -rf /tmp/xray /tmp/xray.zip
 
-# Also copy geoip/geosite data files
-cp /tmp/xray/geoip.dat /usr/local/x-ui/bin/ 2>/dev/null || true
-cp /tmp/xray/geosite.dat /usr/local/x-ui/bin/ 2>/dev/null || true
-```
-
-### 6. Deploy
-
-```bash
-# Create directories
-mkdir -p /usr/local/x-ui/bin /etc/x-ui /var/log/x-ui
-
-# Copy the built binary
+# Deploy and run
 cp x-ui /usr/local/x-ui/
-
-# Run the panel
 cd /usr/local/x-ui
 nohup ./x-ui run > /var/log/x-ui/panel.log 2>&1 &
 
-# Panel is now available at http://YOUR_SERVER_IP:2053
-# Default credentials: admin / admin
+# Panel: http://YOUR_IP:2053 (default: admin/admin)
 ```
 
-Alternatively, run via systemd (create `/etc/systemd/system/x-ui.service`):
+Or run via systemd:
 
-```ini
+```bash
+cat > /etc/systemd/system/x-ui.service << 'EOF'
 [Unit]
 Description=x-ui
 After=network.target
@@ -227,32 +170,18 @@ LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-```
+EOF
 
-```bash
 systemctl daemon-reload
 systemctl enable --now x-ui
 ```
 
-### 7. Verify
-
-```bash
-# Check the panel is running
-curl -s http://localhost:2053 | head -1
-
-# Check logs
-tail -f /var/log/x-ui/panel.log
-
-# Verify VPN daemons can start (the panel manages them, but check they're installed)
-which xl2tpd pptpd openvpn ipsec
-```
-
 ### Notes
 
-- The panel automatically manages all VPN service configs (`xl2tpd.conf`, `ipsec.conf`, `pptpd.conf`, OpenVPN server configs). You do not need to configure them manually.
-- IP forwarding (`net.ipv4.ip_forward=1`) and nftables rules are set up automatically by the panel when VPN inbounds are created.
-- The embedded RADIUS server starts automatically on `127.0.0.1:1812-1813`. No external RADIUS setup needed.
-- For Windows L2TP clients behind NAT, the Windows registry key `AssumeUDPEncapsulationContextOnSendRule` (DWORD value `2`) may be needed under `HKLM\SYSTEM\CurrentControlSet\Services\PolicyAgent`.
+- The panel automatically generates all VPN configs at runtime. No manual config editing needed.
+- The embedded RADIUS server starts automatically on `127.0.0.1:1812-1813`.
+- For Windows L2TP clients behind NAT, set registry key `AssumeUDPEncapsulationContextOnSendRule` (DWORD `2`) under `HKLM\SYSTEM\CurrentControlSet\Services\PolicyAgent`.
+- Cloud/minimal kernels may lack PPP modules — install `linux-image-amd64` and reboot if `modprobe` fails.
 
 ## Usage
 
@@ -331,6 +260,8 @@ L2TP and PPTP traffic flows through Xray's routing engine. The inbound's **tag**
 
 **Note**: OpenVPN traffic uses direct NAT routing and does not pass through Xray.
 
+#### Route by inbound tag (all users of an inbound)
+
 ```json
 {
   "inboundTag": ["inbound-1701", "inbound-1723"],
@@ -340,6 +271,21 @@ L2TP and PPTP traffic flows through Xray's routing engine. The inbound's **tag**
 ```
 
 This blocks ads for all L2TP and PPTP clients, just as it would for any Xray protocol.
+
+#### Route by user email (per-client routing)
+
+You can route individual L2TP/PPTP clients using the `user` field with their **email**, exactly the same syntax as VMess/VLESS/Trojan:
+
+```json
+{
+  "user": ["alice@example.com"],
+  "outboundTag": "warp"
+}
+```
+
+This routes all traffic from the L2TP/PPTP client with email `alice@example.com` through the `warp` outbound.
+
+Behind the scenes, the panel assigns deterministic IPs to VPN clients via RADIUS and transparently translates `user` (email) rules to `source` (IP) rules in the generated Xray config. No special configuration is needed — just use `user` with the client's email as you would for any other protocol.
 
 ## Development
 

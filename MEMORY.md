@@ -3,7 +3,7 @@
 ## Meta
 - Memory location: /home/mmd/work/vpn-ui/MEMORY.md
 - Rule: Update this file after every significant step or discovery
-- Last updated: 2026-02-18
+- Last updated: 2026-02-20 (session 10)
 - Branch: mmd (main branch: main)
 
 ## Project Identity
@@ -146,12 +146,12 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
 - **Date formats**: Gregorian + Jalalian (Persian) calendar
 
 ## Deployment
-- **Docker**: Multi-stage build (Go 1.26 alpine builder -> alpine runtime)
-- **Systemd**: Service files for Debian, RHEL, Arch
+- **Setup script**: `setup-vpn-backend.sh` — installs all VPN backend deps (idempotent, Debian 12+/Ubuntu 22.04+)
+- **Local compile**: Go 1.26 is available locally at `/usr/bin/go` — `CGO_ENABLED=1 go build -o x-ui main.go`
+- **Server compile**: Also works on x-server at `/usr/local/go/bin/go`
 - **Default port**: 2053 (panel), 2096 (subscription)
 - **Data volume**: /etc/x-ui
-- **Fail2Ban**: Configured in Docker (SSH disabled)
-- **Install script**: install.sh (shell-based installer)
+- **Install script**: install.sh (shell-based installer, upstream)
 
 ## Configuration (Environment Variables)
 | Variable | Default | Purpose |
@@ -279,6 +279,7 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
 - xl2tpd `require chap = yes` works fine with PPP `+mschap-v2` (additive); it conflicted with `require-mschap-v2` (exclusive)
 - pppd logs "Peer X authenticated with CHAP" even for MSCHAPv2 — generic log message
 - Windows registry `AssumeUDPEncapsulationContextOnSendRule=2` needed for NAT-T L2TP
+- **Controller vs Server service instances**: InboundController creates its own zero-value L2tpService/PptpService. `SetRadius()` is only called on Server's instances. Any method that needs `radiusSecret` must fall back to DB lookup (`SettingService.GetRadiusSecret()`) when in-memory field is empty. Fixed in session 9 (commit 94fbbf62).
 
 ## Embedded RADIUS Server (2026-02-18, session 7)
 - **Architecture**: Replaced file-based auth (chap-secrets, usermap, ip-up/ip-down scripts, session files) with embedded Go RADIUS server
@@ -375,6 +376,33 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
 - Disable client → kill via management socket → RADIUS reject reconnect ✅
 - NAT masquerade (client traffic routed through server IP) ✅
 - OpenVPN packages: `openvpn` on x-server, `openvpn` on x-client
+
+## Per-User Email Routing for L2TP/PPTP (2026-02-20, session 9, commit c2138b43)
+- **Problem**: Xray's `user` routing field doesn't work with dokodemo-door (no per-user identification). L2TP/PPTP could only be routed by `inboundTag`, not per-user.
+- **Solution**: Two-part approach — deterministic IP assignment + transparent routing rule translation.
+
+### Deterministic IP assignment (radius.go)
+- RADIUS Access-Accept now includes `Framed-IP-Address` based on client's index in the inbound's client list
+- Index 0 → startIP, index 1 → startIP+1, etc. (e.g., `10.0.2.10`, `10.0.2.11`, ...)
+- Functions: `getClientIP()` (on RadiusService), `computeVpnClientIP()`, `vpnSubnet()`
+- `BuildVpnEmailToIPMap()` — exported, builds email→IP map for all enabled L2TP/PPTP clients
+
+### Routing rule translation (xray.go)
+- `translateVpnRoutingRules()` called at end of `GetXrayConfig()`
+- Scans all routing rules for `user` field, checks emails against VPN client map
+- VPN emails → creates `source`-based rule (copy all fields except `user`, add `source` IPs)
+- Non-VPN emails → kept as original `user` rule
+- Mixed rules (some VPN, some Xray) → split into two rules (source + user)
+- **Transparent to UI**: operators write `user: ["email"]` same as VMess/VLESS/Trojan
+
+### Key detail
+- TPROXY preserves source IPs, so Xray sees each user's unique PPP IP in dokodemo-door traffic
+- No UI changes needed — panel template routing rules "just work" with VPN emails
+
+### Tested on sandbox
+- L2TP user "a" (index 1) → IP `10.0.2.11` (correct: startIP 10.0.2.10 + 1) ✅
+- Template `{"user": ["a"], "outboundTag": "SVXNL@SVXNL"}` → generated `{"source": ["10.0.2.11"], "outboundTag": "SVXNL@SVXNL"}` ✅
+- Multiple rules with same email correctly translated independently ✅
 
 ## nftables (2026-02-18, session 5)
 - **Architecture**: Single `table ip vpn` with 5 chains: prerouting (TPROXY + jumps), postrouting (jumps), input (raw L2TP filter), l2tp_acct (dynamic per-client), pptp_acct (dynamic per-client)
