@@ -50,6 +50,17 @@ func (s *L2tpService) SetRadius(rs RadiusService, secret string) {
 	s.radiusSecret = secret
 }
 
+// getRadiusSecret returns the RADIUS secret, falling back to reading from DB
+// when the in-memory field is empty (e.g. in the controller's zero-value instance).
+func (s *L2tpService) getRadiusSecret() string {
+	if s.radiusSecret != "" {
+		return s.radiusSecret
+	}
+	var settingService SettingService
+	secret, _ := settingService.GetRadiusSecret()
+	return secret
+}
+
 func (s *L2tpService) GetL2tpInbounds() ([]*model.Inbound, error) {
 	db := database.GetDB()
 	var inbounds []*model.Inbound
@@ -122,12 +133,13 @@ func (s *L2tpService) GenerateAllConfigs() error {
 	if err := s.GenerateIPsecConfig(inbounds); err != nil {
 		return err
 	}
+	radiusSecret := s.getRadiusSecret()
 	for _, inbound := range inbounds {
 		if err := s.GeneratePPPOptions(inbound); err != nil {
 			return err
 		}
-		if s.radiusSecret != "" {
-			if err := GenerateRadiusClientConfig("l2tp", inbound.Id, s.radiusSecret); err != nil {
+		if radiusSecret != "" {
+			if err := GenerateRadiusClientConfig("l2tp", inbound.Id, radiusSecret); err != nil {
 				return err
 			}
 		}

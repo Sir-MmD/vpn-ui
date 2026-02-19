@@ -47,6 +47,17 @@ func (s *PptpService) SetRadius(rs RadiusService, secret string) {
 	s.radiusSecret = secret
 }
 
+// getRadiusSecret returns the RADIUS secret, falling back to reading from DB
+// when the in-memory field is empty (e.g. in the controller's zero-value instance).
+func (s *PptpService) getRadiusSecret() string {
+	if s.radiusSecret != "" {
+		return s.radiusSecret
+	}
+	var settingService SettingService
+	secret, _ := settingService.GetRadiusSecret()
+	return secret
+}
+
 func (s *PptpService) GetPptpInbounds() ([]*model.Inbound, error) {
 	db := database.GetDB()
 	var inbounds []*model.Inbound
@@ -110,12 +121,13 @@ func (s *PptpService) GenerateAllConfigs() error {
 	if err := s.GeneratePptpdConfig(inbounds); err != nil {
 		return err
 	}
+	radiusSecret := s.getRadiusSecret()
 	for _, inbound := range inbounds {
 		if err := s.GeneratePPPOptions(inbound); err != nil {
 			return err
 		}
-		if s.radiusSecret != "" {
-			if err := GenerateRadiusClientConfig("pptp", inbound.Id, s.radiusSecret); err != nil {
+		if radiusSecret != "" {
+			if err := GenerateRadiusClientConfig("pptp", inbound.Id, radiusSecret); err != nil {
 				return err
 			}
 		}
