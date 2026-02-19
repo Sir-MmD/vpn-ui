@@ -220,7 +220,100 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *dokodemoConfig)
 	}
 
+	// Translate email-based routing rules for L2TP/PPTP clients to source-IP rules.
+	// Dokodemo-door doesn't support per-user identification, so we use deterministic
+	// IP assignment and match on source IP instead.
+	s.translateVpnRoutingRules(xrayConfig)
+
 	return xrayConfig, nil
+}
+
+// translateVpnRoutingRules rewrites routing rules so that "user" (email) matches
+// for L2TP/PPTP clients are translated to "source" (IP) matches.
+func (s *XrayService) translateVpnRoutingRules(config *xray.Config) {
+	if len(config.RouterConfig) == 0 {
+		return
+	}
+
+	vpnMap := BuildVpnEmailToIPMap()
+	if len(vpnMap) == 0 {
+		return
+	}
+
+	var routing map[string]any
+	if err := json.Unmarshal(config.RouterConfig, &routing); err != nil {
+		return
+	}
+
+	rulesRaw, ok := routing["rules"].([]any)
+	if !ok || len(rulesRaw) == 0 {
+		return
+	}
+
+	var newRules []any
+	modified := false
+
+	for _, ruleRaw := range rulesRaw {
+		rule, ok := ruleRaw.(map[string]any)
+		if !ok {
+			newRules = append(newRules, ruleRaw)
+			continue
+		}
+
+		usersRaw, ok := rule["user"].([]any)
+		if !ok || len(usersRaw) == 0 {
+			newRules = append(newRules, rule)
+			continue
+		}
+
+		// Separate VPN emails from regular Xray emails
+		var vpnIPs []any
+		var regularEmails []any
+		for _, u := range usersRaw {
+			email, ok := u.(string)
+			if !ok {
+				regularEmails = append(regularEmails, u)
+				continue
+			}
+			if ip, found := vpnMap[email]; found {
+				vpnIPs = append(vpnIPs, ip)
+			} else {
+				regularEmails = append(regularEmails, u)
+			}
+		}
+
+		if len(vpnIPs) == 0 {
+			newRules = append(newRules, rule)
+			continue
+		}
+
+		modified = true
+
+		// Create source-based rule for VPN clients (copy all fields except "user")
+		vpnRule := make(map[string]any)
+		for k, v := range rule {
+			if k != "user" {
+				vpnRule[k] = v
+			}
+		}
+		vpnRule["source"] = vpnIPs
+		newRules = append(newRules, vpnRule)
+
+		// Keep original rule with remaining non-VPN emails
+		if len(regularEmails) > 0 {
+			rule["user"] = regularEmails
+			newRules = append(newRules, rule)
+		}
+	}
+
+	if !modified {
+		return
+	}
+
+	routing["rules"] = newRules
+	if data, err := json.Marshal(routing); err == nil {
+		config.RouterConfig = data
+	}
 }
 
 // GetXrayTraffic fetches the current traffic statistics from the running Xray process.

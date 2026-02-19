@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -172,10 +173,16 @@ func (s *RadiusService) handleAuth(w radius.ResponseWriter, r *radius.Request) {
 	microsoft.MSMPPEEncryptionPolicy_Add(accept, microsoft.MSMPPEEncryptionPolicy_Value_EncryptionAllowed)
 	microsoft.MSMPPEEncryptionTypes_Add(accept, microsoft.MSMPPEEncryptionTypes_Value_RC440or128BitAllowed)
 
+	// Assign deterministic IP so per-user Xray routing works via source IP
+	clientIP := s.getClientIP(protocol, inboundId, username)
+	if clientIP != nil {
+		rfc2865.FramedIPAddress_Set(accept, clientIP)
+	}
+
 	// Request periodic accounting updates (60s minimum for pppd)
 	rfc2869.AcctInterimInterval_Set(accept, rfc2869.AcctInterimInterval(60))
 
-	logger.Infof("RADIUS: auth accepted user=%s nas=%s", username, nasID)
+	logger.Infof("RADIUS: auth accepted user=%s nas=%s ip=%v", username, nasID, clientIP)
 	w.Write(accept)
 }
 
@@ -497,6 +504,131 @@ func parseNASIdentifier(nasID string) (protocol string, inboundId int, err error
 	}
 
 	return protocol, inboundId, nil
+}
+
+// getClientIP computes the deterministic IP for a VPN client.
+// Returns nil if the client is not found or the IP range is exhausted.
+func (s *RadiusService) getClientIP(protocol string, inboundId int, username string) net.IP {
+	db := database.GetDB()
+	var inbound model.Inbound
+	if err := db.First(&inbound, inboundId).Error; err != nil {
+		return nil
+	}
+
+	type clientEntry struct {
+		ID string `json:"id"`
+	}
+	type settingsJSON struct {
+		IpRange string        `json:"ipRange"`
+		LocalIp string        `json:"localIp"`
+		Clients []clientEntry `json:"clients"`
+	}
+
+	var settings settingsJSON
+	if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
+		return nil
+	}
+
+	clientIndex := -1
+	for i, c := range settings.Clients {
+		if c.ID == username {
+			clientIndex = i
+			break
+		}
+	}
+	if clientIndex < 0 {
+		return nil
+	}
+
+	return computeVpnClientIP(settings.IpRange, settings.LocalIp, inbound.Id, clientIndex, protocol)
+}
+
+// computeVpnClientIP computes a deterministic IP for a VPN client based on their
+// index in the client list. The IP is derived from the start of the IP range.
+func computeVpnClientIP(ipRange, localIp string, inboundId, clientIndex int, protocol string) net.IP {
+	if ipRange == "" {
+		subnet := vpnSubnet(localIp, inboundId, protocol)
+		ipRange = fmt.Sprintf("%s.10-%s.50", subnet, subnet)
+	}
+
+	parts := strings.SplitN(ipRange, "-", 2)
+	startIP := net.ParseIP(strings.TrimSpace(parts[0])).To4()
+	if startIP == nil {
+		return nil
+	}
+
+	// Check bounds against end IP
+	if len(parts) == 2 {
+		endIP := net.ParseIP(strings.TrimSpace(parts[1])).To4()
+		if endIP != nil {
+			maxClients := int(endIP[3]) - int(startIP[3]) + 1
+			if clientIndex >= maxClients {
+				return nil
+			}
+		}
+	}
+
+	ip := make(net.IP, 4)
+	copy(ip, startIP)
+	ip[3] += byte(clientIndex)
+	return ip
+}
+
+// vpnSubnet returns the /24 subnet prefix for a VPN inbound.
+func vpnSubnet(localIp string, inboundId int, protocol string) string {
+	if localIp != "" {
+		parts := strings.Split(localIp, ".")
+		if len(parts) >= 3 {
+			return strings.Join(parts[:3], ".")
+		}
+	}
+	prefix := 0
+	if protocol == "pptp" {
+		prefix = 1
+	}
+	return fmt.Sprintf("10.%d.%d", prefix, inboundId)
+}
+
+// BuildVpnEmailToIPMap returns a map of email → deterministic IP for all enabled
+// L2TP/PPTP clients. Used by the Xray config generator to translate email-based
+// routing rules to source-IP rules.
+func BuildVpnEmailToIPMap() map[string]string {
+	result := make(map[string]string)
+	db := database.GetDB()
+	if db == nil {
+		return result
+	}
+
+	var inbounds []*model.Inbound
+	db.Where("protocol IN ? AND enable = ?", []string{"l2tp", "pptp"}, true).Find(&inbounds)
+
+	type clientEntry struct {
+		ID    string `json:"id"`
+		Email string `json:"email"`
+	}
+	type settingsJSON struct {
+		IpRange string        `json:"ipRange"`
+		LocalIp string        `json:"localIp"`
+		Clients []clientEntry `json:"clients"`
+	}
+
+	for _, inbound := range inbounds {
+		var settings settingsJSON
+		if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
+			continue
+		}
+		for i, client := range settings.Clients {
+			if client.Email == "" {
+				continue
+			}
+			ip := computeVpnClientIP(settings.IpRange, settings.LocalIp, inbound.Id, i, string(inbound.Protocol))
+			if ip != nil {
+				result[client.Email] = ip.String()
+			}
+		}
+	}
+
+	return result
 }
 
 // GenerateRadiusClientConfig writes the radcli config files for a given inbound.
