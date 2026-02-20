@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# setup-vpn-backend.sh — Install and configure the VPN backend for vpn-ui (3x-ui fork)
+# setup-vpn-backend.sh — Install, update, or uninstall the VPN backend for vpn-ui (3x-ui fork)
 #
 # Supports: L2TP/IPsec, PPTP, OpenVPN
 # Target OS: Debian 12+ / Ubuntu 22.04+
 #
 # Usage:
-#   chmod +x setup-vpn-backend.sh
-#   sudo ./setup-vpn-backend.sh
+#   sudo ./setup-vpn-backend.sh install     # First-time setup (default)
+#   sudo ./setup-vpn-backend.sh update      # Re-apply config on existing install
+#   sudo ./setup-vpn-backend.sh uninstall   # Remove VPN backend completely
 #
-# This script is idempotent — safe to run multiple times.
-# It will NOT overwrite existing VPN config files (those are managed by the panel at runtime).
+# The install and update commands are idempotent — safe to run multiple times.
 #
 
 set -euo pipefail
@@ -34,6 +34,28 @@ REQUIRED_PACKAGES=(
     iptables          # legacy cleanup only; nftables is primary
     # RADIUS (pppd radius plugin — shipped with ppp on Debian)
     libradcli4
+)
+
+# Packages installed only for Libreswan rebuild (can be removed after)
+BUILD_PACKAGES=(
+    dpkg-dev
+    build-essential
+    libnspr4-dev
+    libnss3-dev
+    libnss3-tools
+    libpam0g-dev
+    libcap-ng-dev
+    libcurl4-openssl-dev
+    libldap2-dev
+    libunbound-dev
+    libevent-dev
+    libsystemd-dev
+    xmlto
+    bison
+    flex
+    pkg-config
+    libaudit-dev
+    libselinux1-dev
 )
 
 KERNEL_MODULES=(
@@ -62,6 +84,32 @@ REQUIRED_DIRS=(
     /var/run/openvpn
     /var/log/x-ui
     /usr/local/x-ui/bin
+)
+
+# Files and directories created by the panel at runtime
+PANEL_GENERATED_FILES=(
+    /etc/ipsec.conf
+    /etc/ipsec.secrets
+    /etc/xl2tpd/xl2tpd.conf
+    /etc/pptpd.conf
+)
+PANEL_GENERATED_GLOBS=(
+    "/etc/ppp/options.xl2tpd-*"
+    "/etc/ppp/pptpd-options-*"
+    "/etc/ppp/radius/l2tp-*.conf"
+    "/etc/ppp/radius/pptp-*.conf"
+    "/etc/ppp/radius/openvpn-*.conf"
+    "/etc/ppp/ip-up.d/vpn-*"
+    "/etc/ppp/ip-down.d/vpn-*"
+    "/etc/openvpn/server-*"
+    "/etc/systemd/system/openvpn-server@*"
+    "/var/run/openvpn/*"
+)
+
+SETUP_CONFIG_FILES=(
+    /etc/modules-load.d/vpn-ui.conf
+    /etc/sysctl.d/99-vpn-ui.conf
+    /etc/apt/preferences.d/libreswan
 )
 
 RED='\033[0;31m'
@@ -301,6 +349,87 @@ configure_services() {
 }
 
 # --------------------------------------------------------------------------- #
+#  Rebuild Libreswan with ALL_ALGS=true (enables modp1024/DH2 for MikroTik)
+# --------------------------------------------------------------------------- #
+
+rebuild_libreswan() {
+    step "Checking Libreswan for legacy algorithm support (modp1024/DH2)"
+
+    # Check if Libreswan is installed
+    if ! command -v ipsec &>/dev/null; then
+        warn "Libreswan not installed — skipping rebuild"
+        return
+    fi
+
+    # Check if modp1024 is already available
+    if ipsec pluto --selftest 2>&1 | grep -q 'MODP1024'; then
+        log "Libreswan already has MODP1024 (DH2) support"
+        return
+    fi
+
+    info "Libreswan lacks MODP1024 (DH2) — rebuilding with ALL_ALGS=true"
+    info "This enables legacy DH groups for MikroTik and older clients"
+
+    # Install build dependencies
+    info "Installing build dependencies..."
+    apt-get install -y -qq dpkg-dev >/dev/null 2>&1 || true
+    apt-get build-dep -y -qq libreswan >/dev/null 2>&1 || {
+        warn "Could not install Libreswan build dependencies"
+        warn "MikroTik and other legacy devices needing modp1024 will not work"
+        return
+    }
+
+    # Download and extract source
+    local build_dir
+    build_dir=$(mktemp -d /tmp/libreswan-build.XXXXXX)
+    info "Building in $build_dir (this may take a few minutes)..."
+    cd "$build_dir"
+    apt-get source --download-only libreswan >/dev/null 2>&1 || {
+        warn "Could not download Libreswan source"
+        cd /
+        rm -rf "$build_dir"
+        return
+    }
+    dpkg-source -x libreswan_*.dsc libreswan-src >/dev/null 2>&1
+
+    # Patch debian/rules to add ALL_ALGS=true
+    if [[ -f libreswan-src/debian/rules ]]; then
+        perl -i -pe 's|(ARCH=\$\(DEB_HOST_ARCH\) \\)|$1\n\t\tALL_ALGS=true \\|' \
+            libreswan-src/debian/rules
+    fi
+
+    # Build (skip tests — algparse test suite has known failures with ALL_ALGS)
+    cd libreswan-src
+    if DEB_BUILD_OPTIONS=nocheck dpkg-buildpackage -b -uc -us -j"$(nproc)" >/dev/null 2>&1; then
+        # Install the rebuilt package
+        dpkg -i ../libreswan_*_"$(dpkg --print-architecture)".deb >/dev/null 2>&1
+        log "Libreswan rebuilt and installed with ALL_ALGS=true"
+
+        # Verify
+        if ipsec pluto --selftest 2>&1 | grep -q 'MODP1024'; then
+            log "MODP1024 (DH2) is now available"
+        else
+            warn "Rebuild succeeded but MODP1024 still not detected"
+        fi
+
+        # Pin the package to prevent apt from overwriting our custom build
+        cat > /etc/apt/preferences.d/libreswan << 'APTPIN'
+Package: libreswan
+Pin: version *
+Pin-Priority: -1
+APTPIN
+        log "Pinned libreswan package to prevent apt overwrite"
+    else
+        warn "Libreswan rebuild failed — continuing with stock version"
+        warn "MikroTik and other legacy devices needing modp1024 will not work"
+    fi
+
+    # Cleanup
+    cd /
+    rm -rf "$build_dir"
+}
+
+# --------------------------------------------------------------------------- #
 #  StrongSwan conflict check
 # --------------------------------------------------------------------------- #
 
@@ -360,6 +489,15 @@ verify() {
         ok=false
     fi
 
+    # Check Libreswan MODP1024
+    if command -v ipsec &>/dev/null; then
+        if ipsec pluto --selftest 2>&1 | grep -q 'MODP1024'; then
+            log "Libreswan MODP1024 (DH2) — available"
+        else
+            warn "Libreswan MODP1024 (DH2) — NOT available (MikroTik won't work)"
+        fi
+    fi
+
     # Check IP forwarding
     local fwd
     fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
@@ -391,10 +529,10 @@ verify() {
 }
 
 # --------------------------------------------------------------------------- #
-#  Summary
+#  Summary (install)
 # --------------------------------------------------------------------------- #
 
-print_summary() {
+print_install_summary() {
     echo ""
     echo -e "${BLUE}================================================================${NC}"
     echo -e "${BLUE}  VPN Backend Setup Complete${NC}"
@@ -402,7 +540,7 @@ print_summary() {
     echo ""
     echo "  The following VPN services are installed and ready:"
     echo ""
-    echo "    L2TP/IPsec  — xl2tpd + Libreswan + pppd"
+    echo "    L2TP/IPsec  — xl2tpd + Libreswan (ALL_ALGS) + pppd"
     echo "    PPTP        — pptpd + pppd"
     echo "    OpenVPN     — openvpn (UDP + TCP)"
     echo "    RADIUS      — embedded in vpn-ui panel (127.0.0.1:1812-1813)"
@@ -422,13 +560,13 @@ print_summary() {
 }
 
 # --------------------------------------------------------------------------- #
-#  Main
+#  cmd: install (first-time setup)
 # --------------------------------------------------------------------------- #
 
-main() {
+cmd_install() {
     echo ""
     echo "================================================================"
-    echo "  vpn-ui — VPN Backend Setup Script"
+    echo "  vpn-ui — VPN Backend Install"
     echo "  L2TP/IPsec + PPTP + OpenVPN"
     echo "================================================================"
     echo ""
@@ -436,12 +574,306 @@ main() {
     preflight
     install_packages
     check_strongswan_conflict
+    rebuild_libreswan
     load_kernel_modules
     configure_sysctl
     create_directories
     configure_services
     verify
-    print_summary
+    print_install_summary
+}
+
+# --------------------------------------------------------------------------- #
+#  cmd: update (re-apply config on existing install)
+# --------------------------------------------------------------------------- #
+
+cmd_update() {
+    echo ""
+    echo "================================================================"
+    echo "  vpn-ui — VPN Backend Update"
+    echo "================================================================"
+    echo ""
+
+    preflight
+
+    # Check that the backend was previously installed
+    local missing=()
+    for pkg in xl2tpd ppp libreswan pptpd openvpn; do
+        if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+            missing+=("$pkg")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        warn "Missing packages: ${missing[*]}"
+        info "Installing missing packages..."
+        apt-get update -qq || true
+        apt-get install -y "${missing[@]}" || die "Failed to install missing packages"
+    fi
+    log "All required packages present"
+
+    # Rebuild Libreswan if needed (e.g., apt upgraded and overwrote our build)
+    rebuild_libreswan
+
+    # Re-apply kernel modules (in case new ones were added)
+    load_kernel_modules
+
+    # Re-apply sysctl
+    configure_sysctl
+
+    # Ensure directories exist
+    create_directories
+
+    # Re-apply service config
+    configure_services
+
+    # If the panel is running, restart VPN services to pick up changes
+    step "Restarting VPN services"
+    if pgrep -x x-ui &>/dev/null; then
+        info "Panel is running — restarting VPN services"
+
+        # Restart IPsec if config exists
+        if [[ -f /etc/ipsec.conf ]]; then
+            ipsec restart 2>/dev/null && log "ipsec — restarted" || warn "ipsec restart failed"
+            sleep 2
+        fi
+
+        # Restart xl2tpd if config exists
+        if [[ -f /etc/xl2tpd/xl2tpd.conf ]]; then
+            systemctl restart xl2tpd 2>/dev/null && log "xl2tpd — restarted" || warn "xl2tpd restart failed"
+        fi
+
+        # Restart pptpd if config exists
+        if [[ -f /etc/pptpd.conf ]]; then
+            systemctl restart pptpd 2>/dev/null && log "pptpd — restarted" || warn "pptpd restart failed"
+        fi
+
+        # Restart OpenVPN instances
+        local restarted_ovpn=0
+        for unit in /etc/systemd/system/openvpn-server@*.service; do
+            [[ -f "$unit" ]] || continue
+            local name
+            name=$(basename "$unit")
+            systemctl restart "$name" 2>/dev/null && log "$name — restarted" || warn "$name restart failed"
+            ((restarted_ovpn++))
+        done
+        if [[ $restarted_ovpn -eq 0 ]]; then
+            info "No OpenVPN instances found"
+        fi
+    else
+        info "Panel is not running — skipping service restart"
+        info "Services will start when the panel starts"
+    fi
+
+    verify
+
+    echo ""
+    echo -e "${BLUE}================================================================${NC}"
+    echo -e "${BLUE}  VPN Backend Update Complete${NC}"
+    echo -e "${BLUE}================================================================${NC}"
+    echo ""
+    echo "  Changes applied. If the panel was running, VPN services have"
+    echo "  been restarted to pick up the new configuration."
+    echo ""
+    echo -e "${BLUE}================================================================${NC}"
+}
+
+# --------------------------------------------------------------------------- #
+#  cmd: uninstall (remove VPN backend completely)
+# --------------------------------------------------------------------------- #
+
+cmd_uninstall() {
+    echo ""
+    echo "================================================================"
+    echo "  vpn-ui — VPN Backend Uninstall"
+    echo "================================================================"
+    echo ""
+
+    # Must be root
+    if [[ $EUID -ne 0 ]]; then
+        die "This script must be run as root (or via sudo)."
+    fi
+
+    echo -e "${RED}  WARNING: This will remove all VPN backend packages, configs,${NC}"
+    echo -e "${RED}  and generated files. The panel database (/etc/x-ui/x-ui.db)${NC}"
+    echo -e "${RED}  and the panel binary (/usr/local/x-ui/) will NOT be removed.${NC}"
+    echo ""
+    read -r -p "Are you sure you want to uninstall the VPN backend? [y/N] " answer
+    if [[ "${answer,,}" != "y" ]]; then
+        info "Uninstall cancelled."
+        exit 0
+    fi
+
+    # --- Stop services ---
+    step "Stopping VPN services"
+
+    for svc in xl2tpd pptpd ipsec; do
+        if systemctl is-active "$svc" &>/dev/null 2>&1; then
+            systemctl stop "$svc" 2>/dev/null && log "$svc — stopped" || warn "Failed to stop $svc"
+        else
+            log "$svc — not running"
+        fi
+    done
+
+    # Stop OpenVPN instances
+    for unit in /etc/systemd/system/openvpn-server@*.service; do
+        [[ -f "$unit" ]] || continue
+        local name
+        name=$(basename "$unit" .service)
+        systemctl stop "$name" 2>/dev/null || true
+        systemctl disable "$name" 2>/dev/null || true
+        rm -f "$unit"
+        log "$name — stopped and removed"
+    done
+    systemctl daemon-reload 2>/dev/null || true
+
+    # --- Remove panel-generated config files ---
+    step "Removing panel-generated config files"
+
+    for f in "${PANEL_GENERATED_FILES[@]}"; do
+        if [[ -f "$f" ]]; then
+            rm -f "$f"
+            log "Removed $f"
+        fi
+    done
+
+    for pattern in "${PANEL_GENERATED_GLOBS[@]}"; do
+        # shellcheck disable=SC2086
+        for f in $pattern; do
+            [[ -e "$f" ]] || continue
+            rm -rf "$f"
+            log "Removed $f"
+        done
+    done
+
+    # RADIUS config directory
+    if [[ -d /etc/ppp/radius ]]; then
+        rm -rf /etc/ppp/radius
+        log "Removed /etc/ppp/radius/"
+    fi
+
+    # nftables VPN table
+    if nft list table ip vpn &>/dev/null 2>&1; then
+        nft delete table ip vpn 2>/dev/null && log "Removed nftables table 'ip vpn'" || warn "Failed to remove nftables vpn table"
+    fi
+
+    # --- Remove setup config files ---
+    step "Removing setup config files"
+
+    for f in "${SETUP_CONFIG_FILES[@]}"; do
+        if [[ -f "$f" ]]; then
+            rm -f "$f"
+            log "Removed $f"
+        fi
+    done
+
+    # --- Remove packages ---
+    step "Removing VPN packages"
+
+    local to_remove=()
+    for pkg in xl2tpd pptpd libreswan openvpn; do
+        if dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+            to_remove+=("$pkg")
+        fi
+    done
+
+    if [[ ${#to_remove[@]} -gt 0 ]]; then
+        info "Removing: ${to_remove[*]}"
+        apt-get remove -y "${to_remove[@]}" 2>/dev/null || warn "Some packages could not be removed"
+        log "Packages removed"
+    else
+        log "No VPN packages to remove"
+    fi
+
+    # Ask about purging (removes config files from packages too)
+    echo ""
+    read -r -p "Purge package configs too? (removes /etc defaults from packages) [y/N] " answer
+    if [[ "${answer,,}" == "y" ]]; then
+        apt-get purge -y "${to_remove[@]}" 2>/dev/null || true
+        log "Package configs purged"
+    fi
+
+    # Ask about removing build dependencies
+    echo ""
+    read -r -p "Remove build dependencies (dpkg-dev, -dev packages)? [y/N] " answer
+    if [[ "${answer,,}" == "y" ]]; then
+        apt-get autoremove -y 2>/dev/null || true
+        log "Build dependencies cleaned up"
+    fi
+
+    # --- Clean up empty directories ---
+    step "Cleaning up directories"
+
+    for dir in /etc/xl2tpd /var/run/openvpn; do
+        if [[ -d "$dir" ]] && [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]; then
+            rmdir "$dir" 2>/dev/null && log "Removed empty $dir" || true
+        fi
+    done
+
+    # --- Reload systemd ---
+    systemctl daemon-reload 2>/dev/null || true
+
+    echo ""
+    echo -e "${BLUE}================================================================${NC}"
+    echo -e "${BLUE}  VPN Backend Uninstall Complete${NC}"
+    echo -e "${BLUE}================================================================${NC}"
+    echo ""
+    echo "  Removed:"
+    echo "    - VPN packages (xl2tpd, pptpd, libreswan, openvpn)"
+    echo "    - Panel-generated configs (ipsec, xl2tpd, pptpd, openvpn, radius)"
+    echo "    - Kernel module persistence (/etc/modules-load.d/vpn-ui.conf)"
+    echo "    - sysctl overrides (/etc/sysctl.d/99-vpn-ui.conf)"
+    echo "    - Libreswan apt pin (/etc/apt/preferences.d/libreswan)"
+    echo "    - nftables VPN table"
+    echo ""
+    echo "  Preserved:"
+    echo "    - Panel database: /etc/x-ui/x-ui.db"
+    echo "    - Panel binary:   /usr/local/x-ui/"
+    echo "    - Panel logs:     /var/log/x-ui/"
+    echo "    - ppp package (used by pppd — shared dependency)"
+    echo ""
+    echo "  Note: Kernel modules are still loaded in memory until next reboot."
+    echo "  IP forwarding (net.ipv4.ip_forward) may revert on reboot."
+    echo ""
+    echo -e "${BLUE}================================================================${NC}"
+}
+
+# --------------------------------------------------------------------------- #
+#  Usage
+# --------------------------------------------------------------------------- #
+
+usage() {
+    local code="${1:-0}"
+    echo "Usage: $0 {install|update|uninstall}"
+    echo ""
+    echo "Commands:"
+    echo "  install     First-time setup: install packages, configure system,"
+    echo "              rebuild Libreswan with legacy cipher support (default)"
+    echo "  update      Re-apply configuration on an existing install:"
+    echo "              rebuild Libreswan if needed, reload modules/sysctl,"
+    echo "              restart VPN services if the panel is running"
+    echo "  uninstall   Remove VPN backend packages, configs, and cleanup"
+    echo ""
+    echo "Both install and update are idempotent — safe to run multiple times."
+    exit "$code"
+}
+
+# --------------------------------------------------------------------------- #
+#  Main
+# --------------------------------------------------------------------------- #
+
+main() {
+    local cmd="${1:-install}"
+
+    case "$cmd" in
+        install)    cmd_install ;;
+        update)     cmd_update ;;
+        uninstall)  cmd_uninstall ;;
+        -h|--help|help) usage 0 ;;
+        *)
+            err "Unknown command: $cmd"
+            usage 1
+            ;;
+    esac
 }
 
 main "$@"

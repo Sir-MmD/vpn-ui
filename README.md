@@ -9,7 +9,7 @@ All VPN clients are managed through the same panel UI, with per-client traffic t
 ### L2TP/IPsec Protocol Support
 
 - **Full panel integration** — Create L2TP inbounds from the protocol dropdown, add/remove users with username and password
-- **IPsec encryption** — Optional IPsec with configurable pre-shared key (PSK)
+- **IPsec encryption** — Optional IPsec with configurable pre-shared key (PSK), wide cipher support (AES/3DES, SHA2/SHA1/MD5, modp2048/modp1536/modp1024/ECP) for maximum client compatibility including MikroTik
 - **Xray routing** — L2TP traffic passes through Xray's routing rules via TPROXY + dokodemo-door bridge
 - **Per-client traffic tracking** — Upload/download bytes tracked per user via nftables accounting
 - **Client management** — Traffic limits, expiry dates, enable/disable, IP limits — same as any other protocol
@@ -103,20 +103,33 @@ Open [`docs/architecture.html`](docs/architecture.html) in a browser to see an i
 
 ### Automated Setup
 
-The setup script installs all VPN backend dependencies, loads kernel modules, configures sysctl, and verifies the installation:
+The setup script manages the full VPN backend lifecycle:
 
 ```bash
-sudo ./setup-vpn-backend.sh
+sudo ./setup-vpn-backend.sh install     # First-time setup (default)
+sudo ./setup-vpn-backend.sh update      # Re-apply config on existing install
+sudo ./setup-vpn-backend.sh uninstall   # Remove VPN backend completely
 ```
 
-The script is idempotent (safe to run multiple times) and will:
+**install** (default) — idempotent, safe to run multiple times:
 - Install packages: `xl2tpd`, `libreswan`, `pptpd`, `openvpn`, `ppp`, `nftables`
+- Detect and remove StrongSwan (incompatible with Windows L2TP)
+- Rebuild Libreswan with `ALL_ALGS=true` (enables modp1024/DH2 for MikroTik and legacy clients)
 - Load and persist required kernel modules
 - Enable IP forwarding
-- Detect and offer to remove StrongSwan (incompatible with Windows L2TP)
 - Disable auto-start for VPN daemons (the panel manages their lifecycle)
-- Create required directories
-- Verify the installation
+- Create required directories and verify the installation
+
+**update** — re-applies config on an existing deployment:
+- Rebuilds Libreswan if legacy ciphers are missing (e.g. after apt upgrade)
+- Reloads kernel modules and sysctl settings
+- Restarts VPN services if the panel is running
+- Installs any missing packages
+
+**uninstall** — removes VPN backend completely:
+- Stops all VPN services (xl2tpd, pptpd, ipsec, openvpn)
+- Removes generated configs, nftables rules, module/sysctl persistence
+- Removes VPN packages (preserves panel database and binary)
 
 ### Build & Deploy
 
@@ -180,6 +193,7 @@ systemctl enable --now x-ui
 
 - The panel automatically generates all VPN configs at runtime. No manual config editing needed.
 - The embedded RADIUS server starts automatically on `127.0.0.1:1812-1813`.
+- The setup script rebuilds Libreswan with `ALL_ALGS=true` to enable legacy ciphers (modp1024/DH2) for MikroTik and older clients. The custom build is pinned to prevent apt from overwriting it.
 - For Windows L2TP clients behind NAT, set registry key `AssumeUDPEncapsulationContextOnSendRule` (DWORD `2`) under `HKLM\SYSTEM\CurrentControlSet\Services\PolicyAgent`.
 - Cloud/minimal kernels may lack PPP modules — install `linux-image-amd64` and reboot if `modprobe` fails.
 

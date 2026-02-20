@@ -3,7 +3,7 @@
 ## Meta
 - Memory location: /home/mmd/work/vpn-ui/MEMORY.md
 - Rule: Update this file after every significant step or discovery
-- Last updated: 2026-02-20 (session 10)
+- Last updated: 2026-02-20 (session 11)
 - Branch: mmd (main branch: main)
 
 ## Project Identity
@@ -146,7 +146,10 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
 - **Date formats**: Gregorian + Jalalian (Persian) calendar
 
 ## Deployment
-- **Setup script**: `setup-vpn-backend.sh` — installs all VPN backend deps (idempotent, Debian 12+/Ubuntu 22.04+)
+- **Setup script**: `setup-vpn-backend.sh` — install/update/uninstall VPN backend (idempotent, Debian 12+/Ubuntu 22.04+)
+  - `install` (default): packages, StrongSwan removal, Libreswan rebuild, modules, sysctl, services
+  - `update`: rebuild Libreswan if needed, reload modules/sysctl, restart VPN services
+  - `uninstall`: stop services, remove packages/configs/rules, preserve DB+binary
 - **Local compile**: Go 1.26 is available locally at `/usr/bin/go` — `CGO_ENABLED=1 go build -o x-ui main.go`
 - **Server compile**: Also works on x-server at `/usr/local/go/bin/go`
 - **Default port**: 2053 (panel), 2096 (subscription)
@@ -265,7 +268,13 @@ TLS, Reality, ECH certificates, ML-DSA-65, ML-KEM-768, X25519
   - ESP: `aes256-sha2,aes128-sha2,aes256-sha1,aes128-sha1,3des-sha1`
 - **Key lessons**:
   - `sha2-truncbug=yes` breaks Windows 11 (uses correct 128-bit SHA2-256 truncation)
-  - Libreswan 5.2 dropped `modp1024` support — use `modp2048` minimum
+  - **Libreswan rebuilt with ALL_ALGS=true** (session 11): Enables modp1024 (DH2), DH22-24, and all legacy ciphers
+  - Build: `apt-get source libreswan`, patch `debian/rules` to add `ALL_ALGS=true`, `DEB_BUILD_OPTIONS=nocheck dpkg-buildpackage -b -uc -us`
+  - Package pinned at `/etc/apt/preferences.d/libreswan` (Pin-Priority: -1) to prevent apt overwrite
+  - `setup-vpn-backend.sh` has `rebuild_libreswan()` function that automates this
+  - **MikroTik NOW WORKS**: modp1024 (DH2) available, tested with 3DES-SHA1-MODP1024
+  - IKE proposals now include modp2048 + modp1536 + modp1024 + ECP DH19/DH20
+  - ESP proposals include SHA2 + SHA1 + MD5
   - Libreswan 5.2 drops IKEv1 by default — must set `ikev1-policy=accept`
   - `dpdaction=clear` is obsolete in Libreswan 5.2
   - Server has both StrongSwan (disabled) and Libreswan installed — StrongSwan can be removed

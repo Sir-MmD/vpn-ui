@@ -282,10 +282,11 @@ func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 	b.WriteString("    dpddelay=40\n")
 	b.WriteString("    dpdtimeout=130\n")
 	b.WriteString("    keyexchange=ikev1\n")
-	// IKE proposals: broad coverage for Windows 10/11 (MODP2048+SHA1/SHA2), iOS (ECP DH19/DH20+SHA2), Linux
-	b.WriteString("    ike=aes256-sha2;modp2048,aes128-sha2;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048,3des-sha1;modp2048,aes256-sha2;dh20,aes256-sha2;dh19,aes128-sha2;dh19\n")
-	// ESP (Phase 2) proposals: SHA2-256 (128-bit) + SHA1 (96-bit) for all OSes
-	b.WriteString("    phase2alg=aes256-sha2,aes128-sha2,aes256-sha1,aes128-sha1,3des-sha1\n")
+	// IKE proposals: widest compatibility — modp2048 (modern), modp1536/modp1024 (legacy), ECP (iOS)
+	// Requires Libreswan rebuilt with ALL_ALGS=true for modp1024 (DH2) support.
+	b.WriteString("    ike=aes256-sha2;modp2048,aes128-sha2;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048,3des-sha1;modp2048,aes256-sha2;modp1536,aes128-sha2;modp1536,aes256-sha1;modp1536,aes128-sha1;modp1536,3des-sha1;modp1536,3des-md5;modp1536,aes256-sha2;modp1024,aes128-sha2;modp1024,aes256-sha1;modp1024,aes128-sha1;modp1024,3des-sha1;modp1024,3des-md5;modp1024,aes256-sha2;dh20,aes256-sha2;dh19,aes128-sha2;dh19\n")
+	// ESP (Phase 2) proposals: SHA2 + SHA1 + MD5 for widest compatibility
+	b.WriteString("    phase2alg=aes256-sha2,aes128-sha2,aes256-sha1,aes128-sha1,3des-sha1,aes256-md5,aes128-md5,3des-md5\n")
 	b.WriteString("    left=%defaultroute\n")
 	b.WriteString("    right=%any\n")
 
