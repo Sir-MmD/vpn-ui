@@ -17,6 +17,7 @@ type XraySettingController struct {
 	OutboundService    service.OutboundService
 	XrayService        service.XrayService
 	WarpService        service.WarpService
+	NordService        service.NordService
 }
 
 // NewXraySettingController creates a new XraySettingController and initializes its routes.
@@ -35,6 +36,7 @@ func (a *XraySettingController) initRouter(g *gin.RouterGroup) {
 
 	g.POST("/", a.getXraySetting)
 	g.POST("/warp/:action", a.warp)
+	g.POST("/nord/:action", a.nord)
 	g.POST("/update", a.updateSetting)
 	g.POST("/resetOutboundsTraffic", a.resetOutboundsTraffic)
 	g.POST("/testOutbound", a.testOutbound)
@@ -46,6 +48,23 @@ func (a *XraySettingController) getXraySetting(c *gin.Context) {
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.getSettings"), err)
 		return
+	}
+	// Older versions of this handler embedded the raw DB value as
+	// `xraySetting` in the response without checking if the value
+	// already had that wrapper shape. When the frontend saved it
+	// back through the textarea verbatim, the wrapper got persisted
+	// and every subsequent save nested another layer, which is what
+	// eventually produced the blank Xray Settings page in #4059.
+	// Strip any such wrapper here, and heal the DB if we found one so
+	// the next read is O(1) instead of climbing the same pile again.
+	if unwrapped := service.UnwrapXrayTemplateConfig(xraySetting); unwrapped != xraySetting {
+		if saveErr := a.XraySettingService.SaveXraySetting(unwrapped); saveErr == nil {
+			xraySetting = unwrapped
+		} else {
+			// Don't fail the read — just serve the unwrapped value
+			// and leave the DB healing for a later save.
+			xraySetting = unwrapped
+		}
 	}
 	inboundTags, err := a.InboundService.GetInboundTags()
 	if err != nil {
@@ -118,6 +137,32 @@ func (a *XraySettingController) warp(c *gin.Context) {
 	case "license":
 		license := c.PostForm("license")
 		resp, err = a.WarpService.SetWarpLicense(license)
+	}
+
+	jsonObj(c, resp, err)
+}
+
+// nord handles NordVPN-related operations based on the action parameter.
+func (a *XraySettingController) nord(c *gin.Context) {
+	action := c.Param("action")
+	var resp string
+	var err error
+	switch action {
+	case "countries":
+		resp, err = a.NordService.GetCountries()
+	case "servers":
+		countryId := c.PostForm("countryId")
+		resp, err = a.NordService.GetServers(countryId)
+	case "reg":
+		token := c.PostForm("token")
+		resp, err = a.NordService.GetCredentials(token)
+	case "setKey":
+		key := c.PostForm("key")
+		resp, err = a.NordService.SetKey(key)
+	case "data":
+		resp, err = a.NordService.GetNordData()
+	case "del":
+		err = a.NordService.DelNordData()
 	}
 
 	jsonObj(c, resp, err)

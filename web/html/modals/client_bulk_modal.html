@@ -68,7 +68,7 @@
             <a-input-number
                 v-model.number="clientsBulkModal.quantity"
                 :min="1"
-                :max="100"
+                :max="500"
             ></a-input-number>
         </a-form-item>
         <a-form-item
@@ -317,7 +317,7 @@
             this.security = "auto";
             this.flow = "";
             this.dbInbound = new DBInbound(dbInbound);
-            this.inbound = dbInbound.toInbound();
+            this.inbound = Inbound.fromJson(dbInbound.toInbound().toJson());
             this.delayedStart = false;
             this.reset = 0;
         },
@@ -334,6 +334,8 @@
                         clientsBulkModal.inbound.settings.shadowsockses[0]
                             .method,
                     );
+                case Protocols.HYSTERIA:
+                    return new Inbound.HysteriaSettings.Hysteria();
                 case Protocols.L2TP:
                     return new Inbound.L2tpSettings.L2tpUser();
                 case Protocols.PPTP:

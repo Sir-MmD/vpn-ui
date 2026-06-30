@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
@@ -24,6 +25,12 @@ import (
 // and integration with the Xray API for real-time updates.
 type InboundService struct {
 	xrayApi xray.XrayAPI
+}
+
+type CopyClientsResult struct {
+	Added   []string `json:"added"`
+	Skipped []string `json:"skipped"`
+	Errors  []string `json:"errors"`
 }
 
 // GetInbounds retrieves all inbounds for a specific user.
@@ -305,6 +312,10 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 			if client.Email == "" {
 				return inbound, false, common.NewError("empty client ID")
 			}
+		case "hysteria", "hysteria2":
+			if client.Auth == "" {
+				return inbound, false, common.NewError("empty client ID")
+			}
 		default:
 			if client.ID == "" {
 				return inbound, false, common.NewError("empty client ID")
@@ -540,23 +551,88 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 		logger.Debug("Old inbound deleted by api:", tag)
 	}
 	if inbound.Enable {
-		inboundJson, err2 := json.MarshalIndent(oldInbound.GenXrayInboundConfig(), "", "  ")
+		runtimeInbound, err2 := s.buildRuntimeInboundForAPI(tx, oldInbound)
 		if err2 != nil {
-			logger.Debug("Unable to marshal updated inbound config:", err2)
+			logger.Debug("Unable to prepare runtime inbound config:", err2)
 			needRestart = true
 		} else {
-			err2 = s.xrayApi.AddInbound(inboundJson)
-			if err2 == nil {
-				logger.Debug("Updated inbound added by api:", oldInbound.Tag)
-			} else {
-				logger.Debug("Unable to update inbound by api:", err2)
+			inboundJson, err2 := json.MarshalIndent(runtimeInbound.GenXrayInboundConfig(), "", "  ")
+			if err2 != nil {
+				logger.Debug("Unable to marshal updated inbound config:", err2)
 				needRestart = true
+			} else {
+				err2 = s.xrayApi.AddInbound(inboundJson)
+				if err2 == nil {
+					logger.Debug("Updated inbound added by api:", oldInbound.Tag)
+				} else {
+					logger.Debug("Unable to update inbound by api:", err2)
+					needRestart = true
+				}
 			}
 		}
 	}
 	s.xrayApi.Close()
 
 	return inbound, needRestart, tx.Save(oldInbound).Error
+}
+
+func (s *InboundService) buildRuntimeInboundForAPI(tx *gorm.DB, inbound *model.Inbound) (*model.Inbound, error) {
+	if inbound == nil {
+		return nil, fmt.Errorf("inbound is nil")
+	}
+
+	runtimeInbound := *inbound
+	settings := map[string]any{}
+	if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
+		return nil, err
+	}
+
+	clients, ok := settings["clients"].([]any)
+	if !ok {
+		return &runtimeInbound, nil
+	}
+
+	var clientStats []xray.ClientTraffic
+	err := tx.Model(xray.ClientTraffic{}).
+		Where("inbound_id = ?", inbound.Id).
+		Select("email", "enable").
+		Find(&clientStats).Error
+	if err != nil {
+		return nil, err
+	}
+
+	enableMap := make(map[string]bool, len(clientStats))
+	for _, clientTraffic := range clientStats {
+		enableMap[clientTraffic.Email] = clientTraffic.Enable
+	}
+
+	finalClients := make([]any, 0, len(clients))
+	for _, client := range clients {
+		c, ok := client.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		email, _ := c["email"].(string)
+		if enable, exists := enableMap[email]; exists && !enable {
+			continue
+		}
+
+		if manualEnable, ok := c["enable"].(bool); ok && !manualEnable {
+			continue
+		}
+
+		finalClients = append(finalClients, c)
+	}
+
+	settings["clients"] = finalClients
+	modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	runtimeInbound.Settings = string(modifiedSettings)
+
+	return &runtimeInbound, nil
 }
 
 func (s *InboundService) updateClientTraffics(tx *gorm.DB, oldInbound *model.Inbound, newInbound *model.Inbound) error {
@@ -652,6 +728,10 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 			if client.Email == "" {
 				return false, common.NewError("empty client ID")
 			}
+		case "hysteria", "hysteria2":
+			if client.Auth == "" {
+				return false, common.NewError("empty client ID")
+			}
 		default:
 			if client.ID == "" {
 				return false, common.NewError("empty client ID")
@@ -712,6 +792,7 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 				err1 := s.xrayApi.AddUser(string(oldInbound.Protocol), oldInbound.Tag, map[string]any{
 					"email":    client.Email,
 					"id":       client.ID,
+					"auth":     client.Auth,
 					"security": client.Security,
 					"flow":     client.Flow,
 					"password": client.Password,
@@ -733,6 +814,202 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 	return needRestart, tx.Save(oldInbound).Error
 }
 
+func (s *InboundService) getClientPrimaryKey(protocol model.Protocol, client model.Client) string {
+	switch protocol {
+	case model.Trojan:
+		return client.Password
+	case model.Shadowsocks:
+		return client.Email
+	case model.Hysteria:
+		return client.Auth
+	default:
+		return client.ID
+	}
+}
+
+func (s *InboundService) writeBackClientSubID(sourceInboundID int, sourceProtocol model.Protocol, client model.Client, subID string) (bool, error) {
+	client.SubID = subID
+	client.UpdatedAt = time.Now().UnixMilli()
+	clientID := s.getClientPrimaryKey(sourceProtocol, client)
+	if clientID == "" {
+		return false, common.NewError("empty client ID")
+	}
+
+	settingsBytes, err := json.Marshal(map[string][]model.Client{
+		"clients": {client},
+	})
+	if err != nil {
+		return false, err
+	}
+
+	updatePayload := &model.Inbound{
+		Id:       sourceInboundID,
+		Settings: string(settingsBytes),
+	}
+	return s.UpdateInboundClient(updatePayload, clientID)
+}
+
+func (s *InboundService) generateRandomCredential(targetProtocol model.Protocol) string {
+	switch targetProtocol {
+	case model.VMESS, model.VLESS:
+		return uuid.NewString()
+	default:
+		return strings.ReplaceAll(uuid.NewString(), "-", "")
+	}
+}
+
+func (s *InboundService) buildTargetClientFromSource(source model.Client, targetProtocol model.Protocol, email string, flow string) (model.Client, error) {
+	nowTs := time.Now().UnixMilli()
+	target := source
+	target.Email = email
+	target.CreatedAt = nowTs
+	target.UpdatedAt = nowTs
+
+	target.ID = ""
+	target.Password = ""
+	target.Auth = ""
+	target.Flow = ""
+
+	switch targetProtocol {
+	case model.VMESS:
+		target.ID = s.generateRandomCredential(targetProtocol)
+	case model.VLESS:
+		target.ID = s.generateRandomCredential(targetProtocol)
+		if flow == "xtls-rprx-vision" || flow == "xtls-rprx-vision-udp443" {
+			target.Flow = flow
+		}
+	case model.Trojan, model.Shadowsocks:
+		target.Password = s.generateRandomCredential(targetProtocol)
+	case model.Hysteria:
+		target.Auth = s.generateRandomCredential(targetProtocol)
+	default:
+		target.ID = s.generateRandomCredential(targetProtocol)
+	}
+
+	return target, nil
+}
+
+func (s *InboundService) nextAvailableCopiedEmail(originalEmail string, targetID int, occupied map[string]struct{}) string {
+	base := fmt.Sprintf("%s_%d", originalEmail, targetID)
+	candidate := base
+	suffix := 0
+	for {
+		if _, exists := occupied[strings.ToLower(candidate)]; !exists {
+			occupied[strings.ToLower(candidate)] = struct{}{}
+			return candidate
+		}
+		suffix++
+		candidate = fmt.Sprintf("%s_%d", base, suffix)
+	}
+}
+
+func (s *InboundService) CopyInboundClients(targetInboundID int, sourceInboundID int, clientEmails []string, flow string) (*CopyClientsResult, bool, error) {
+	result := &CopyClientsResult{
+		Added:   []string{},
+		Skipped: []string{},
+		Errors:  []string{},
+	}
+	if targetInboundID == sourceInboundID {
+		return result, false, common.NewError("source and target inbounds must be different")
+	}
+
+	targetInbound, err := s.GetInbound(targetInboundID)
+	if err != nil {
+		return result, false, err
+	}
+	sourceInbound, err := s.GetInbound(sourceInboundID)
+	if err != nil {
+		return result, false, err
+	}
+
+	sourceClients, err := s.GetClients(sourceInbound)
+	if err != nil {
+		return result, false, err
+	}
+	if len(sourceClients) == 0 {
+		return result, false, nil
+	}
+
+	allowedEmails := map[string]struct{}{}
+	if len(clientEmails) > 0 {
+		for _, email := range clientEmails {
+			allowedEmails[strings.ToLower(strings.TrimSpace(email))] = struct{}{}
+		}
+	}
+
+	occupiedEmails := map[string]struct{}{}
+	allEmails, err := s.getAllEmails()
+	if err != nil {
+		return result, false, err
+	}
+	for _, email := range allEmails {
+		clean := strings.Trim(email, "\"")
+		if clean != "" {
+			occupiedEmails[strings.ToLower(clean)] = struct{}{}
+		}
+	}
+
+	newClients := make([]model.Client, 0)
+	needRestart := false
+	for _, sourceClient := range sourceClients {
+		originalEmail := strings.TrimSpace(sourceClient.Email)
+		if originalEmail == "" {
+			continue
+		}
+		if len(allowedEmails) > 0 {
+			if _, ok := allowedEmails[strings.ToLower(originalEmail)]; !ok {
+				continue
+			}
+		}
+
+		if sourceClient.SubID == "" {
+			newSubID := uuid.NewString()
+			subNeedRestart, subErr := s.writeBackClientSubID(sourceInbound.Id, sourceInbound.Protocol, sourceClient, newSubID)
+			if subErr != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("%s: failed to write source subId: %v", originalEmail, subErr))
+				continue
+			}
+			if subNeedRestart {
+				needRestart = true
+			}
+			sourceClient.SubID = newSubID
+		}
+
+		targetEmail := s.nextAvailableCopiedEmail(originalEmail, targetInboundID, occupiedEmails)
+		targetClient, buildErr := s.buildTargetClientFromSource(sourceClient, targetInbound.Protocol, targetEmail, flow)
+		if buildErr != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", originalEmail, buildErr))
+			continue
+		}
+		newClients = append(newClients, targetClient)
+		result.Added = append(result.Added, targetEmail)
+	}
+
+	if len(newClients) == 0 {
+		return result, needRestart, nil
+	}
+
+	settingsPayload, err := json.Marshal(map[string][]model.Client{
+		"clients": newClients,
+	})
+	if err != nil {
+		return result, needRestart, err
+	}
+
+	addNeedRestart, err := s.AddInboundClient(&model.Inbound{
+		Id:       targetInboundID,
+		Settings: string(settingsPayload),
+	})
+	if err != nil {
+		return result, needRestart, err
+	}
+	if addNeedRestart {
+		needRestart = true
+	}
+
+	return result, needRestart, nil
+}
+
 func (s *InboundService) DelInboundClient(inboundId int, clientId string) (bool, error) {
 	oldInbound, err := s.GetInbound(inboundId)
 	if err != nil {
@@ -747,11 +1024,13 @@ func (s *InboundService) DelInboundClient(inboundId int, clientId string) (bool,
 
 	email := ""
 	client_key := "id"
-	if oldInbound.Protocol == "trojan" || oldInbound.Protocol == "l2tp" || oldInbound.Protocol == "pptp" || oldInbound.Protocol == "openvpn" {
+	switch oldInbound.Protocol {
+	case "trojan", "l2tp", "pptp", "openvpn":
 		client_key = "password"
-	}
-	if oldInbound.Protocol == "shadowsocks" {
+	case "shadowsocks":
 		client_key = "email"
+	case "hysteria", "hysteria2":
+		client_key = "auth"
 	}
 
 	interfaceClients := settings["clients"].([]any)
@@ -858,6 +1137,9 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 		case "shadowsocks":
 			oldClientId = oldClient.Email
 			newClientId = clients[0].Email
+		case "hysteria", "hysteria2":
+			oldClientId = oldClient.Auth
+			newClientId = clients[0].Auth
 		default:
 			oldClientId = oldClient.ID
 			newClientId = clients[0].ID
@@ -993,6 +1275,7 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 				"id":       clients[0].ID,
 				"security": clients[0].Security,
 				"flow":     clients[0].Flow,
+				"auth":     clients[0].Auth,
 				"password": clients[0].Password,
 				"cipher":   cipher,
 			})
@@ -1901,6 +2184,7 @@ func (s *InboundService) ResetClientTraffic(id int, clientEmail string) (bool, e
 				err1 := s.xrayApi.AddUser(string(inbound.Protocol), inbound.Tag, map[string]any{
 					"email":    client.Email,
 					"id":       client.ID,
+					"auth":     client.Auth,
 					"security": client.Security,
 					"flow":     client.Flow,
 					"password": client.Password,
@@ -1977,6 +2261,16 @@ func (s *InboundService) ResetAllTraffics() error {
 
 	err := result.Error
 	return err
+}
+
+func (s *InboundService) ResetInboundTraffic(id int) error {
+	db := database.GetDB()
+
+	result := db.Model(model.Inbound{}).
+		Where("id = ?", id).
+		Updates(map[string]any{"up": 0, "down": 0})
+
+	return result.Error
 }
 
 func (s *InboundService) DelDepletedClients(id int) (err error) {
@@ -2120,7 +2414,6 @@ func (s *InboundService) GetClientTrafficByEmail(email string) (traffic *xray.Cl
 		return nil, err
 	}
 	if t != nil && client != nil {
-		t.Enable = client.Enable
 		t.UUID = client.ID
 		t.SubId = client.SubID
 		return t, nil

@@ -19,6 +19,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/infra/conf"
+	hysteriaAccount "github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
 	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	"github.com/xtls/xray-core/proxy/trojan"
@@ -34,6 +35,34 @@ type XrayAPI struct {
 	StatsServiceClient   *statsService.StatsServiceClient
 	grpcClient           *grpc.ClientConn
 	isConnected          bool
+}
+
+func getRequiredUserString(user map[string]any, key string) (string, error) {
+	value, ok := user[key]
+	if !ok || value == nil {
+		return "", fmt.Errorf("missing required user field %q", key)
+	}
+
+	strValue, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("invalid type for user field %q: %T", key, value)
+	}
+
+	return strValue, nil
+}
+
+func getOptionalUserString(user map[string]any, key string) (string, error) {
+	value, ok := user[key]
+	if !ok || value == nil {
+		return "", nil
+	}
+
+	strValue, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("invalid type for user field %q: %T", key, value)
+	}
+
+	return strValue, nil
 }
 
 // Init connects to the Xray API server and initializes handler and stats service clients.
@@ -103,16 +132,36 @@ func (x *XrayAPI) DelInbound(tag string) error {
 
 // AddUser adds a user to an inbound in the Xray core using the specified protocol and user data.
 func (x *XrayAPI) AddUser(Protocol string, inboundTag string, user map[string]any) error {
+	userEmail, err := getRequiredUserString(user, "email")
+	if err != nil {
+		return err
+	}
+
 	var account *serial.TypedMessage
 	switch Protocol {
 	case "vmess":
+		userID, err := getRequiredUserString(user, "id")
+		if err != nil {
+			return err
+		}
+
 		account = serial.ToTypedMessage(&vmess.Account{
-			Id: user["id"].(string),
+			Id: userID,
 		})
 	case "vless":
+		userID, err := getRequiredUserString(user, "id")
+		if err != nil {
+			return err
+		}
+
+		userFlow, err := getOptionalUserString(user, "flow")
+		if err != nil {
+			return err
+		}
+
 		vlessAccount := &vless.Account{
-			Id:   user["id"].(string),
-			Flow: user["flow"].(string),
+			Id:   userID,
+			Flow: userFlow,
 		}
 		// Add testseed if provided
 		if testseedVal, ok := user["testseed"]; ok {
@@ -138,16 +187,27 @@ func (x *XrayAPI) AddUser(Protocol string, inboundTag string, user map[string]an
 		}
 		account = serial.ToTypedMessage(vlessAccount)
 	case "trojan":
+		password, err := getRequiredUserString(user, "password")
+		if err != nil {
+			return err
+		}
+
 		account = serial.ToTypedMessage(&trojan.Account{
-			Password: user["password"].(string),
+			Password: password,
 		})
 	case "shadowsocks":
+		cipher, err := getOptionalUserString(user, "cipher")
+		if err != nil {
+			return err
+		}
+
+		password, err := getRequiredUserString(user, "password")
+		if err != nil {
+			return err
+		}
+
 		var ssCipherType shadowsocks.CipherType
-		switch user["cipher"].(string) {
-		case "aes-128-gcm":
-			ssCipherType = shadowsocks.CipherType_AES_128_GCM
-		case "aes-256-gcm":
-			ssCipherType = shadowsocks.CipherType_AES_256_GCM
+		switch cipher {
 		case "chacha20-poly1305", "chacha20-ietf-poly1305":
 			ssCipherType = shadowsocks.CipherType_CHACHA20_POLY1305
 		case "xchacha20-poly1305", "xchacha20-ietf-poly1305":
@@ -158,26 +218,35 @@ func (x *XrayAPI) AddUser(Protocol string, inboundTag string, user map[string]an
 
 		if ssCipherType != shadowsocks.CipherType_NONE {
 			account = serial.ToTypedMessage(&shadowsocks.Account{
-				Password:   user["password"].(string),
+				Password:   password,
 				CipherType: ssCipherType,
 			})
 		} else {
 			account = serial.ToTypedMessage(&shadowsocks_2022.ServerConfig{
-				Key:   user["password"].(string),
-				Email: user["email"].(string),
+				Key:   password,
+				Email: userEmail,
 			})
 		}
+	case "hysteria", "hysteria2":
+		auth, err := getRequiredUserString(user, "auth")
+		if err != nil {
+			return err
+		}
+
+		account = serial.ToTypedMessage(&hysteriaAccount.Account{
+			Auth: auth,
+		})
 	default:
 		return nil
 	}
 
 	client := *x.HandlerServiceClient
 
-	_, err := client.AlterInbound(context.Background(), &command.AlterInboundRequest{
+	_, err = client.AlterInbound(context.Background(), &command.AlterInboundRequest{
 		Tag: inboundTag,
 		Operation: serial.ToTypedMessage(&command.AddUserOperation{
 			User: &protocol.User{
-				Email:   user["email"].(string),
+				Email:   userEmail,
 				Account: account,
 			},
 		}),

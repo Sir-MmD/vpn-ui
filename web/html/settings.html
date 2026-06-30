@@ -6,7 +6,7 @@
   <a-sidebar></a-sidebar>
   <a-layout id="content-layout">
     <a-layout-content>
-      <a-spin :spinning="loadingStates.spinning" :delay="500" tip='{{ i18n "loading"}}'>
+      <a-spin :spinning="loadingStates.spinning" :delay="500" tip='{{ i18n "loading"}}' size="large">
         <transition name="list" appear>
           <a-alert type="error" v-if="confAlerts.length>0 && loadingStates.fetched" :style="{ marginBottom: '10px' }"
             message='{{ i18n "secAlertTitle" }}' color="red" show-icon closable>
@@ -21,10 +21,7 @@
         <transition name="list" appear>
           <template>
             <a-row v-if="!loadingStates.fetched">
-              <a-card
-                :style="{ textAlign: 'center', padding: '30px 0', marginTop: '10px', background: 'transparent', border: 'none' }">
-                <a-spin tip='{{ i18n "loading" }}'></a-spin>
-              </a-card>
+              <div :style="{ minHeight: 'calc(100vh - 120px)' }"></div>
             </a-row>
             <a-row :gutter="[isMobile ? 8 : 16, isMobile ? 0 : 12]" v-else>
               <a-col>
@@ -82,10 +79,10 @@
                     </template>
                     {{ template "settings/panel/subscription/general" . }}
                   </a-tab-pane>
-                  <a-tab-pane key="5" v-if="allSetting.subJsonEnable" :style="{ paddingTop: '20px' }">
+                  <a-tab-pane key="5" v-if="allSetting.subJsonEnable || allSetting.subClashEnable" :style="{ paddingTop: '20px' }">
                     <template #tab>
                       <a-icon type="code"></a-icon>
-                      <span>{{ i18n "pages.settings.subSettings" }} (JSON)</span>
+                      <span>{{ i18n "pages.settings.subSettings" }} (Formats)</span>
                     </template>
                     {{ template "settings/panel/subscription/json" . }}
                   </a-tab-pane>
@@ -132,35 +129,14 @@
       datepickerList: [{ name: 'Gregorian (Standard)', value: 'gregorian' }, { name: 'Jalalian (شمسی)', value: 'jalalian' }],
       remarkSample: '',
       defaultFragment: {
-        tag: "fragment",
-        protocol: "freedom",
-        settings: {
-          domainStrategy: "AsIs",
-          fragment: {
-            packets: "tlshello",
-            length: "100-200",
-            interval: "10-20",
-            maxSplit: "300-400"
-          }
-        },
-        streamSettings: {
-          sockopt: {
-            tcpKeepAliveIdle: 100,
-            tcpMptcp: true,
-            penetrate: true
-          }
-        }
+        packets: "tlshello",
+        length: "100-200",
+        interval: "10-20",
+        maxSplit: "300-400"
       },
-      defaultNoises: {
-        tag: "noises",
-        protocol: "freedom",
-        settings: {
-          domainStrategy: "AsIs",
-          noises: [
-            { type: "rand", packet: "10-20", delay: "10-16", applyTo: "ip" },
-          ],
-        },
-      },
+      defaultNoises: [
+        { type: "rand", packet: "10-20", delay: "10-16", applyTo: "ip" }
+      ],
       defaultMux: {
         enabled: true,
         concurrency: 8,
@@ -454,41 +430,41 @@
         }
       },
       fragmentPackets: {
-        get: function () { return this.fragment ? JSON.parse(this.allSetting.subJsonFragment).settings.fragment.packets : ""; },
+        get: function () { return this.fragment ? JSON.parse(this.allSetting.subJsonFragment).packets : ""; },
         set: function (v) {
           if (v != "") {
             newFragment = JSON.parse(this.allSetting.subJsonFragment);
-            newFragment.settings.fragment.packets = v;
+            newFragment.packets = v;
             this.allSetting.subJsonFragment = JSON.stringify(newFragment);
           }
         }
       },
       fragmentLength: {
-        get: function () { return this.fragment ? JSON.parse(this.allSetting.subJsonFragment).settings.fragment.length : ""; },
+        get: function () { return this.fragment ? JSON.parse(this.allSetting.subJsonFragment).length : ""; },
         set: function (v) {
           if (v != "") {
             newFragment = JSON.parse(this.allSetting.subJsonFragment);
-            newFragment.settings.fragment.length = v;
+            newFragment.length = v;
             this.allSetting.subJsonFragment = JSON.stringify(newFragment);
           }
         }
       },
       fragmentInterval: {
-        get: function () { return this.fragment ? JSON.parse(this.allSetting.subJsonFragment).settings.fragment.interval : ""; },
+        get: function () { return this.fragment ? JSON.parse(this.allSetting.subJsonFragment).interval : ""; },
         set: function (v) {
           if (v != "") {
             newFragment = JSON.parse(this.allSetting.subJsonFragment);
-            newFragment.settings.fragment.interval = v;
+            newFragment.interval = v;
             this.allSetting.subJsonFragment = JSON.stringify(newFragment);
           }
         }
       },
       fragmentMaxSplit: {
-        get: function () { return this.fragment ? JSON.parse(this.allSetting.subJsonFragment).settings.fragment.maxSplit : ""; },
+        get: function () { return this.fragment ? JSON.parse(this.allSetting.subJsonFragment).maxSplit : ""; },
         set: function (v) {
           if (v != "") {
             newFragment = JSON.parse(this.allSetting.subJsonFragment);
-            newFragment.settings.fragment.maxSplit = v;
+            newFragment.maxSplit = v;
             this.allSetting.subJsonFragment = JSON.stringify(newFragment);
           }
         }
@@ -507,13 +483,11 @@
       },
       noisesArray: {
         get() {
-          return this.noises ? JSON.parse(this.allSetting.subJsonNoises).settings.noises : [];
+          return this.noises ? JSON.parse(this.allSetting.subJsonNoises) : [];
         },
         set(value) {
           if (this.noises) {
-            const newNoises = JSON.parse(this.allSetting.subJsonNoises);
-            newNoises.settings.noises = value;
-            this.allSetting.subJsonNoises = JSON.stringify(newNoises);
+            this.allSetting.subJsonNoises = JSON.stringify(value);
           }
         }
       },

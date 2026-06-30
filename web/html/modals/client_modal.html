@@ -65,7 +65,7 @@
             this.okText = okText;
             this.isEdit = isEdit;
             this.dbInbound = new DBInbound(dbInbound);
-            this.inbound = dbInbound.toInbound();
+            this.inbound = Inbound.fromJson(dbInbound.toInbound().toJson());
             this.clients = this.inbound.clients;
             this.index = index === null ? this.clients.length : index;
             this.delayedStart = false;
@@ -94,6 +94,8 @@
                     return client.password;
                 case Protocols.SHADOWSOCKS:
                     return client.email;
+                case Protocols.HYSTERIA:
+                    return client.auth;
                 default:
                     return client.id;
             }
@@ -122,6 +124,10 @@
                 case Protocols.OPENVPN:
                     return clients.push(
                         new Inbound.OpenvpnSettings.OpenvpnUser(),
+                    );
+                case Protocols.HYSTERIA:
+                    return clients.push(
+                        new Inbound.HysteriaSettings.Hysteria(),
                     );
                 default:
                     return null;
@@ -157,9 +163,9 @@
                 return app.datepicker;
             },
             get isTrafficExhausted() {
-                if (!clientStats) return false;
-                if (clientStats.total <= 0) return false;
-                if (clientStats.up + clientStats.down < clientStats.total)
+                if (!this.clientStats) return false;
+                if (this.clientStats.total <= 0) return false;
+                if (this.clientStats.up + this.clientStats.down < this.clientStats.total)
                     return false;
                 return true;
             },

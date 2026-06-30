@@ -152,6 +152,12 @@ class RandomUtil {
         return Base64.alternativeEncode(String.fromCharCode(...array));
     }
 
+    static randomBase64(length = 16) {
+        const array = new Uint8Array(length);
+        window.crypto.getRandomValues(array);
+        return Base64.alternativeEncode(String.fromCharCode(...array));
+    }
+
     static randomBase32String(length = 16) {
         const array = new Uint8Array(length);
 
@@ -651,10 +657,13 @@ class CookieManager {
     }
 
     static setCookie(cname, cvalue, exdays) {
-        const d = new Date();
-        d.setTime(d.getTime() + exdays * 24 * 60 * 60 * 1000);
-        let expires = 'expires=' + d.toUTCString();
-        document.cookie = cname + '=' + encodeURIComponent(cvalue) + ';' + expires + ';path=/';
+        let expires = '';
+        if (exdays) {
+            const d = new Date();
+            d.setTime(d.getTime() + exdays * 24 * 60 * 60 * 1000);
+            expires = 'expires=' + d.toUTCString() + ';';
+        }
+        document.cookie = cname + '=' + encodeURIComponent(cvalue) + ';' + expires + 'path=/';
     }
 }
 
@@ -813,13 +822,13 @@ class LanguageManager {
                 });
 
                 if (LanguageManager.isSupportLanguage(lang)) {
-                    CookieManager.setCookie("lang", lang, 150);
+                    CookieManager.setCookie("lang", lang);
                 } else {
-                    CookieManager.setCookie("lang", "en-US", 150);
+                    CookieManager.setCookie("lang", "en-US");
                     window.location.reload();
                 }
             } else {
-                CookieManager.setCookie("lang", "en-US", 150);
+                CookieManager.setCookie("lang", "en-US");
                 window.location.reload();
             }
         }
@@ -832,7 +841,7 @@ class LanguageManager {
             language = "en-US";
         }
 
-        CookieManager.setCookie("lang", language, 150);
+        CookieManager.setCookie("lang", language);
         window.location.reload();
     }
 
