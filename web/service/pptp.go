@@ -203,6 +203,9 @@ func (s *PptpService) GeneratePPPOptions(inbound *model.Inbound) error {
 	b.WriteString("refuse-chap\n")
 	b.WriteString("require-mschap-v2\n")
 	b.WriteString("require-mppe\n")
+	// Disable IPv6CP: the PPTP data path (nftables TPROXY -> Xray) is IPv4-only,
+	// so a negotiated IPv6 link would leak IPv6 traffic and DNS past Xray.
+	b.WriteString("noipv6\n")
 	b.WriteString(fmt.Sprintf("ms-dns %s\n", dns1))
 	b.WriteString(fmt.Sprintf("ms-dns %s\n", dns2))
 	b.WriteString("proxyarp\n")

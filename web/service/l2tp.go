@@ -212,6 +212,11 @@ func (s *L2tpService) GeneratePPPOptions(inbound *model.Inbound) error {
 	b.WriteString("ipcp-accept-local\n")
 	b.WriteString("ipcp-accept-remote\n")
 	b.WriteString("noccp\n")
+	// Disable IPv6CP so no IPv6 address/route is negotiated on the ppp link.
+	// The VPN data path (nftables TPROXY -> Xray) is IPv4-only; without this,
+	// a dual-stack client could negotiate IPv6 and leak IPv6 traffic and DNS
+	// straight out the host's default route, bypassing Xray entirely.
+	b.WriteString("noipv6\n")
 	b.WriteString(fmt.Sprintf("ms-dns %s\n", dns1))
 	b.WriteString(fmt.Sprintf("ms-dns %s\n", dns2))
 	b.WriteString("proxyarp\n")
