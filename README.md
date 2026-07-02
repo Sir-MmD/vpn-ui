@@ -26,13 +26,15 @@ All VPN clients are managed through the same panel UI, with per-client traffic t
 
 ### OpenVPN Protocol Support
 
-- **Full panel integration** — Create OpenVPN inbounds from the protocol dropdown, same user management UI
-- **Dual protocol** — Each inbound runs two OpenVPN instances: UDP (default 1194) and TCP (configurable port)
-- **Certificate management** — Generate self-signed CA + server cert + tls-crypt key from the panel, or paste your own
-- **Client config download** — Download `.ovpn` files (UDP or TCP) directly from the panel
-- **Direct NAT routing** — OpenVPN traffic is NATed directly to the internet (no Xray/TPROXY)
-- **Per-client traffic tracking** — Same nftables accounting as L2TP/PPTP
-- **Separate subnets** — UDP uses `10.2.x.0/24`, TCP uses `10.3.x.0/24`
+- **Full panel integration** — Create OpenVPN inbounds from the protocol dropdown, then add/remove/manage users (username + password) with the same UI, traffic limits, and expiry as every other protocol
+- **UDP + TCP with independent toggles** — Each inbound can run a UDP listener (on the inbound port) and/or a TCP listener (own port); flip either transport on or off from the form. A disabled transport doesn't start and its `.ovpn` download is hidden
+- **Certificate management** — Generate a self-signed CA + server cert + tls-crypt key from the panel, or paste your own
+- **Client config export** — Download ready-to-use `.ovpn` profiles (UDP and/or TCP) from the inbound's action menu or the edit form
+- **Routes through Xray** — OpenVPN client traffic is TPROXY-redirected into Xray via a paired dokodemo-door inbound (the same bridge as L2TP/PPTP), so it obeys the panel's routing rules and outbounds. Per-user routing works too: each user is pinned to a deterministic tunnel IP (via `client-config-dir`), so email-based routing rules translate to source-IP rules
+- **RADIUS authentication** — Users authenticate against the embedded RADIUS server (PAP); the auth/connect/disconnect hooks invoke the panel binary
+- **IPv6 leak protection** — The server pushes `block-ipv6` so dual-stack clients can't leak IPv6 traffic/DNS around the tunnel
+- **Per-client traffic tracking** — nftables accounting (`openvpn_acct` chain) keyed by the deterministic client IP, surfaced per-user in the panel
+- **Separate subnets** — UDP clients use `10.2.<id>.0/24`, TCP clients use `10.3.<id>.0/24`
 
 ### Embedded RADIUS Server
 
@@ -45,7 +47,7 @@ Authentication and session management for L2TP, PPTP, and OpenVPN use an embedde
 
 ### How It Works
 
-L2TP and PPTP are not native Xray protocols, so a bridge architecture routes their traffic through Xray. OpenVPN uses direct NAT routing (no Xray).
+L2TP, PPTP, and OpenVPN are not native Xray protocols, so a common bridge architecture routes all three through Xray via nftables TPROXY + a paired dokodemo-door inbound.
 
 ```
 L2TP Client              PPTP Client              OpenVPN Client
@@ -58,12 +60,12 @@ Libreswan (IPsec)        pptpd                   openvpn
 xl2tpd --> pppd          pppd                    tun device
 PPP (10.0.x.0/24)        PPP (10.1.x.0/24)       (10.2.x.0/24 UDP, 10.3.x.0/24 TCP)
     |                        |                        |
-    | nftables TPROXY        |                        | nftables MASQUERADE
+    | nftables TPROXY        | nftables TPROXY        | nftables TPROXY
     v                        v                        v
-Xray dokodemo-door       Xray dokodemo-door       Direct NAT
+Xray dokodemo-door       Xray dokodemo-door       Xray dokodemo-door
     |                        |                        |
     v                        v                        v
-Xray Routing Engine      Xray Routing Engine       Internet
+Xray Routing Engine      Xray Routing Engine      Xray Routing Engine
 ```
 
 Each L2TP/PPTP inbound automatically gets:
@@ -74,8 +76,10 @@ Each L2TP/PPTP inbound automatically gets:
 - Per-client nftables accounting rules (named counters) for traffic measurement
 
 Each OpenVPN inbound automatically gets:
-- Two OpenVPN server instances (UDP + TCP) with separate tun devices
-- NAT masquerade rules for the OpenVPN subnets
+- Up to two OpenVPN server instances (UDP and/or TCP, per the transport toggles) with separate tun devices
+- A shared TPROXY/dokodemo port (`12300 + inbound ID`) and a paired dokodemo-door inbound in the Xray config
+- nftables TPROXY rules redirecting the `10.2.<id>.0/24` (UDP) and `10.3.<id>.0/24` (TCP) subnets into Xray
+- A `client-config-dir` entry per user pinning a deterministic tunnel IP (for per-user routing)
 - Per-client nftables accounting rules (same as L2TP/PPTP)
 - Auth/session scripts that integrate with the embedded RADIUS server
 
@@ -99,11 +103,11 @@ Since Xray's dokodemo-door sees all PPP traffic as a single stream without user 
 
 Open [`docs/architecture.html`](docs/architecture.html) in a browser to see an interactive diagram of the L2TP integration architecture.
 
-## Fresh Server Setup (Debian 12+ / Ubuntu 22.04+)
+## Fresh Server Setup (Debian 12+ / Ubuntu 22.04+ / Fedora 38+ / RHEL 9+)
 
 ### Automated Setup
 
-The setup script manages the full VPN backend lifecycle:
+The setup script manages the full VPN backend lifecycle and supports both Debian/Ubuntu (apt) and Fedora/RHEL (dnf) systems:
 
 ```bash
 sudo ./setup-vpn-backend.sh install     # First-time setup (default)
@@ -112,7 +116,10 @@ sudo ./setup-vpn-backend.sh uninstall   # Remove VPN backend completely
 ```
 
 **install** (default) — idempotent, safe to run multiple times:
+- Detect distribution type (Debian/Ubuntu or Fedora/RHEL)
 - Install packages: `xl2tpd`, `libreswan`, `pptpd`, `openvpn`, `ppp`, `nftables`
+  - On RHEL-based systems: enables EPEL repository for additional packages
+  - Note: pptpd may require RPM Fusion on Fedora/RHEL
 - Detect and remove StrongSwan (incompatible with Windows L2TP)
 - Rebuild Libreswan with `ALL_ALGS=true` (enables modp1024/DH2 for MikroTik and legacy clients)
 - Load and persist required kernel modules
@@ -254,8 +261,8 @@ Users can connect with any PPTP client using:
 2. Click **Add Inbound**
 3. Select **openvpn** from the Protocol dropdown
 4. Configure:
-   - **Port**: `1194` (UDP port, standard OpenVPN)
-   - **TCP Port**: `443` (TCP port for the second instance)
+   - **Port**: `1194` (the UDP listen port)
+   - **UDP Port / TCP Port toggles**: enable either or both transports; the TCP listener uses its own port (default `443`)
    - **DNS 1/2**: DNS servers pushed to clients
    - **MTU**: Typically `1500` for OpenVPN
 5. Click **Add** to save
@@ -266,13 +273,11 @@ Users can connect with any PPTP client using:
 
 Same as L2TP/PPTP — click the **+** button on the OpenVPN inbound row, set Username, Password, Email, and optional limits.
 
-To download client configs, expand the inbound settings and click **Download UDP Config** or **Download TCP Config**. The `.ovpn` file includes all certificates and settings — users just need to import it and enter their username/password when connecting.
+To export client configs, use **Export UDP (.ovpn)** / **Export TCP (.ovpn)** from the inbound's action (⋯) menu, or the download buttons in the edit form. Only enabled transports are offered. The `.ovpn` file includes the CA and tls-crypt key — users import it and enter their username/password when connecting.
 
 ### Applying Xray Routing Rules
 
-L2TP and PPTP traffic flows through Xray's routing engine. The inbound's **tag** (e.g., `inbound-1701` for L2TP, `inbound-1723` for PPTP) can be used in routing rules.
-
-**Note**: OpenVPN traffic uses direct NAT routing and does not pass through Xray.
+L2TP, PPTP, and OpenVPN traffic all flow through Xray's routing engine. An inbound's **tag** (e.g. `inbound-1701` for L2TP) can be used in routing rules, and per-user rules (by client email) are honored — for these VPN protocols the panel automatically translates the email match into the client's deterministic source IP.
 
 #### Route by inbound tag (all users of an inbound)
 
@@ -323,10 +328,10 @@ go run main.go
 | `database/model/model.go` | `L2TP`, `PPTP`, `OPENVPN` protocol constants |
 | `web/service/l2tp.go` | **New** — L2TP service: xl2tpd, Libreswan IPsec, PPP config generation |
 | `web/service/pptp.go` | **New** — PPTP service: mirrors L2TP without IPsec |
-| `web/service/openvpn.go` | **New** — OpenVPN service: dual UDP/TCP instances, cert gen, management socket |
-| `web/service/nftables.go` | **New** — nftables service: TPROXY rules, traffic accounting, NAT, IPsec filter |
-| `web/service/radius.go` | **New** — Embedded RADIUS server: MS-CHAPv2 + PAP auth, accounting, session tracking |
-| `web/service/xray.go` | Skip L2TP/PPTP inbounds + inject dokodemo-door |
+| `web/service/openvpn.go` | **New** — OpenVPN service: UDP/TCP instances, cert gen, TPROXY routing, `client-config-dir` per-user IPs, management socket |
+| `web/service/nftables.go` | **New** — nftables service: TPROXY rules (incl. OpenVPN), traffic accounting, IPsec filter |
+| `web/service/radius.go` | **New** — Embedded RADIUS server: MS-CHAPv2 + PAP auth, accounting, session tracking, email→IP map |
+| `web/service/xray.go` | Skip L2TP/PPTP/OpenVPN inbounds + inject dokodemo-door, translate per-user routing rules to source IPs |
 | `web/service/inbound.go` | Client-key switches for L2TP/PPTP/OpenVPN (password-based, like Trojan) |
 | `web/service/server.go` | DB import restores L2TP + PPTP + OpenVPN configs |
 | `web/controller/inbound.go` | CRUD hooks trigger L2TP/PPTP/OpenVPN config regeneration, cert/config download routes |
@@ -348,7 +353,7 @@ go run main.go
 |------|--------|
 | `web/html/form/protocol/l2tp.html` | **New** — L2TP settings form (IPsec, IP range, DNS, MTU) |
 | `web/html/form/protocol/pptp.html` | **New** — PPTP settings form (IP range, DNS, MTU) |
-| `web/html/form/protocol/openvpn.html` | **New** — OpenVPN settings form (TCP port, DNS, MTU, certs, config download) |
+| `web/html/form/protocol/openvpn.html` | **New** — OpenVPN settings form (UDP/TCP port toggles, DNS, MTU, certs, config export) |
 | `web/html/form/inbound.html` | Include L2TP + PPTP + OpenVPN form templates |
 | `web/html/form/client.html` | Username + password fields for L2TP/PPTP/OpenVPN clients |
 | `web/html/inbounds.html` | Client identification for L2TP/PPTP/OpenVPN |

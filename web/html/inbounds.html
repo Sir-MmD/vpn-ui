@@ -253,6 +253,18 @@
                             <a-icon type="qrcode"></a-icon>
                             {{ i18n "qrCode" }}
                           </a-menu-item>
+                          <template v-if="dbInbound.isOpenvpn">
+                            <a-menu-item key="ovpnUdp"
+                              v-if="dbInbound.toInbound().settings.udpEnable">
+                              <a-icon type="download"></a-icon>
+                              {{ i18n "pages.inbounds.export" }} UDP (.ovpn)
+                            </a-menu-item>
+                            <a-menu-item key="ovpnTcp"
+                              v-if="dbInbound.toInbound().settings.tcpEnable">
+                              <a-icon type="download"></a-icon>
+                              {{ i18n "pages.inbounds.export" }} TCP (.ovpn)
+                            </a-menu-item>
+                          </template>
                           <template v-if="dbInbound.isMultiUser()">
                             <a-menu-item key="addClient">
                               <a-icon type="user-add"></a-icon>
@@ -1191,7 +1203,7 @@
           to_inbound = dbInbound.toInbound()
           this.inbounds.push(to_inbound);
           this.dbInbounds.push(dbInbound);
-          if ([Protocols.VMESS, Protocols.VLESS, Protocols.TROJAN, Protocols.SHADOWSOCKS, Protocols.L2TP, Protocols.PPTP].includes(inbound.protocol)) {
+          if ([Protocols.VMESS, Protocols.VLESS, Protocols.TROJAN, Protocols.SHADOWSOCKS, Protocols.L2TP, Protocols.PPTP, Protocols.OPENVPN].includes(inbound.protocol)) {
             if (dbInbound.isSS && (!to_inbound.isSSMultiUser)) {
               continue;
             }
@@ -1377,7 +1389,18 @@
           case "delDepletedClients":
             this.delDepletedClients(dbInbound.id)
             break;
+          case "ovpnUdp":
+            this.downloadOvpn(dbInbound.id, "udp");
+            break;
+          case "ovpnTcp":
+            this.downloadOvpn(dbInbound.id, "tcp");
+            break;
         }
+      },
+      downloadOvpn(dbInboundId, proto) {
+        const url = "/panel/api/inbounds/" + dbInboundId + "/ovpn/" + proto;
+        const base = (typeof basePath !== "undefined" ? basePath : "").replace(/\/$/, "");
+        window.open(base + url, "_blank");
       },
       openCloneInbound(dbInbound) {
         this.$confirm({
@@ -1545,6 +1568,7 @@
           case Protocols.SHADOWSOCKS:
           case Protocols.L2TP:
           case Protocols.PPTP:
+          case Protocols.OPENVPN:
             return clients.findIndex(item => item && item.password === client.password && item.email === client.email);
           default: return clients.findIndex(item => item && item.id === client.id && item.email === client.email);
         }
@@ -1640,6 +1664,7 @@
           case Protocols.TROJAN: return client.password;
           case Protocols.L2TP: return client.password;
           case Protocols.PPTP: return client.password;
+          case Protocols.OPENVPN: return client.password;
           case Protocols.SHADOWSOCKS: return client.email;
           case Protocols.HYSTERIA: return client.auth;
           default: return client.id;

@@ -368,9 +368,11 @@
                 this.$set(this.inbound.settings, "testseed", [900, 500, 900, 256]);
             },
             async generateOpenVpnCerts() {
-                if (!inModal.inbound.id) return;
                 inModal.loading(true);
-                const msg = await HttpUtil.post('/panel/inbound/' + inModal.inbound.id + '/generate-openvpn-certs');
+                // With a saved inbound, persist to it; otherwise generate for the
+                // not-yet-saved inbound and store in the form (saved on "Add").
+                const idSeg = inModal.inbound.id ? inModal.inbound.id + '/' : '';
+                const msg = await HttpUtil.post('/panel/api/inbounds/' + idSeg + 'generate-openvpn-certs');
                 inModal.loading(false);
                 if (msg.success) {
                     const obj = msg.obj;
@@ -383,7 +385,7 @@
             },
             downloadOvpn(proto) {
                 if (!inModal.inbound.id) return;
-                const url = '/panel/inbound/' + inModal.inbound.id + '/ovpn/' + proto;
+                const url = '/panel/api/inbounds/' + inModal.inbound.id + '/ovpn/' + proto;
                 window.open(basePath.replace(/\/$/, '') + url, '_blank');
             }
         },

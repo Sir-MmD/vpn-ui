@@ -589,31 +589,34 @@ func vpnSubnet(localIp string, inboundId int, protocol string) string {
 	return fmt.Sprintf("10.%d.%d", prefix, inboundId)
 }
 
-// BuildVpnEmailToIPMap returns a map of email → deterministic IP for all enabled
-// L2TP/PPTP clients. Used by the Xray config generator to translate email-based
-// routing rules to source-IP rules.
-func BuildVpnEmailToIPMap() map[string]string {
-	result := make(map[string]string)
+// BuildVpnEmailToIPMap returns a map of email → deterministic tunnel IP(s) for all
+// enabled L2TP/PPTP/OpenVPN clients. Used by the Xray config generator to translate
+// email-based routing rules into source-IP rules. An OpenVPN client can map to two
+// IPs (one per enabled transport subnet), so the values are slices.
+func BuildVpnEmailToIPMap() map[string][]string {
+	result := make(map[string][]string)
 	db := database.GetDB()
 	if db == nil {
 		return result
 	}
 
-	var inbounds []*model.Inbound
-	db.Where("protocol IN ? AND enable = ?", []string{"l2tp", "pptp"}, true).Find(&inbounds)
-
 	type clientEntry struct {
 		ID    string `json:"id"`
 		Email string `json:"email"`
 	}
-	type settingsJSON struct {
+
+	// --- L2TP / PPTP: single IP from the ppp ip-range ---
+	var pppInbounds []*model.Inbound
+	db.Where("protocol IN ? AND enable = ?", []string{"l2tp", "pptp"}, true).Find(&pppInbounds)
+
+	type pppSettingsJSON struct {
 		IpRange string        `json:"ipRange"`
 		LocalIp string        `json:"localIp"`
 		Clients []clientEntry `json:"clients"`
 	}
 
-	for _, inbound := range inbounds {
-		var settings settingsJSON
+	for _, inbound := range pppInbounds {
+		var settings pppSettingsJSON
 		if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
 			continue
 		}
@@ -623,7 +626,41 @@ func BuildVpnEmailToIPMap() map[string]string {
 			}
 			ip := computeVpnClientIP(settings.IpRange, settings.LocalIp, inbound.Id, i, string(inbound.Protocol))
 			if ip != nil {
-				result[client.Email] = ip.String()
+				result[client.Email] = append(result[client.Email], ip.String())
+			}
+		}
+	}
+
+	// --- OpenVPN: one deterministic CCD IP per enabled transport subnet ---
+	var ovpnInbounds []*model.Inbound
+	db.Where("protocol = ? AND enable = ?", "openvpn", true).Find(&ovpnInbounds)
+
+	type ovpnSettingsJSON struct {
+		UdpEnable *bool         `json:"udpEnable"`
+		TcpEnable *bool         `json:"tcpEnable"`
+		Clients   []clientEntry `json:"clients"`
+	}
+
+	for _, inbound := range ovpnInbounds {
+		var settings ovpnSettingsJSON
+		if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
+			continue
+		}
+		udpOn := settings.UdpEnable == nil || *settings.UdpEnable
+		tcpOn := settings.TcpEnable == nil || *settings.TcpEnable
+		for i, client := range settings.Clients {
+			if client.Email == "" {
+				continue
+			}
+			if udpOn {
+				if ip := ovpnClientIP(inbound.Id, i, "udp"); ip != "" {
+					result[client.Email] = append(result[client.Email], ip)
+				}
+			}
+			if tcpOn {
+				if ip := ovpnClientIP(inbound.Id, i, "tcp"); ip != "" {
+					result[client.Email] = append(result[client.Email], ip)
+				}
 			}
 		}
 	}

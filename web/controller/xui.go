@@ -10,6 +10,7 @@ type XUIController struct {
 
 	settingController     *SettingController
 	xraySettingController *XraySettingController
+	coreController        *CoreController
 }
 
 // NewXUIController creates a new XUIController and initializes its routes.
@@ -28,9 +29,11 @@ func (a *XUIController) initRouter(g *gin.RouterGroup) {
 	g.GET("/inbounds", a.inbounds)
 	g.GET("/settings", a.settings)
 	g.GET("/xray", a.xraySettings)
+	g.GET("/core", a.coreSettings)
 
 	a.settingController = NewSettingController(g)
 	a.xraySettingController = NewXraySettingController(g)
+	a.coreController = NewCoreController(g)
 }
 
 // index renders the main panel index page.
@@ -51,4 +54,9 @@ func (a *XUIController) settings(c *gin.Context) {
 // xraySettings renders the Xray settings page.
 func (a *XUIController) xraySettings(c *gin.Context) {
 	html(c, "xray.html", "pages.xray.title", nil)
+}
+
+// coreSettings renders the Core Settings page (per-core status + provisioning).
+func (a *XUIController) coreSettings(c *gin.Context) {
+	html(c, "core.html", "pages.core.title", nil)
 }

@@ -27,6 +27,7 @@ type XrayService struct {
 	settingService SettingService
 	l2tpService    L2tpService
 	pptpService    PptpService
+	openvpnService OpenVpnService
 	xrayAPI        xray.XrayAPI
 }
 
@@ -116,8 +117,7 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 			continue
 		}
 		// Skip L2TP/PPTP/OpenVPN inbounds — they are not native Xray protocols.
-		// L2TP/PPTP use paired dokodemo-door inbounds injected below.
-		// OpenVPN uses direct NAT (no Xray integration).
+		// All three route through paired dokodemo-door inbounds injected below.
 		if inbound.Protocol == "l2tp" || inbound.Protocol == "pptp" || inbound.Protocol == "openvpn" {
 			continue
 		}
@@ -224,6 +224,16 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *dokodemoConfig)
 	}
 
+	// Inject paired dokodemo-door inbounds for OpenVPN
+	ovpnInbounds, _ := s.openvpnService.GetOpenVpnInbounds()
+	for _, ovpnInbound := range ovpnInbounds {
+		if !ovpnInbound.Enable {
+			continue
+		}
+		dokodemoConfig := s.openvpnService.GetDokodemoConfig(ovpnInbound)
+		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *dokodemoConfig)
+	}
+
 	// Translate email-based routing rules for L2TP/PPTP clients to source-IP rules.
 	// Dokodemo-door doesn't support per-user identification, so we use deterministic
 	// IP assignment and match on source IP instead.
@@ -279,8 +289,10 @@ func (s *XrayService) translateVpnRoutingRules(config *xray.Config) {
 				regularEmails = append(regularEmails, u)
 				continue
 			}
-			if ip, found := vpnMap[email]; found {
-				vpnIPs = append(vpnIPs, ip)
+			if ips, found := vpnMap[email]; found {
+				for _, ip := range ips {
+					vpnIPs = append(vpnIPs, ip)
+				}
 			} else {
 				regularEmails = append(regularEmails, u)
 			}

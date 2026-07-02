@@ -59,6 +59,8 @@ func (a *InboundController) initRouter(g *gin.RouterGroup) {
 	g.POST("/:id/delClientByEmail/:email", a.delInboundClientByEmail)
 	g.GET("/:id/ovpn/:proto", a.downloadOvpn)
 	g.POST("/:id/generate-openvpn-certs", a.generateOpenVpnCerts)
+	// id-less variant so certs can be generated for a not-yet-saved inbound
+	g.POST("/generate-openvpn-certs", a.generateOpenVpnCerts)
 }
 
 // onL2tpChanged regenerates L2TP configs and restarts services when an L2TP inbound is modified.
@@ -96,13 +98,16 @@ func (a *InboundController) onOpenVpnChanged() {
 	if err := a.openvpnService.GenerateAllConfigs(); err != nil {
 		logger.Warning("OpenVPN: config generation failed:", err)
 	}
-	if err := a.openvpnService.SetupNAT(); err != nil {
-		logger.Warning("OpenVPN: NAT setup failed:", err)
+	if err := a.openvpnService.SetupRouting(); err != nil {
+		logger.Warning("OpenVPN: routing setup failed:", err)
 	}
 	if err := a.openvpnService.RestartServices(); err != nil {
 		logger.Warning("OpenVPN: service restart failed:", err)
 	}
 	a.openvpnService.KillDisabledSessions()
+	// OpenVPN now routes through Xray via dokodemo-door, so its config must be
+	// regenerated (and Xray restarted) when an OpenVPN inbound changes.
+	a.xrayService.SetToNeedRestart()
 }
 
 type CopyInboundClientsRequest struct {
@@ -618,45 +623,44 @@ func (a *InboundController) downloadOvpn(c *gin.Context) {
 	c.Data(200, "application/x-openvpn-profile", []byte(content))
 }
 
-// generateOpenVpnCerts generates a self-signed CA and server certificates for OpenVPN.
+// generateOpenVpnCerts generates a self-signed CA, server cert, and tls-crypt
+// key for OpenVPN. Certificate generation does not need a saved inbound — the
+// material is returned to the caller. When called with a valid inbound id (the
+// edit case) the certs are also persisted to that inbound and applied; for a
+// new (unsaved) inbound the frontend stores them in the form and the normal
+// "Add inbound" save persists + applies them.
 func (a *InboundController) generateOpenVpnCerts(c *gin.Context) {
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		jsonMsg(c, "Invalid inbound ID", err)
-		return
-	}
-
 	caCert, caKey, serverCert, serverKey, tlsCrypt, err := a.openvpnService.GenerateSelfSignedCA()
 	if err != nil {
 		jsonMsg(c, "Failed to generate certificates", err)
 		return
 	}
 
-	// Update the inbound settings with the generated certs
-	inbound, err := a.inboundService.GetInbound(id)
-	if err != nil {
-		jsonMsg(c, "Inbound not found", err)
-		return
-	}
+	// If editing an existing inbound, persist the certs to it and apply them.
+	if id, err := strconv.Atoi(c.Param("id")); err == nil && id > 0 {
+		inbound, err := a.inboundService.GetInbound(id)
+		if err != nil {
+			jsonMsg(c, "Inbound not found", err)
+			return
+		}
+		var settings map[string]any
+		if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
+			jsonMsg(c, "Failed to parse settings", err)
+			return
+		}
+		settings["caCert"] = caCert
+		settings["caKey"] = caKey
+		settings["serverCert"] = serverCert
+		settings["serverKey"] = serverKey
+		settings["tlsCrypt"] = tlsCrypt
 
-	var settings map[string]any
-	if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
-		jsonMsg(c, "Failed to parse settings", err)
-		return
-	}
-
-	settings["caCert"] = caCert
-	settings["caKey"] = caKey
-	settings["serverCert"] = serverCert
-	settings["serverKey"] = serverKey
-	settings["tlsCrypt"] = tlsCrypt
-
-	settingsJSON, _ := json.Marshal(settings)
-	inbound.Settings = string(settingsJSON)
-
-	if _, _, err := a.inboundService.UpdateInbound(inbound); err != nil {
-		jsonMsg(c, "Failed to save certificates", err)
-		return
+		settingsJSON, _ := json.Marshal(settings)
+		inbound.Settings = string(settingsJSON)
+		if _, _, err := a.inboundService.UpdateInbound(inbound); err != nil {
+			jsonMsg(c, "Failed to save certificates", err)
+			return
+		}
+		a.onOpenVpnChanged()
 	}
 
 	jsonObj(c, map[string]string{
@@ -666,8 +670,6 @@ func (a *InboundController) generateOpenVpnCerts(c *gin.Context) {
 		"serverKey":  serverKey,
 		"tlsCrypt":   tlsCrypt,
 	}, nil)
-
-	a.onOpenVpnChanged()
 }
 
 // delInboundClientByEmail deletes a client from an inbound by email address.

@@ -287,9 +287,19 @@ func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 	b.WriteString("    dpddelay=40\n")
 	b.WriteString("    dpdtimeout=130\n")
 	b.WriteString("    keyexchange=ikev1\n")
-	// IKE proposals: widest compatibility — modp2048 (modern), modp1536/modp1024 (legacy), ECP (iOS)
-	// Requires Libreswan rebuilt with ALL_ALGS=true for modp1024 (DH2) support.
-	b.WriteString("    ike=aes256-sha2;modp2048,aes128-sha2;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048,3des-sha1;modp2048,aes256-sha2;modp1536,aes128-sha2;modp1536,aes256-sha1;modp1536,aes128-sha1;modp1536,3des-sha1;modp1536,3des-md5;modp1536,aes256-sha2;modp1024,aes128-sha2;modp1024,aes256-sha1;modp1024,aes128-sha1;modp1024,3des-sha1;modp1024,3des-md5;modp1024,aes256-sha2;dh20,aes256-sha2;dh19,aes128-sha2;dh19\n")
+	// IKE (phase 1) proposals — widest client compatibility. modp2048/modp1536
+	// and the ECP groups (dh19/dh20) are in every Libreswan; modp1024 (DH2) is
+	// only present in an ALL_ALGS=true build. Libreswan rejects the WHOLE
+	// connection if the proposal names a group it doesn't support, so modp1024
+	// is appended only when the installed Libreswan actually has it — otherwise
+	// stock/distro Libreswan (which x-ui setup installs) fails to load the conn.
+	ike := "aes256-sha2;modp2048,aes128-sha2;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048,3des-sha1;modp2048," +
+		"aes256-sha2;modp1536,aes128-sha2;modp1536,aes256-sha1;modp1536,aes128-sha1;modp1536,3des-sha1;modp1536,3des-md5;modp1536," +
+		"aes256-sha2;dh20,aes256-sha2;dh19,aes128-sha2;dh19"
+	if ipsecSupportsModp1024() {
+		ike += ",aes256-sha2;modp1024,aes128-sha2;modp1024,aes256-sha1;modp1024,aes128-sha1;modp1024,3des-sha1;modp1024,3des-md5;modp1024"
+	}
+	b.WriteString("    ike=" + ike + "\n")
 	// ESP (Phase 2) proposals: SHA2 + SHA1 + MD5 for widest compatibility
 	b.WriteString("    phase2alg=aes256-sha2,aes128-sha2,aes256-sha1,aes128-sha1,3des-sha1,aes256-md5,aes128-md5,3des-md5\n")
 	b.WriteString("    left=%defaultroute\n")
@@ -311,6 +321,17 @@ func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 	os.Remove("/etc/swanctl/conf.d/l2tp.conf")
 
 	return nil
+}
+
+// ipsecSupportsModp1024 reports whether the installed Libreswan supports the
+// MODP1024 (DH2) group. Distro/stock Libreswan omits it (it's cryptographically
+// weak — only a build with ALL_ALGS=true has it), and naming an unsupported
+// group in a proposal makes Libreswan reject the whole connection. The selftest
+// aborts (and thus reports "not supported") if the NSS DB isn't initialized,
+// which safely errs toward dropping modp1024.
+func ipsecSupportsModp1024() bool {
+	out, _ := exec.Command("ipsec", "pluto", "--selftest").CombinedOutput()
+	return strings.Contains(strings.ToUpper(string(out)), "MODP1024")
 }
 
 // SetupAllTproxy sets up kernel modules, ip rules, and nftables rules for TPROXY.

@@ -97,6 +97,7 @@
 "settings" = "Cài đặt bảng điều khiển"
 "logout" = "Đăng xuất"
 "xray" = "Cài đặt Xray"
+"core" = "Cài đặt lõi"
 "link" = "Quản lý"
 
 [pages.login]

@@ -4,16 +4,27 @@
     :label-col="{ md: {span:8} }"
     :wrapper-col="{ md: {span:14} }"
 >
+    <a-form-item label="UDP Port">
+        <a-space>
+            <a-switch v-model="inbound.settings.udpEnable"></a-switch>
+            <span v-if="inbound.settings.udpEnable" :style="{ color: '#888' }">
+                Uses the inbound port above ([[ inbound.port ]])
+            </span>
+            <span v-else :style="{ color: '#888' }">Disabled</span>
+        </a-space>
+    </a-form-item>
     <a-form-item label="TCP Port">
-        <a-input-number
-            v-model.number="inbound.settings.tcpPort"
-            :min="1"
-            :max="65535"
-            placeholder="443"
-        ></a-input-number>
-        <span :style="{ marginLeft: '8px', color: '#888' }">
-            UDP port uses the inbound port above
-        </span>
+        <a-space>
+            <a-switch v-model="inbound.settings.tcpEnable"></a-switch>
+            <a-input-number
+                v-if="inbound.settings.tcpEnable"
+                v-model.number="inbound.settings.tcpPort"
+                :min="1"
+                :max="65535"
+                placeholder="443"
+            ></a-input-number>
+            <span v-else :style="{ color: '#888' }">Disabled</span>
+        </a-space>
     </a-form-item>
     <a-form-item label="DNS 1">
         <a-input
@@ -77,18 +88,15 @@
         <a-button
             type="primary"
             @click="generateOpenVpnCerts"
-            :disabled="!inbound.id"
         >
             Generate Self-Signed CA
         </a-button>
-        <span v-if="!inbound.id" :style="{ marginLeft: '8px', color: '#888' }">
-            Save the inbound first
-        </span>
     </a-form-item>
     <template v-if="inbound.id && inbound.settings.caCert">
         <a-divider>Client Config</a-divider>
         <a-form-item :wrapper-col="{ md: {offset:8, span:14} }">
             <a-button
+                v-if="inbound.settings.udpEnable"
                 icon="download"
                 @click="downloadOvpn('udp')"
                 :style="{ marginRight: '8px' }"
@@ -96,6 +104,7 @@
                 UDP Config (.ovpn)
             </a-button>
             <a-button
+                v-if="inbound.settings.tcpEnable"
                 icon="download"
                 @click="downloadOvpn('tcp')"
             >

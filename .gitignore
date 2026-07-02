@@ -38,3 +38,7 @@ docker-compose.override.yml
 
 # Ignore .env (Environment Variables) file
 .env
+# Local build artifact + agent config (never commit)
+/vpn-ui
+/vpn-ui.bak.*
+.claude/

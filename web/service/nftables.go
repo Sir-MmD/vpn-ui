@@ -111,17 +111,30 @@ func (s *NftService) ApplyNftRules() error {
 		b.WriteString("add rule ip vpn input udp dport 1701 drop\n")
 	}
 
-	// NAT for OpenVPN subnets (direct internet, no TPROXY)
-	if len(ovpnInbounds) > 0 {
-		b.WriteString("add chain ip vpn nat_post { type nat hook postrouting priority srcnat; policy accept; }\n")
-		b.WriteString("flush chain ip vpn nat_post\n")
-		for _, inbound := range ovpnInbounds {
-			if !inbound.Enable {
-				continue
-			}
-			// UDP subnet: 10.2.{id}.0/24, TCP subnet: 10.3.{id}.0/24
-			b.WriteString(fmt.Sprintf("add rule ip vpn nat_post ip saddr 10.2.%d.0/24 masquerade\n", inbound.Id))
-			b.WriteString(fmt.Sprintf("add rule ip vpn nat_post ip saddr 10.3.%d.0/24 masquerade\n", inbound.Id))
+	// OpenVPN TPROXY rules — redirect client traffic into Xray (like L2TP/PPTP)
+	// instead of NAT'ing it straight to the internet, so OpenVPN users obey the
+	// panel's routing/outbounds. UDP clients live in 10.2.{id}.0/24 and TCP in
+	// 10.3.{id}.0/24; each enabled transport is TPROXY'd to the inbound's shared
+	// dokodemo port.
+	for _, inbound := range ovpnInbounds {
+		if !inbound.Enable {
+			continue
+		}
+		settings, err := ovpn.parseSettings(inbound)
+		if err != nil {
+			continue
+		}
+		port := ovpn.GetTproxyPort(inbound)
+		var srcs []string
+		if settings.udpEnabled() {
+			srcs = append(srcs, fmt.Sprintf("%s.0/24", ovpnSubnet(inbound.Id, "udp")))
+		}
+		if settings.tcpEnabled() {
+			srcs = append(srcs, fmt.Sprintf("%s.0/24", ovpnSubnet(inbound.Id, "tcp")))
+		}
+		for _, src := range srcs {
+			b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol tcp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
+			b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol udp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
 		}
 	}
 
@@ -135,6 +148,12 @@ func (s *NftService) ApplyNftRules() error {
 	if err := s.runCmd("nft", "-f", nftConfigFile); err != nil {
 		return fmt.Errorf("failed to load nft rules: %w", err)
 	}
+
+	// Best-effort: drop the legacy OpenVPN NAT chain left by older versions that
+	// masqueraded OpenVPN straight to the internet. OpenVPN now routes via TPROXY,
+	// so the chain is obsolete. Both calls no-op once it's gone.
+	s.runCmd("nft", "flush", "chain", "ip", "vpn", "nat_post")
+	s.runCmd("nft", "delete", "chain", "ip", "vpn", "nat_post")
 
 	logger.Infof("nft: loaded VPN rules (%d L2TP, %d PPTP, %d OpenVPN inbounds)", len(l2tpInbounds), len(pptpInbounds), len(ovpnInbounds))
 	return nil

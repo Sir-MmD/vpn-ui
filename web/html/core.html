@@ -1,0 +1,207 @@
+{{ template "page/head_start" .}}
+{{ template "page/head_end" .}}
+
+{{ template "page/body_start" .}}
+<a-layout id="app" v-cloak :class="themeSwitcher.currentTheme">
+  <a-sidebar></a-sidebar>
+  <a-layout id="content-layout">
+    <a-layout-content>
+      <a-spin :spinning="spinning" :delay="300" tip='{{ i18n "loading"}}' size="large">
+        <a-row :gutter="[16, 16]" :style="{ margin: 0 }">
+
+          <!-- Header -->
+          <a-col :span="24">
+            <a-card hoverable>
+              <a-row type="flex" justify="space-between" align="middle" :gutter="[8,8]">
+                <a-col>
+                  <h2 :style="{ margin: 0 }">{{ i18n "pages.core.title" }}</h2>
+                  <span :style="{ opacity: 0.65 }">{{ i18n "pages.core.subtitle" }}</span>
+                </a-col>
+                <a-col>
+                  <a-button @click="loadStatus(true)">
+                    <a-icon type="reload"></a-icon>{{ i18n "pages.core.refresh" }}
+                  </a-button>
+                </a-col>
+              </a-row>
+            </a-card>
+          </a-col>
+
+          <!-- Per-core cards -->
+          <a-col :xs="24" :sm="12" :lg="8" v-for="core in cores" :key="core.name">
+            <a-card hoverable>
+              <template #title>
+                <a-icon :type="coreIcon(core.name)"></a-icon>
+                <span :style="{ marginLeft: '6px' }">[[ coreTitle(core.name) ]]</span>
+              </template>
+              <template #extra>
+                <a-tag :color="stateColor(core.state)">[[ stateText(core.state) ]]</a-tag>
+              </template>
+
+              <p v-if="core.version" :style="{ margin: '2px 0' }">
+                <b>{{ i18n "pages.core.version" }}:</b> [[ core.version ]]
+              </p>
+              <p v-if="core.name !== 'xray' && core.name !== 'radius'" :style="{ margin: '2px 0' }">
+                <b>{{ i18n "pages.core.inbounds" }}:</b> [[ core.inbounds ]]
+              </p>
+              <p v-if="core.extra && core.extra.ipsec !== undefined" :style="{ margin: '2px 0' }">
+                <b>IPsec:</b>
+                <a-tag :color="core.extra.ipsec ? 'green' : 'orange'">
+                  [[ core.extra.ipsec ? '{{ i18n "pages.core.stateRunning" }}' : '{{ i18n "pages.core.stateStopped" }}' ]]
+                </a-tag>
+              </p>
+              <a-alert v-if="core.detail" type="warning" :message="core.detail" banner
+                :style="{ marginTop: '8px' }"></a-alert>
+
+              <div :style="{ marginTop: '12px' }">
+                <a-space>
+                  <a-button size="small" type="primary" :disabled="!canRestart(core.name)"
+                    @click="restart(core.name)">{{ i18n "pages.core.restart" }}</a-button>
+                  <a-button size="small" type="danger" v-if="canStop(core.name)"
+                    @click="stop(core.name)">{{ i18n "pages.core.stop" }}</a-button>
+                  <a-button size="small" v-if="core.name === 'xray'"
+                    :href="basePath + 'panel/xray'">{{ i18n "pages.core.editConfig" }}</a-button>
+                </a-space>
+              </div>
+            </a-card>
+          </a-col>
+
+          <!-- System / provisioning card -->
+          <a-col :span="24">
+            <a-card hoverable>
+              <template #title>
+                <a-icon type="hdd"></a-icon>
+                <span :style="{ marginLeft: '6px' }">{{ i18n "pages.core.system" }}</span>
+              </template>
+              <template #extra>
+                <a-button type="primary" :loading="provisioning" @click="runProvision">
+                  <a-icon type="thunderbolt"></a-icon>{{ i18n "pages.core.runSetup" }}
+                </a-button>
+              </template>
+
+              <p :style="{ opacity: 0.65 }">{{ i18n "pages.core.provisionDesc" }}</p>
+              <a-row :gutter="[16, 8]">
+                <a-col :xs="12" :sm="8">
+                  <b>{{ i18n "pages.core.ipForward" }}:</b>
+                  <a-tag :color="system.ipForward ? 'green' : 'red'">
+                    [[ system.ipForward ? '{{ i18n "pages.core.enabled" }}' : '{{ i18n "pages.core.disabled" }}' ]]
+                  </a-tag>
+                </a-col>
+                <a-col :xs="12" :sm="8">
+                  <b>{{ i18n "pages.core.nftables" }}:</b>
+                  <a-tag :color="system.nftables ? 'green' : 'red'">
+                    [[ system.nftables ? '{{ i18n "pages.core.present" }}' : '{{ i18n "pages.core.absent" }}' ]]
+                  </a-tag>
+                </a-col>
+                <a-col :xs="12" :sm="8">
+                  <b>{{ i18n "pages.core.iproute" }}:</b>
+                  <a-tag :color="system.iproute ? 'green' : 'red'">
+                    [[ system.iproute ? '{{ i18n "pages.core.present" }}' : '{{ i18n "pages.core.absent" }}' ]]
+                  </a-tag>
+                </a-col>
+              </a-row>
+
+              <a-divider :style="{ margin: '12px 0' }"></a-divider>
+              <b>{{ i18n "pages.core.kernelModules" }}:</b>
+              <div :style="{ marginTop: '8px' }">
+                <a-tag v-for="m in system.modules" :key="m.name" :color="m.loaded ? 'green' : 'red'"
+                  :style="{ marginBottom: '6px' }">
+                  [[ m.name ]] — [[ m.loaded ? '{{ i18n "pages.core.loaded" }}' : '{{ i18n "pages.core.missing" }}' ]]
+                </a-tag>
+              </div>
+            </a-card>
+          </a-col>
+
+        </a-row>
+      </a-spin>
+    </a-layout-content>
+  </a-layout>
+
+  <!-- Provision result -->
+  <a-modal v-model="provisionVisible" title='{{ i18n "pages.core.runSetup" }}' :footer="null">
+    <div v-for="item in provisionResult" :key="item.name" :style="{ marginBottom: '6px' }">
+      <a-icon :type="item.ok ? 'check-circle' : 'close-circle'"
+        :style="{ color: item.ok ? '#52c41a' : '#f5222d', marginRight: '8px' }"></a-icon>
+      <span>[[ item.name ]] — [[ item.msg ]]</span>
+    </div>
+  </a-modal>
+</a-layout>
+
+{{template "page/body_scripts" .}}
+{{template "component/aSidebar" .}}
+{{template "component/aThemeSwitch" .}}
+<script>
+  const app = new Vue({
+    delimiters: ['[[', ']]'],
+    mixins: [MediaQueryMixin],
+    el: '#app',
+    data: {
+      themeSwitcher,
+      spinning: false,
+      cores: [],
+      system: { modules: [] },
+      provisioning: false,
+      provisionVisible: false,
+      provisionResult: [],
+      basePath: '{{ .base_path }}',
+    },
+    methods: {
+      async loadStatus(showSpin) {
+        if (showSpin) this.spinning = true;
+        const msg = await HttpUtil.get('{{ .base_path }}panel/core/status');
+        if (msg && msg.success && msg.obj) {
+          this.cores = msg.obj.cores || [];
+          this.system = msg.obj.system || { modules: [] };
+        }
+        this.spinning = false;
+      },
+      async restart(core) {
+        this.spinning = true;
+        await HttpUtil.post('{{ .base_path }}panel/core/restart/' + core);
+        await this.loadStatus(false);
+      },
+      async stop(core) {
+        this.spinning = true;
+        await HttpUtil.post('{{ .base_path }}panel/core/stop/' + core);
+        await this.loadStatus(false);
+      },
+      async runProvision() {
+        this.provisioning = true;
+        const msg = await HttpUtil.post('{{ .base_path }}panel/core/provision');
+        this.provisioning = false;
+        if (msg && msg.success) {
+          this.provisionResult = msg.obj || [];
+          this.provisionVisible = true;
+          await this.loadStatus(false);
+        }
+      },
+      coreTitle(name) {
+        return ({ xray: 'Xray', l2tp: 'L2TP / IPsec', pptp: 'PPTP', openvpn: 'OpenVPN', radius: 'RADIUS' })[name] || name;
+      },
+      coreIcon(name) {
+        return ({ xray: 'tool', l2tp: 'lock', pptp: 'api', openvpn: 'safety-certificate', radius: 'key' })[name] || 'appstore';
+      },
+      stateColor(state) {
+        return ({ running: 'green', idle: 'blue', stopped: 'orange', not_installed: 'default', error: 'red' })[state] || 'default';
+      },
+      stateText(state) {
+        return ({
+          running: '{{ i18n "pages.core.stateRunning" }}',
+          stopped: '{{ i18n "pages.core.stateStopped" }}',
+          idle: '{{ i18n "pages.core.stateIdle" }}',
+          not_installed: '{{ i18n "pages.core.stateNotInstalled" }}',
+          error: '{{ i18n "pages.core.stateError" }}',
+        })[state] || state;
+      },
+      canStop(name) { return name === 'xray' || name === 'openvpn'; },
+      canRestart(name) { return name !== 'radius'; },
+    },
+    mounted() {
+      this.loadStatus(true);
+      this.pollTimer = setInterval(() => this.loadStatus(false), 5000);
+    },
+    beforeDestroy() {
+      if (this.pollTimer) clearInterval(this.pollTimer);
+    },
+  });
+</script>
+{{ template "page/body_end" .}}

@@ -3208,6 +3208,8 @@ Inbound.PptpSettings.PptpUser = class extends XrayCommonClass {
 Inbound.OpenvpnSettings = class extends Inbound.Settings {
   constructor(
     protocol,
+    udpEnable = true,
+    tcpEnable = true,
     tcpPort = 443,
     dns1 = "8.8.8.8",
     dns2 = "8.8.4.4",
@@ -3220,6 +3222,8 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
     openvpnUsers = [new Inbound.OpenvpnSettings.OpenvpnUser()],
   ) {
     super(protocol);
+    this.udpEnable = udpEnable;
+    this.tcpEnable = tcpEnable;
     this.tcpPort = tcpPort;
     this.dns1 = dns1;
     this.dns2 = dns2;
@@ -3235,6 +3239,8 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
   static fromJson(json = {}) {
     return new Inbound.OpenvpnSettings(
       Protocols.OPENVPN,
+      json.udpEnable ?? true,
+      json.tcpEnable ?? true,
       json.tcpPort ?? 443,
       json.dns1 ?? "8.8.8.8",
       json.dns2 ?? "8.8.4.4",
@@ -3250,6 +3256,8 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
 
   toJson() {
     return {
+      udpEnable: this.udpEnable,
+      tcpEnable: this.tcpEnable,
       tcpPort: this.tcpPort,
       dns1: this.dns1,
       dns2: this.dns2,

@@ -323,8 +323,8 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 		}
 	}
 
-	// Check for duplicate L2TP/PPTP usernames
-	if inbound.Protocol == "l2tp" || inbound.Protocol == "pptp" {
+	// Check for duplicate L2TP/PPTP/OpenVPN usernames
+	if inbound.Protocol == "l2tp" || inbound.Protocol == "pptp" || inbound.Protocol == "openvpn" {
 		dupUser, err := s.checkPPPUsernamesForDuplicates(string(inbound.Protocol), clients)
 		if err != nil {
 			return inbound, false, err

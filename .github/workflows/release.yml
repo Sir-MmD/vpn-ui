@@ -83,6 +83,16 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      # Cross-arch Alpine builds for the bundled VPN daemons run under QEMU.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build bundled VPN daemons
+        run: |
+          # Builds static xl2tpd/openvpn/pptpd + the relocatable pppd bundle into
+          # backend/bin/<arch>/ for go:embed. No-op for arches without a bundle.
+          DOCKER_NET="--network=host" build/backend/build.sh ${{ matrix.platform }}
+
       - name: Build 3X-UI
         run: |
           export CGO_ENABLED=1

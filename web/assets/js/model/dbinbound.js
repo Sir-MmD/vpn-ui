@@ -71,6 +71,10 @@ class DBInbound {
         return this.protocol === Protocols.PPTP;
     }
 
+    get isOpenvpn() {
+        return this.protocol === Protocols.OPENVPN;
+    }
+
     get address() {
         let address = location.hostname;
         if (!ObjectUtil.isEmpty(this.listen) && this.listen !== "0.0.0.0") {
@@ -158,6 +162,7 @@ class DBInbound {
             case Protocols.HYSTERIA:
             case Protocols.L2TP:
             case Protocols.PPTP:
+            case Protocols.OPENVPN:
                 return true;
             case Protocols.SHADOWSOCKS:
                 return this.toInbound().isSSMultiUser;

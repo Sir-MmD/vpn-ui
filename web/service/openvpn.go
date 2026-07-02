@@ -20,6 +20,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
+	"github.com/mhsanaei/3x-ui/v2/util/json_util"
 	"github.com/mhsanaei/3x-ui/v2/xray"
 )
 
@@ -34,16 +35,32 @@ type OpenVpnService struct {
 
 // openvpnSettings represents the OpenVPN-specific settings stored in the inbound's Settings JSON.
 type openvpnSettings struct {
-	TcpPort    int            `json:"tcpPort"`
-	Dns1       string         `json:"dns1"`
-	Dns2       string         `json:"dns2"`
-	Mtu        int            `json:"mtu"`
-	CaCert     string         `json:"caCert"`
-	CaKey      string         `json:"caKey"`
-	ServerCert string         `json:"serverCert"`
-	ServerKey  string         `json:"serverKey"`
-	TlsCrypt   string         `json:"tlsCrypt"`
+	UdpEnable  *bool           `json:"udpEnable"` // nil == enabled (back-compat with pre-toggle inbounds)
+	TcpEnable  *bool           `json:"tcpEnable"` // nil == enabled
+	TcpPort    int             `json:"tcpPort"`
+	Dns1       string          `json:"dns1"`
+	Dns2       string          `json:"dns2"`
+	Mtu        int             `json:"mtu"`
+	CaCert     string          `json:"caCert"`
+	CaKey      string          `json:"caKey"`
+	ServerCert string          `json:"serverCert"`
+	ServerKey  string          `json:"serverKey"`
+	TlsCrypt   string          `json:"tlsCrypt"`
 	Clients    []openvpnClient `json:"clients"`
+}
+
+// udpEnabled / tcpEnabled report whether a transport is active. A nil pointer
+// (older inbound saved before the toggles existed) is treated as enabled so we
+// never silently take a working server offline on upgrade.
+func (o *openvpnSettings) udpEnabled() bool { return o.UdpEnable == nil || *o.UdpEnable }
+func (o *openvpnSettings) tcpEnabled() bool { return o.TcpEnable == nil || *o.TcpEnable }
+
+// tcpPortOrDefault returns the configured TCP port, defaulting to 443.
+func (o *openvpnSettings) tcpPortOrDefault() int {
+	if o.TcpPort == 0 {
+		return 443
+	}
+	return o.TcpPort
 }
 
 type openvpnClient struct {
@@ -77,6 +94,70 @@ func (s *OpenVpnService) configDir(inboundId int) string {
 	return fmt.Sprintf("/etc/openvpn/server-%d", inboundId)
 }
 
+// ovpnSubnet returns the /24 prefix for an OpenVPN inbound/transport.
+// UDP clients live in 10.2.{id}.0/24, TCP clients in 10.3.{id}.0/24 — the same
+// pools buildServerConfig hands to OpenVPN's `server` directive.
+func ovpnSubnet(inboundId int, proto string) string {
+	prefix := 2
+	if proto == "tcp" {
+		prefix = 3
+	}
+	return fmt.Sprintf("10.%d.%d", prefix, inboundId)
+}
+
+// ovpnClientIP returns the deterministic tunnel IP assigned (via client-config-dir)
+// to the client at index i for the given transport. The server takes .1, so
+// clients start at .2. Returns "" when the index would overflow the /24.
+func ovpnClientIP(inboundId, i int, proto string) string {
+	host := 2 + i
+	if host > 254 {
+		return ""
+	}
+	return fmt.Sprintf("%s.%d", ovpnSubnet(inboundId, proto), host)
+}
+
+// binaryPath returns the absolute path of the running panel binary, used for
+// OpenVPN's hook scripts (auth-user-pass-verify / client-connect / -disconnect).
+// It resolves the real executable so the config never points at a stale symlink
+// or a wrong distro-specific path. Falls back to the historical fixed path only
+// if the executable can't be determined.
+func (s *OpenVpnService) binaryPath() string {
+	if exe, err := os.Executable(); err == nil {
+		if resolved, rerr := filepath.EvalSymlinks(exe); rerr == nil {
+			return resolved
+		}
+		return exe
+	}
+	return "/usr/local/x-ui/x-ui"
+}
+
+// GetTproxyPort returns a deterministic TPROXY/dokodemo port for the given
+// inbound. Inbound IDs are globally unique, so this shares L2TP/PPTP's 12300+id
+// formula without colliding with them.
+func (s *OpenVpnService) GetTproxyPort(inbound *model.Inbound) int {
+	return 12300 + inbound.Id
+}
+
+// GetDokodemoConfig builds the paired dokodemo-door inbound that captures the
+// TPROXY-redirected OpenVPN traffic and feeds it into Xray's routing — the same
+// mechanism L2TP/PPTP use so OpenVPN clients obey the panel's outbound rules.
+func (s *OpenVpnService) GetDokodemoConfig(inbound *model.Inbound) *xray.InboundConfig {
+	port := s.GetTproxyPort(inbound)
+	settings := `{"network":"tcp,udp","followRedirect":true}`
+	streamSettings := `{"sockopt":{"tproxy":"tproxy","mark":255}}`
+	sniffing := `{"enabled":true,"destOverride":["http","tls"]}`
+
+	return &xray.InboundConfig{
+		Listen:         json_util.RawMessage(`"0.0.0.0"`),
+		Port:           port,
+		Protocol:       "dokodemo-door",
+		Settings:       json_util.RawMessage(settings),
+		StreamSettings: json_util.RawMessage(streamSettings),
+		Tag:            inbound.Tag,
+		Sniffing:       json_util.RawMessage(sniffing),
+	}
+}
+
 // InitOpenVpn initializes OpenVPN services on panel startup.
 func (s *OpenVpnService) InitOpenVpn() {
 	inbounds, err := s.GetOpenVpnInbounds()
@@ -90,8 +171,8 @@ func (s *OpenVpnService) InitOpenVpn() {
 		logger.Warning("OpenVPN: failed to generate configs:", err)
 		return
 	}
-	if err := s.SetupNAT(); err != nil {
-		logger.Warning("OpenVPN: failed to setup NAT:", err)
+	if err := s.SetupRouting(); err != nil {
+		logger.Warning("OpenVPN: failed to setup routing:", err)
 	}
 	if err := s.RestartServices(); err != nil {
 		logger.Warning("OpenVPN: failed to restart services:", err)
@@ -131,32 +212,70 @@ func (s *OpenVpnService) generateServerConfigs(inbound *model.Inbound) error {
 	dir := s.configDir(inbound.Id)
 	os.MkdirAll(dir, 0755)
 	os.MkdirAll("/var/run/openvpn", 0755)
+	os.MkdirAll("/etc/openvpn/server", 0755)
 
-	// Get the x-ui binary path for hook scripts
-	binaryPath := "/usr/local/x-ui/x-ui"
+	// Path to the running panel binary, used as OpenVPN's auth/connect/disconnect
+	// hook. Resolved at runtime — the install location varies by distro
+	// (/root/vpn-ui, /usr/local/x-ui/x-ui, /usr/lib/x-ui/x-ui, …) and a wrong
+	// path makes OpenVPN refuse to start (auth-user-pass-verify script not found).
+	binaryPath := s.binaryPath()
 
-	// UDP config
-	udpConf := s.buildServerConfig(inbound, settings, "udp", inbound.Port, binaryPath)
-	if err := s.writeFile(fmt.Sprintf("%s/server-udp.conf", dir), udpConf); err != nil {
+	ports := map[string]int{
+		"udp": inbound.Port,
+		"tcp": settings.tcpPortOrDefault(),
+	}
+	enabled := map[string]bool{
+		"udp": settings.udpEnabled(),
+		"tcp": settings.tcpEnabled(),
+	}
+
+	for _, proto := range []string{"udp", "tcp"} {
+		confPath := fmt.Sprintf("%s/server-%s.conf", dir, proto)
+		link := fmt.Sprintf("/etc/openvpn/server/server-%d-%s.conf", inbound.Id, proto)
+		if !enabled[proto] {
+			// Drop the systemd symlink so a disabled transport cannot be started.
+			os.Remove(link)
+			continue
+		}
+		conf := s.buildServerConfig(inbound, settings, proto, ports[proto], binaryPath)
+		if err := s.writeFile(confPath, conf); err != nil {
+			return err
+		}
+		if err := s.writeClientConfigDir(inbound, settings, proto); err != nil {
+			logger.Warning("OpenVPN: CCD write failed for inbound", inbound.Id, err)
+		}
+		s.runCmd("ln", "-sf", confPath, link)
+	}
+
+	return nil
+}
+
+// writeClientConfigDir writes the per-client client-config-dir files that pin
+// each user to a deterministic tunnel IP (ifconfig-push). Deterministic IPs are
+// what let the panel translate per-user routing rules (matched by email) into
+// source-IP rules the dokodemo-door path can match — the same trick L2TP/PPTP
+// use. Lookups are keyed by common-name, which username-as-common-name sets to
+// the authenticated username (client.ID).
+func (s *OpenVpnService) writeClientConfigDir(inbound *model.Inbound, settings *openvpnSettings, proto string) error {
+	ccdDir := fmt.Sprintf("%s/ccd-%s", s.configDir(inbound.Id), proto)
+	// Rebuild from scratch so deleted/renamed users don't leave stale pins.
+	os.RemoveAll(ccdDir)
+	if err := os.MkdirAll(ccdDir, 0755); err != nil {
 		return err
 	}
-
-	// TCP config
-	tcpPort := settings.TcpPort
-	if tcpPort == 0 {
-		tcpPort = 443
+	for i, client := range settings.Clients {
+		if client.ID == "" {
+			continue
+		}
+		ip := ovpnClientIP(inbound.Id, i, proto)
+		if ip == "" {
+			continue
+		}
+		content := fmt.Sprintf("ifconfig-push %s 255.255.255.0\n", ip)
+		if err := s.writeFile(fmt.Sprintf("%s/%s", ccdDir, client.ID), content); err != nil {
+			return err
+		}
 	}
-	tcpConf := s.buildServerConfig(inbound, settings, "tcp", tcpPort, binaryPath)
-	if err := s.writeFile(fmt.Sprintf("%s/server-tcp.conf", dir), tcpConf); err != nil {
-		return err
-	}
-
-	// Create symlinks for systemd
-	s.runCmd("ln", "-sf", fmt.Sprintf("%s/server-udp.conf", dir),
-		fmt.Sprintf("/etc/openvpn/server/server-%d-udp.conf", inbound.Id))
-	s.runCmd("ln", "-sf", fmt.Sprintf("%s/server-tcp.conf", dir),
-		fmt.Sprintf("/etc/openvpn/server/server-%d-tcp.conf", inbound.Id))
-
 	return nil
 }
 
@@ -206,9 +325,15 @@ func (s *OpenVpnService) buildServerConfig(inbound *model.Inbound, settings *ope
 	b.WriteString("dev-type tun\n")
 	b.WriteString("topology subnet\n")
 	b.WriteString(fmt.Sprintf("server %s 255.255.255.0\n", subnet))
+	// Pin every user to a deterministic tunnel IP so per-user routing rules work.
+	b.WriteString(fmt.Sprintf("client-config-dir %s/ccd-%s\n", dir, proto))
 	b.WriteString("push \"redirect-gateway def1 bypass-dhcp\"\n")
 	b.WriteString(fmt.Sprintf("push \"dhcp-option DNS %s\"\n", dns1))
 	b.WriteString(fmt.Sprintf("push \"dhcp-option DNS %s\"\n", dns2))
+	// The VPN data path (nftables TPROXY -> Xray) is IPv4-only. Block IPv6 on the
+	// client so a dual-stack host can't leak IPv6 traffic/DNS out its own default
+	// route, bypassing Xray entirely (mirrors the L2TP/PPTP noipv6 fix).
+	b.WriteString("push \"block-ipv6\"\n")
 	b.WriteString(fmt.Sprintf("tun-mtu %d\n", mtu))
 	b.WriteString(fmt.Sprintf("ca %s/ca.crt\n", dir))
 	b.WriteString(fmt.Sprintf("cert %s/server.crt\n", dir))
@@ -275,10 +400,25 @@ func (s *OpenVpnService) writeCertFiles(inbound *model.Inbound) error {
 	return nil
 }
 
-// SetupNAT configures IP forwarding and nftables NAT rules for OpenVPN subnets.
-func (s *OpenVpnService) SetupNAT() error {
+// SetupRouting prepares the host so OpenVPN client traffic is TPROXY-redirected
+// into Xray instead of NAT'd straight to the internet: it enables forwarding,
+// loads the tproxy/tun modules, installs the fwmark policy route, and reapplies
+// the nftables rules. Mirrors L2tpService.SetupAllTproxy.
+func (s *OpenVpnService) SetupRouting() error {
 	// Enable IP forwarding
 	s.runCmd("sysctl", "-w", "net.ipv4.ip_forward=1")
+
+	// Kernel modules for the tun device + TPROXY redirect.
+	s.runCmd("modprobe", "tun")
+	s.runCmd("modprobe", "nf_tproxy_ipv4")
+
+	// Deliver fwmark-1 packets locally so TPROXY can hand them to the dokodemo
+	// socket (shared table 100 with L2TP/PPTP; add/replace are idempotent).
+	output, _ := exec.Command("ip", "rule", "show").Output()
+	if !strings.Contains(string(output), "fwmark 0x1 lookup 100") {
+		s.runCmd("ip", "rule", "add", "fwmark", "1", "lookup", "100")
+	}
+	s.runCmd("ip", "route", "replace", "local", "0.0.0.0/0", "dev", "lo", "table", "100")
 
 	return s.nftService.ApplyNftRules()
 }
@@ -297,23 +437,29 @@ func (s *OpenVpnService) RestartServices() error {
 	os.MkdirAll("/etc/openvpn/server", 0755)
 
 	for _, inbound := range inbounds {
-		udpSvc := fmt.Sprintf("openvpn-server@server-%d-udp", inbound.Id)
-		tcpSvc := fmt.Sprintf("openvpn-server@server-%d-tcp", inbound.Id)
-
-		if inbound.Enable {
-			s.runCmd("systemctl", "enable", "--now", udpSvc)
-			s.runCmd("systemctl", "restart", udpSvc)
-			s.runCmd("systemctl", "enable", "--now", tcpSvc)
-			s.runCmd("systemctl", "restart", tcpSvc)
-		} else {
-			s.runCmd("systemctl", "stop", udpSvc)
-			s.runCmd("systemctl", "disable", udpSvc)
-			s.runCmd("systemctl", "stop", tcpSvc)
-			s.runCmd("systemctl", "disable", tcpSvc)
+		settings, err := s.parseSettings(inbound)
+		if err != nil {
+			logger.Warning("OpenVPN: skipping inbound", inbound.Id, err)
+			continue
 		}
+		// A transport runs only when both the inbound and that transport toggle
+		// are enabled; otherwise the systemd instance is stopped and disabled.
+		s.applyServiceState(fmt.Sprintf("openvpn-server@server-%d-udp", inbound.Id), inbound.Enable && settings.udpEnabled())
+		s.applyServiceState(fmt.Sprintf("openvpn-server@server-%d-tcp", inbound.Id), inbound.Enable && settings.tcpEnabled())
 	}
 
 	return nil
+}
+
+// applyServiceState starts+enables (or stops+disables) a systemd unit.
+func (s *OpenVpnService) applyServiceState(unit string, want bool) {
+	if want {
+		s.runCmd("systemctl", "enable", "--now", unit)
+		s.runCmd("systemctl", "restart", unit)
+	} else {
+		s.runCmd("systemctl", "stop", unit)
+		s.runCmd("systemctl", "disable", unit)
+	}
 }
 
 // StopServices stops all OpenVPN systemd services.
@@ -339,6 +485,14 @@ func (s *OpenVpnService) GenerateClientConfig(inbound *model.Inbound, proto stri
 		return "", fmt.Errorf("certificates not generated yet — use 'Generate Self-Signed CA' first")
 	}
 
+	// Refuse to hand out a profile for a transport the admin has switched off.
+	if proto == "tcp" && !settings.tcpEnabled() {
+		return "", fmt.Errorf("TCP transport is disabled for this inbound")
+	}
+	if proto == "udp" && !settings.udpEnabled() {
+		return "", fmt.Errorf("UDP transport is disabled for this inbound")
+	}
+
 	// Determine server IP
 	serverIP := s.getServerIP()
 	if serverIP == "" {
@@ -348,10 +502,7 @@ func (s *OpenVpnService) GenerateClientConfig(inbound *model.Inbound, proto stri
 	port := inbound.Port
 	protoStr := "udp"
 	if proto == "tcp" {
-		port = settings.TcpPort
-		if port == 0 {
-			port = 443
-		}
+		port = settings.tcpPortOrDefault()
 		protoStr = "tcp"
 	}
 

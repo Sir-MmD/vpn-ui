@@ -3,12 +3,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -570,6 +572,113 @@ func openvpnDisconnect() {
 	os.Exit(0)
 }
 
+// kernelModuleHint returns the distro-appropriate command to install the full
+// kernel modules (needed for the PPP/L2TP modules on minimal/cloud kernels).
+func kernelModuleHint() string {
+	exists := func(p string) bool { _, err := os.Stat(p); return err == nil }
+	switch {
+	case exists("/usr/bin/dnf") || exists("/bin/dnf"):
+		return "dnf install kernel-modules-extra"
+	case exists("/usr/bin/apt-get") || exists("/bin/apt-get"):
+		return "apt install linux-image-amd64   (Debian)   |   apt install linux-modules-extra-$(uname -r)   (Ubuntu)"
+	case exists("/usr/bin/zypper"):
+		return "zypper install kernel-default-extra"
+	case exists("/usr/bin/pacman"):
+		return "install/boot a kernel that ships the ppp modules (linux, linux-lts)"
+	default:
+		return "install the full kernel-modules package for your distro"
+	}
+}
+
+var stdinReader = bufio.NewReader(os.Stdin)
+
+// isTerminal reports whether stdin is an interactive terminal (so we can prompt).
+func isTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
+}
+
+// confirm asks a yes/no question. Non-interactive input returns the default.
+func confirm(prompt string, defaultYes bool) bool {
+	if !isTerminal() {
+		return defaultYes
+	}
+	hint := "[y/N]"
+	if defaultYes {
+		hint = "[Y/n]"
+	}
+	fmt.Printf("%s %s ", prompt, hint)
+	line, _ := stdinReader.ReadString('\n')
+	line = strings.TrimSpace(strings.ToLower(line))
+	if line == "" {
+		return defaultYes
+	}
+	return line == "y" || line == "yes"
+}
+
+// setupBackend provisions the host/kernel prerequisites for the VPN backend
+// (loads + persists kernel modules, enables IP forwarding). It is the in-binary
+// replacement for the host-prep half of setup-vpn-backend.sh, and is idempotent.
+func setupBackend() {
+	if os.Geteuid() != 0 {
+		fmt.Println("setup must be run as root (or via sudo).")
+		os.Exit(1)
+	}
+	var coreService service.CoreService
+	fmt.Println("Provisioning VPN backend (kernel modules, IP forwarding)...")
+	fmt.Println()
+	for _, step := range coreService.Provision() {
+		status := "OK  "
+		if !step.OK {
+			status = "FAIL"
+		}
+		fmt.Printf("  [%s] %s — %s\n", status, step.Name, step.Msg)
+	}
+	fmt.Println()
+
+	// Missing kernel modules (typical of minimal/cloud kernels) block L2TP/PPTP
+	// — offer to install the full kernel modules package, with consent.
+	missing := coreService.MissingKernelModules()
+	if len(missing) > 0 {
+		fmt.Printf("Missing kernel modules: %s\n", strings.Join(missing, ", "))
+		fmt.Println("These are required for L2TP/PPTP (OpenVPN is unaffected).")
+
+		pkg := service.KernelModulesPackage()
+		if pkg == "" {
+			fmt.Printf("Fix manually: %s\n", kernelModuleHint())
+			return
+		}
+		if !confirm(fmt.Sprintf("Install '%s' to provide them?", pkg), true) {
+			fmt.Printf("Skipped. Install it later with: %s\n", kernelModuleHint())
+			return
+		}
+
+		fmt.Printf("Installing %s (this can take a minute)...\n", pkg)
+		installed, still, err := coreService.InstallKernelModules()
+		if err != nil {
+			fmt.Printf("  Install failed: %v\n", err)
+			fmt.Printf("  Try manually: %s\n", kernelModuleHint())
+			os.Exit(1)
+		}
+		if len(still) == 0 {
+			fmt.Printf("  Installed %s and loaded the modules — no reboot needed.\n", installed)
+		} else {
+			fmt.Printf("  Installed %s. A reboot is required to load: %s\n", installed, strings.Join(still, ", "))
+			fmt.Println("  (The modules load automatically on boot — no need to re-run setup.)")
+			if confirm("Reboot now?", false) {
+				fmt.Println("Rebooting...")
+				if err := exec.Command("systemctl", "reboot").Run(); err != nil {
+					_ = exec.Command("reboot").Run()
+				}
+				return
+			}
+			fmt.Println("Reboot when convenient to finish enabling L2TP/PPTP.")
+		}
+	}
+
+	fmt.Println("VPN backend provisioning complete.")
+}
+
 // main is the entry point of the 3x-ui application.
 // It parses command-line arguments to run the web server, migrate database, or update settings.
 func main() {
@@ -625,6 +734,7 @@ func main() {
 		fmt.Println("    run            run web panel")
 		fmt.Println("    migrate        migrate form other/old x-ui")
 		fmt.Println("    setting        set settings")
+		fmt.Println("    setup          provision the VPN backend (kernel modules, sysctl)")
 	}
 
 	flag.Parse()
@@ -690,6 +800,8 @@ func main() {
 		openvpnConnect()
 	case "openvpn-disconnect":
 		openvpnDisconnect()
+	case "setup":
+		setupBackend()
 	default:
 		fmt.Println("Invalid subcommands")
 		fmt.Println()

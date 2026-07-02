@@ -780,29 +780,67 @@ firewall_menu() {
 }
 
 install_firewall() {
-    if ! command -v ufw &>/dev/null; then
-        echo "ufw firewall is not installed. Installing now..."
-        apt-get update
-        apt-get install -y ufw
-    else
-        echo "ufw firewall is already installed"
-    fi
+    case "${release}" in
+        ubuntu | debian | armbian)
+            if ! command -v ufw &>/dev/null; then
+                echo "ufw firewall is not installed. Installing now..."
+                apt-get update
+                apt-get install -y ufw
+            else
+                echo "ufw firewall is already installed"
+            fi
 
-    # Check if the firewall is inactive
-    if ufw status | grep -q "Status: active"; then
-        echo "Firewall is already active"
-    else
-        echo "Activating firewall..."
-        # Open the necessary ports
-        ufw allow ssh
-        ufw allow http
-        ufw allow https
-        ufw allow 2053/tcp #webPort
-        ufw allow 2096/tcp #subport
+            # Check if the firewall is inactive
+            if ufw status | grep -q "Status: active"; then
+                echo "Firewall is already active"
+            else
+                echo "Activating firewall..."
+                # Open the necessary ports
+                ufw allow ssh
+                ufw allow http
+                ufw allow https
+                ufw allow 2053/tcp #webPort
+                ufw allow 2096/tcp #subport
 
-        # Enable the firewall
-        ufw --force enable
-    fi
+                # Enable the firewall
+                ufw --force enable
+            fi
+            ;;
+        fedora | rhel | centos | almalinux | rocky | ol)
+            if ! command -v firewall-cmd &>/dev/null; then
+                echo "firewalld is not installed. Installing now..."
+                dnf install -y firewalld 2>/dev/null || yum install -y firewalld
+            else
+                echo "firewalld is already installed"
+            fi
+
+            # Start and enable firewalld
+            systemctl start firewalld 2>/dev/null
+            systemctl enable firewalld 2>/dev/null
+
+            # Check if the firewall is active
+            if firewall-cmd --state 2>/dev/null | grep -q "running"; then
+                echo "Firewall is already active"
+            else
+                echo "Activating firewall..."
+                systemctl start firewalld
+            fi
+
+            # Open the necessary ports
+            echo "Opening required ports..."
+            firewall-cmd --permanent --add-service=ssh 2>/dev/null
+            firewall-cmd --permanent --add-service=http 2>/dev/null
+            firewall-cmd --permanent --add-service=https 2>/dev/null
+            firewall-cmd --permanent --add-port=2053/tcp 2>/dev/null #webPort
+            firewall-cmd --permanent --add-port=2096/tcp 2>/dev/null #subport
+            firewall-cmd --reload 2>/dev/null
+            echo "Firewall configured successfully"
+            ;;
+        *)
+            echo "Firewall setup not supported for this distribution."
+            echo "Please configure your firewall manually to allow ports: 22, 80, 443, 2053, 2096"
+            ;;
+    esac
 }
 
 open_ports() {
