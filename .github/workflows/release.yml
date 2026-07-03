@@ -85,7 +85,7 @@ jobs:
 
       # Cross-arch Alpine builds for the bundled VPN daemons run under QEMU.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Build bundled VPN daemons
         run: |
