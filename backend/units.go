@@ -74,6 +74,21 @@ WantedBy=multi-user.target
 `, envLine, binDir, pppArg)
 }
 
+// LinkPptpCtrl points the fixed path pptpd was compiled to exec pptpctrl from
+// (PptpCtrlLink) at the extracted bundled pptpctrl, so the bundle works from any
+// install dir. No-op when pptpctrl isn't bundled. Idempotent.
+func LinkPptpCtrl() error {
+	ctrl := DaemonPath("pptpctrl")
+	if ctrl == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(PptpCtrlLink), 0o755); err != nil {
+		return err
+	}
+	_ = os.Remove(PptpCtrlLink)
+	return os.Symlink(ctrl, PptpCtrlLink)
+}
+
 // distroUnitExists reports whether a distro package already provides this unit
 // (in /usr/lib or /lib). If so we leave it alone and use the packaged daemon.
 func distroUnitExists(name string) bool {

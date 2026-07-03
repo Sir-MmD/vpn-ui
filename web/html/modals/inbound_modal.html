@@ -50,6 +50,15 @@
             } else {
                 this.dbInbound = new DBInbound();
             }
+            // The Inbound model carries no DB id (toInbound() rebuilds it from
+            // settings), but the OpenVPN "Client Config" download section and
+            // downloadOvpn() need it. Mirror the saved row id onto the form when
+            // editing so the in-modal .ovpn export is reachable and targets the
+            // right inbound. Purely a frontend property — Inbound.toJson() omits
+            // id, so this never leaks into the saved settings.
+            if (this.dbInbound && this.dbInbound.id) {
+                this.inbound.id = this.dbInbound.id;
+            }
             this.confirm = confirm;
             this.visible = true;
             this.isEdit = isEdit;
@@ -158,6 +167,35 @@
                 } else {
                     inModal.inbound.stream.externalProxy = [];
                 }
+            },
+            // OpenVPN keeps its external proxy list in the protocol settings
+            // (it has no xray stream), without the forceTls option.
+            get ovpnExternalProxy() {
+                return (
+                    Array.isArray(inModal.inbound.settings.externalProxy) &&
+                    inModal.inbound.settings.externalProxy.length > 0
+                );
+            },
+            set ovpnExternalProxy(value) {
+                if (value) {
+                    inModal.inbound.settings.externalProxy = [
+                        {
+                            dest: window.location.hostname,
+                            port: inModal.inbound.port,
+                            remark: "",
+                        },
+                    ];
+                } else {
+                    inModal.inbound.settings.externalProxy = [];
+                }
+            },
+        },
+        computed: {
+            ovpnAeadCiphers() {
+                return Inbound.OpenvpnSettings.CIPHERS_AEAD;
+            },
+            ovpnCbcCiphers() {
+                return Inbound.OpenvpnSettings.CIPHERS_CBC;
             },
         },
         watch: {
@@ -367,6 +405,57 @@
                 // Reset testseed to default values using Vue.set for reactivity
                 this.$set(this.inbound.settings, "testseed", [900, 500, 900, 256]);
             },
+            ovpnToggleTransport(proto, checked) {
+                const settings = inModal.inbound.settings;
+                const otherEnabled =
+                    proto === "tcp" ? settings.udpEnable : settings.tcpEnable;
+                if (!checked && !otherEnabled) {
+                    this.$message.warning(
+                        "At least one of TCP/UDP must be enabled",
+                    );
+                    return;
+                }
+                if (proto === "tcp") {
+                    settings.tcpEnable = checked;
+                } else {
+                    settings.udpEnable = checked;
+                }
+            },
+            ovpnSetCipherMode(mode) {
+                const settings = inModal.inbound.settings;
+                settings.cipherMode = mode;
+                const preset = Inbound.OpenvpnSettings.CIPHER_MODES[mode];
+                if (preset) {
+                    settings.ciphers = preset.slice();
+                }
+            },
+            ovpnToggleCipher(cipher, checked) {
+                const settings = inModal.inbound.settings;
+                if (
+                    !checked &&
+                    settings.ciphers.length === 1 &&
+                    settings.ciphers[0] === cipher
+                ) {
+                    this.$message.warning(
+                        "At least one cipher must be selected",
+                    );
+                    return;
+                }
+                const selected = new Set(settings.ciphers);
+                if (checked) {
+                    selected.add(cipher);
+                } else {
+                    selected.delete(cipher);
+                }
+                // Keep the list in ALL_CIPHERS order — it is the data-ciphers
+                // preference order and what detectCipherMode compares against.
+                settings.ciphers = Inbound.OpenvpnSettings.ALL_CIPHERS.filter(
+                    (c) => selected.has(c),
+                );
+                settings.cipherMode = Inbound.OpenvpnSettings.detectCipherMode(
+                    settings.ciphers,
+                );
+            },
             async generateOpenVpnCerts() {
                 inModal.loading(true);
                 // With a saved inbound, persist to it; otherwise generate for the
@@ -383,10 +472,48 @@
                     inModal.inbound.settings.tlsCrypt = obj.tlsCrypt;
                 }
             },
-            downloadOvpn(proto) {
-                if (!inModal.inbound.id) return;
-                const url = '/panel/api/inbounds/' + inModal.inbound.id + '/ovpn/' + proto;
-                window.open(basePath.replace(/\/$/, '') + url, '_blank');
+            async downloadOvpn(proto) {
+                const inbound = inModal.inbound;
+                const dbInbound = inModal.dbInbound;
+                if (!inbound.id) return;
+                // The export endpoint reads the SAVED inbound from the DB, so any
+                // unsaved edits in this dialog (ciphers, external proxy, ports, DNS…)
+                // would be missing from the downloaded profile. Persist the current
+                // form first, then download, so the .ovpn always matches the screen.
+                inModal.loading(true);
+                try {
+                    const data = {
+                        up: dbInbound.up,
+                        down: dbInbound.down,
+                        total: dbInbound.total,
+                        remark: dbInbound.remark,
+                        enable: dbInbound.enable,
+                        expiryTime: dbInbound.expiryTime,
+                        trafficReset: dbInbound.trafficReset,
+                        lastTrafficResetTime: dbInbound.lastTrafficResetTime,
+                        listen: inbound.listen,
+                        port: inbound.port,
+                        protocol: inbound.protocol,
+                        settings: inbound.settings.toString(),
+                        sniffing: inbound.sniffing.toString(),
+                    };
+                    const formData = new FormData();
+                    Object.keys(data).forEach((key) => formData.append(key, data[key]));
+                    const msg = await HttpUtil.post(
+                        `/panel/api/inbounds/update/${inbound.id}`,
+                        formData,
+                    );
+                    if (!msg || !msg.success) return;
+                    // Refresh the table so its export buttons and settings reflect
+                    // the just-saved state too (fire and forget).
+                    if (typeof app !== 'undefined' && app.getDBInbounds) {
+                        app.getDBInbounds();
+                    }
+                    const url = '/panel/api/inbounds/' + inbound.id + '/ovpn/' + proto;
+                    window.open(basePath.replace(/\/$/, '') + url, '_blank');
+                } finally {
+                    inModal.loading(false);
+                }
             }
         },
     });

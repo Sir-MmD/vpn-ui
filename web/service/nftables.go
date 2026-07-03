@@ -7,14 +7,92 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/xray"
 )
 
 const nftConfigFile = "/etc/x-ui/vpn.nft"
 
+// vpnAddrSpace is the covering /14 for the four protocol /16s VPN clients live in
+// (10.0/16 L2TP, 10.1 PPTP, 10.2/10.3 OpenVPN — see vpnrange.go). Trusting the
+// whole /14 in firewalld covers every current and future auto-expanded /24.
+const vpnAddrSpace = "10.0.0.0/14"
+
 // NftService manages nftables rules for L2TP, PPTP, and OpenVPN traffic accounting, TPROXY, and NAT.
 type NftService struct{}
+
+// firewalldRunning reports whether firewalld is installed and active.
+func firewalldRunning() bool {
+	if !commandExists("firewall-cmd") {
+		return false
+	}
+	out, _ := exec.Command("firewall-cmd", "--state").CombinedOutput()
+	return strings.TrimSpace(string(out)) == "running"
+}
+
+// ensureVpnHostNetworking relaxes the two host-level packet-filtering defaults
+// that silently break VPN routing on Fedora/RHEL but not on Debian/Ubuntu — the
+// reason "the VPN connects but has no internet" there:
+//
+//   - rp_filter: Fedora ships net.ipv4.conf.all.rp_filter=1 (strict), which drops
+//     the policy-routed (fwmark → table 100) TPROXY packets on their way to the
+//     Xray socket. Ubuntu defaults to loose (2); we set loose here too.
+//   - firewalld: active by default on Fedora with an INPUT policy that rejects
+//     everything but the explicitly opened service ports. TPROXY delivers each
+//     client packet to a LOCAL socket while it still carries the client's
+//     ORIGINAL destination port (e.g. 443), so firewalld's filter_INPUT drops it
+//     before Xray ever sees it — control-plane auth (over the opened L2TP/PPTP/
+//     OpenVPN ports) succeeds, but no data flows. Trusting the VPN source space
+//     makes firewalld accept the TPROXY'd data plane.
+//
+// Idempotent and cheap; a no-op on hosts without an active firewalld.
+func ensureVpnHostNetworking() {
+	// rp_filter → loose. `all` is the effective-max override; set `default` too so
+	// PPP/tun interfaces created later inherit loose rather than strict.
+	for _, key := range []string{"net.ipv4.conf.all.rp_filter", "net.ipv4.conf.default.rp_filter"} {
+		_ = exec.Command("sysctl", "-w", key+"=2").Run()
+	}
+
+	if !firewalldRunning() {
+		return
+	}
+	// Only add the trusted source when it isn't already there. Add it to both the
+	// runtime and permanent configs so no `firewall-cmd --reload` (which would drop
+	// other runtime-only state) is needed.
+	out, _ := exec.Command("firewall-cmd", "--zone=trusted", "--query-source="+vpnAddrSpace).CombinedOutput()
+	if strings.TrimSpace(string(out)) == "yes" {
+		return
+	}
+	if err := exec.Command("firewall-cmd", "--zone=trusted", "--add-source="+vpnAddrSpace).Run(); err != nil {
+		logger.Warningf("firewalld: failed to trust VPN space %s: %v", vpnAddrSpace, err)
+		return
+	}
+	_ = exec.Command("firewall-cmd", "--permanent", "--zone=trusted", "--add-source="+vpnAddrSpace).Run()
+	logger.Infof("firewalld: trusted VPN space %s so the TPROXY data plane reaches Xray", vpnAddrSpace)
+}
+
+// writeClientToClientRules emits the inter-client (client-to-client) rules for a
+// VPN inbound's client subnet(s), placed BEFORE its TPROXY rules so they take
+// effect first. Traffic where BOTH src and dst are client IPs is:
+//   - accepted (kernel forwards it straight to the peer) when the toggle is ON;
+//   - dropped when OFF — otherwise it would be TPROXY'd to Xray, whose direct
+//     outbound would still deliver it to the other client (both live on the
+//     server's tun), making the toggle a no-op.
+//
+// Multiple subnets (OpenVPN UDP+TCP) get every src/dst pair so cross-transport
+// client-to-client is covered too.
+func writeClientToClientRules(b *strings.Builder, subnets []string, enabled bool) {
+	verdict := "drop"
+	if enabled {
+		verdict = "accept"
+	}
+	for _, src := range subnets {
+		for _, dst := range subnets {
+			b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s ip daddr %s %s\n", src, dst, verdict))
+		}
+	}
+}
 
 // ApplyNftRules regenerates and atomically loads the nftables config for all VPN inbounds.
 // Static chains (prerouting/postrouting/input) are flushed and rebuilt.
@@ -45,6 +123,11 @@ func (s *NftService) ApplyNftRules() error {
 		return nil
 	}
 
+	// VPN is active — make sure the host's rp_filter/firewalld defaults don't
+	// silently drop the TPROXY'd data plane (the Fedora/RHEL "connects but no
+	// internet" failure). No-op on Debian/Ubuntu.
+	ensureVpnHostNetworking()
+
 	var b strings.Builder
 
 	// Create table and chains (idempotent — 'add' doesn't error if they already exist)
@@ -69,16 +152,82 @@ func (s *NftService) ApplyNftRules() error {
 	b.WriteString("add rule ip vpn postrouting jump pptp_acct\n")
 	b.WriteString("add rule ip vpn postrouting jump openvpn_acct\n")
 
+	// --- Cross-inbound pass (mutual opt-in) --------------------------------
+	// Gather every enabled VPN inbound's client subnet(s) plus its Client-to-
+	// Client / Cross-Inbound toggles, then allow forwarding between any two
+	// DIFFERENT inbounds that BOTH opted in (Cross Inbound requires Client to
+	// Client). These accepts sit before the TPROXY rules, so cross-inbound
+	// traffic is kernel-forwarded straight to the peer instead of being
+	// redirected into Xray (which would apply the peer's routing/outbounds).
+	type vpnNet struct {
+		subnets []string // CIDRs, e.g. "10.0.5.0/24"
+		c2c     bool
+		cross   bool
+	}
+	var allNets []vpnNet
+	for _, inbound := range l2tpInbounds {
+		if !inbound.Enable {
+			continue
+		}
+		st, err := l2tp.parseSettings(inbound)
+		if err != nil {
+			continue
+		}
+		allNets = append(allNets, vpnNet{subnets: subnetCIDRs(l2tp.GetSubnetsForInbound(inbound)), c2c: st.ClientToClient, cross: st.CrossInbound})
+	}
+	for _, inbound := range pptpInbounds {
+		if !inbound.Enable {
+			continue
+		}
+		st, err := pptp.parseSettings(inbound)
+		if err != nil {
+			continue
+		}
+		allNets = append(allNets, vpnNet{subnets: subnetCIDRs(pptp.GetSubnetsForInbound(inbound)), c2c: st.ClientToClient, cross: st.CrossInbound})
+	}
+	for _, inbound := range ovpnInbounds {
+		if !inbound.Enable {
+			continue
+		}
+		st, err := ovpn.parseSettings(inbound)
+		if err != nil {
+			continue
+		}
+		allNets = append(allNets, vpnNet{subnets: ovpnCIDRs(inbound, st), c2c: st.ClientToClient, cross: st.CrossInbound})
+	}
+	for ai, a := range allNets {
+		if !a.cross || !a.c2c {
+			continue
+		}
+		for bi, bnet := range allNets {
+			if ai == bi || !bnet.cross || !bnet.c2c {
+				continue
+			}
+			for _, sa := range a.subnets {
+				for _, dst := range bnet.subnets {
+					b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s ip daddr %s accept\n", sa, dst))
+				}
+			}
+		}
+	}
+
 	// L2TP TPROXY rules
 	for _, inbound := range l2tpInbounds {
 		if !inbound.Enable {
 			continue
 		}
-		subnet := l2tp.GetSubnetForInbound(inbound)
 		port := l2tp.GetTproxyPort(inbound)
-		src := fmt.Sprintf("%s.0/24", subnet)
-		b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol tcp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
-		b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol udp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
+		// Client-to-client gate (accept when on, drop when off) before TPROXY.
+		c2c := false
+		if settings, err := l2tp.parseSettings(inbound); err == nil {
+			c2c = settings.ClientToClient
+		}
+		srcs := subnetCIDRs(l2tp.GetSubnetsForInbound(inbound))
+		writeClientToClientRules(&b, srcs, c2c)
+		for _, src := range srcs {
+			b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol tcp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
+			b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol udp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
+		}
 	}
 
 	// PPTP TPROXY rules
@@ -86,11 +235,17 @@ func (s *NftService) ApplyNftRules() error {
 		if !inbound.Enable {
 			continue
 		}
-		subnet := pptp.GetSubnetForInbound(inbound)
 		port := pptp.GetTproxyPort(inbound)
-		src := fmt.Sprintf("%s.0/24", subnet)
-		b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol tcp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
-		b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol udp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
+		c2c := false
+		if settings, err := pptp.parseSettings(inbound); err == nil {
+			c2c = settings.ClientToClient
+		}
+		srcs := subnetCIDRs(pptp.GetSubnetsForInbound(inbound))
+		writeClientToClientRules(&b, srcs, c2c)
+		for _, src := range srcs {
+			b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol tcp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
+			b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol udp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
+		}
 	}
 
 	// Raw L2TP filter: block non-IPsec L2TP when ipsecEnable && !allowRaw
@@ -125,13 +280,13 @@ func (s *NftService) ApplyNftRules() error {
 			continue
 		}
 		port := ovpn.GetTproxyPort(inbound)
-		var srcs []string
-		if settings.udpEnabled() {
-			srcs = append(srcs, fmt.Sprintf("%s.0/24", ovpnSubnet(inbound.Id, "udp")))
-		}
-		if settings.tcpEnabled() {
-			srcs = append(srcs, fmt.Sprintf("%s.0/24", ovpnSubnet(inbound.Id, "tcp")))
-		}
+		srcs := ovpnCIDRs(inbound, settings)
+		// Client-to-client gate before TPROXY. OpenVPN's own `client-to-client`
+		// directive only routes within one transport's instance, so these rules
+		// also cover UDP<->TCP peers and, crucially, DROP inter-client traffic
+		// when the toggle is off (the directive alone can't, since Xray would
+		// still bridge the two clients).
+		writeClientToClientRules(&b, srcs, settings.ClientToClient)
 		for _, src := range srcs {
 			b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol tcp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
 			b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s meta mark != 0xff ip protocol udp tproxy to :%d meta mark set mark or 0x1 accept\n", src, port))
@@ -383,6 +538,30 @@ func (s *NftService) CleanupLegacyIptables() {
 	}
 
 	logger.Info("nft: cleaned up legacy iptables rules")
+}
+
+// subnetCIDRs turns "10.0.5" /24 prefixes into "10.0.5.0/24" CIDR strings.
+func subnetCIDRs(subnets []string) []string {
+	out := make([]string, 0, len(subnets))
+	for _, p := range subnets {
+		out = append(out, p+".0/24")
+	}
+	return out
+}
+
+// ovpnCIDRs returns the block CIDR(s) for an OpenVPN inbound's enabled
+// transports (UDP => 10.2.x, TCP => 10.3.x).
+func ovpnCIDRs(inbound *model.Inbound, settings *openvpnSettings) []string {
+	var out []string
+	if settings.udpEnabled() {
+		n, p := ovpnBlockFor(inbound, settings, "udp")
+		out = append(out, fmt.Sprintf("%s/%d", n.String(), p))
+	}
+	if settings.tcpEnabled() {
+		n, p := ovpnBlockFor(inbound, settings, "tcp")
+		out = append(out, fmt.Sprintf("%s/%d", n.String(), p))
+	}
+	return out
 }
 
 func (s *NftService) runCmd(name string, args ...string) error {

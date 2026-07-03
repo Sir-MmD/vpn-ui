@@ -26,15 +26,18 @@ type L2tpService struct {
 
 // l2tpSettings represents the L2TP-specific settings stored in the inbound's Settings JSON.
 type l2tpSettings struct {
-	IpsecEnable bool         `json:"ipsecEnable"`
-	IpsecPsk    string       `json:"ipsecPsk"`
-	AllowRaw    bool         `json:"allowRaw"`
-	IpRange     string       `json:"ipRange"`
-	LocalIp     string       `json:"localIp"`
-	Dns1        string       `json:"dns1"`
-	Dns2        string       `json:"dns2"`
-	Mtu         int          `json:"mtu"`
-	Clients     []l2tpClient `json:"clients"`
+	IpsecEnable    bool         `json:"ipsecEnable"`
+	IpsecPsk       string       `json:"ipsecPsk"`
+	AllowRaw       bool         `json:"allowRaw"`
+	ClientToClient bool         `json:"clientToClient"`
+	CrossInbound   bool         `json:"crossInbound"`
+	IpRanges       []string     `json:"ipRanges"`
+	IpRange        string       `json:"ipRange"` // legacy single-range field (read-only fallback)
+	LocalIp        string       `json:"localIp"`
+	Dns1           string       `json:"dns1"`
+	Dns2           string       `json:"dns2"`
+	Mtu            int          `json:"mtu"`
+	Clients        []l2tpClient `json:"clients"`
 }
 
 type l2tpClient struct {
@@ -77,19 +80,32 @@ func (s *L2tpService) parseSettings(inbound *model.Inbound) (*l2tpSettings, erro
 	return settings, nil
 }
 
-// GetSubnetForInbound extracts the /24 subnet from the inbound's localIp setting.
-// Falls back to a deterministic 10.0.x.0/24 subnet if localIp is not set.
-func (s *L2tpService) GetSubnetForInbound(inbound *model.Inbound) string {
-	settings, err := s.parseSettings(inbound)
-	if err == nil && settings.LocalIp != "" {
-		// Extract first 3 octets from localIp (e.g., "10.0.2.1" -> "10.0.2")
-		parts := strings.Split(settings.LocalIp, ".")
-		if len(parts) == 4 {
-			return fmt.Sprintf("%s.%s.%s", parts[0], parts[1], parts[2])
+// effectiveRanges returns the inbound's configured IP ranges, seeding from the
+// legacy single ipRange field when the ipRanges list is empty.
+func (o *l2tpSettings) effectiveRanges() []string {
+	if len(o.IpRanges) > 0 {
+		return o.IpRanges
+	}
+	if o.IpRange != "" {
+		return []string{o.IpRange}
+	}
+	return nil
+}
+
+// GetSubnetsForInbound returns every /24 prefix ("10.0.x") the inbound's client
+// ranges cover. Falls back to the legacy id-derived /24 when nothing is stored.
+func (s *L2tpService) GetSubnetsForInbound(inbound *model.Inbound) []string {
+	if settings, err := s.parseSettings(inbound); err == nil {
+		if subs := subnetsOf(settings.effectiveRanges()); len(subs) > 0 {
+			return subs
 		}
 	}
-	octet := 2 + (inbound.Id % 250)
-	return fmt.Sprintf("10.0.%d", octet)
+	return []string{fmt.Sprintf("10.0.%d", inbound.Id)}
+}
+
+// GetSubnetForInbound returns the inbound's first /24 subnet (legacy callers).
+func (s *L2tpService) GetSubnetForInbound(inbound *model.Inbound) string {
+	return s.GetSubnetsForInbound(inbound)[0]
 }
 
 // GetTproxyPort returns a deterministic TPROXY port for the given inbound.
@@ -161,18 +177,24 @@ func (s *L2tpService) GenerateXl2tpdConfig(inbounds []*model.Inbound) error {
 			continue
 		}
 
-		subnet := s.GetSubnetForInbound(inbound)
-		ipRange := settings.IpRange
-		if ipRange == "" {
-			ipRange = fmt.Sprintf("%s.10-%s.50", subnet, subnet)
+		ranges := settings.effectiveRanges()
+		if len(ranges) == 0 {
+			subnet := s.GetSubnetForInbound(inbound)
+			ranges = []string{defaultRange(subnet)}
 		}
+		// The PPP gateway (local ip) is the first range's .1; per-link /32
+		// point-to-point addressing means one gateway serves all client /24s.
 		localIp := settings.LocalIp
-		if localIp == "" {
-			localIp = fmt.Sprintf("%s.1", subnet)
+		if start, _, ok := parseRange(ranges[0]); ok {
+			localIp = fmt.Sprintf("%d.%d.%d.1", start[0], start[1], start[2])
 		}
 
 		b.WriteString("[lns default]\n")
-		b.WriteString(fmt.Sprintf("ip range = %s\n", ipRange))
+		// xl2tpd accepts multiple `ip range` lines; each range's client IP is then
+		// pinned deterministically by RADIUS (Framed-IP-Address).
+		for _, r := range ranges {
+			b.WriteString(fmt.Sprintf("ip range = %s\n", r))
+		}
 		b.WriteString(fmt.Sprintf("local ip = %s\n", localIp))
 		b.WriteString("require authentication = yes\n")
 		b.WriteString(fmt.Sprintf("name = l2tp-%d\n", inbound.Id))
@@ -355,23 +377,29 @@ func (s *L2tpService) SetupAllTproxy() error {
 	return s.nftService.ApplyNftRules()
 }
 
-// RestartServices restarts xl2tpd and optionally ipsec.
+// RestartServices (re)launches xl2tpd as a panel-managed child process and, when
+// any inbound needs it, restarts the host's IPsec (libreswan) service.
 func (s *L2tpService) RestartServices() error {
+	migrateFromSystemd()
+
 	inbounds, err := s.GetL2tpInbounds()
 	if err != nil {
 		return err
 	}
 
 	if len(inbounds) == 0 {
+		procMgr.Stop("xl2tpd")
 		return nil
 	}
 
-	// Restart xl2tpd
-	if err := s.runCmd("systemctl", "restart", "xl2tpd"); err != nil {
-		logger.Warning("L2TP: failed to restart xl2tpd:", err)
+	// xl2tpd -D runs in the foreground reading /etc/xl2tpd/xl2tpd.conf; the panel
+	// supervises it and reaps its pppd children.
+	os.MkdirAll("/var/run/xl2tpd", 0755)
+	if err := procMgr.Start("xl2tpd", daemonBin("xl2tpd"), []string{"-D"}, pppdEnv(), ""); err != nil {
+		logger.Warning("L2TP: failed to start xl2tpd:", err)
 	}
 
-	// Check if any inbound has IPsec enabled
+	// IPsec (libreswan) remains a host service — it is not a bundled daemon.
 	for _, inbound := range inbounds {
 		settings, err := s.parseSettings(inbound)
 		if err != nil {
@@ -387,6 +415,11 @@ func (s *L2tpService) RestartServices() error {
 	}
 
 	return nil
+}
+
+// StopServices stops the L2TP (xl2tpd) child process.
+func (s *L2tpService) StopServices() {
+	procMgr.Stop("xl2tpd")
 }
 
 // InitL2tp initializes L2TP services on panel startup.

@@ -25,7 +25,9 @@ func (a *CoreController) initRouter(g *gin.RouterGroup) {
 	g.GET("/status", a.status)
 	g.POST("/provision", a.provision)
 	g.POST("/restart/:core", a.restart)
+	g.POST("/restart-all", a.restartAll)
 	g.POST("/stop/:core", a.stop)
+	g.GET("/logs/:core", a.logs)
 }
 
 // status returns the status of all cores plus the host/kernel system status.
@@ -48,8 +50,19 @@ func (a *CoreController) restart(c *gin.Context) {
 	jsonMsg(c, I18nWeb(c, "pages.core.toasts.restarted"), err)
 }
 
-// stop stops the given core, where supported (xray, openvpn).
+// restartAll restarts every core.
+func (a *CoreController) restartAll(c *gin.Context) {
+	err := a.coreService.RestartAll()
+	jsonMsg(c, I18nWeb(c, "pages.core.toasts.restarted"), err)
+}
+
+// stop stops the given core, where supported (xray, l2tp, pptp, openvpn, radius).
 func (a *CoreController) stop(c *gin.Context) {
 	err := a.coreService.StopCore(c.Param("core"))
 	jsonMsg(c, I18nWeb(c, "pages.core.toasts.stopped"), err)
+}
+
+// logs returns the recent captured output for a core's process(es).
+func (a *CoreController) logs(c *gin.Context) {
+	jsonObj(c, a.coreService.CoreLogs(c.Param("core")), nil)
 }

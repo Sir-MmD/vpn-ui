@@ -43,10 +43,22 @@ type radiusSession struct {
 	protocol string // "l2tp", "pptp", or "openvpn"
 }
 
+// runningRadius points at the RadiusService whose servers are currently bound.
+// The embedded RADIUS server lives in-process (not a child daemon), so the Core
+// Settings restart/stop controls act on this instance rather than a PID.
+var runningRadius *RadiusService
+
 // Start launches the RADIUS auth (1812) and accounting (1813) servers on localhost.
 func (s *RadiusService) Start(secret string) error {
-	s.secret = []byte(secret)
 	s.sessions = make(map[string]*radiusSession)
+	return s.listen(secret)
+}
+
+// listen (re)creates and serves the auth/acct packet servers. It does NOT touch
+// the sessions map, so a restart preserves active-session tracking (the map is
+// shared by reference with the L2TP/PPTP/OpenVPN services).
+func (s *RadiusService) listen(secret string) error {
+	s.secret = []byte(secret)
 
 	s.authServer = &radius.PacketServer{
 		Addr:         "127.0.0.1:1812",
@@ -70,6 +82,7 @@ func (s *RadiusService) Start(secret string) error {
 		}
 	}()
 
+	runningRadius = s
 	logger.Info("RADIUS: listening on 127.0.0.1:1812 (auth) and :1813 (acct)")
 	return nil
 }
@@ -80,10 +93,42 @@ func (s *RadiusService) Stop() {
 	defer cancel()
 	if s.authServer != nil {
 		s.authServer.Shutdown(ctx)
+		s.authServer = nil
 	}
 	if s.acctServer != nil {
 		s.acctServer.Shutdown(ctx)
+		s.acctServer = nil
 	}
+}
+
+// StopRadius stops the embedded RADIUS servers. Exported for the Core Settings
+// "Stop" control. Note: this halts L2TP/PPTP/OpenVPN authentication until a
+// restart, so it is a deliberate, admin-triggered action.
+func StopRadius() error {
+	if runningRadius == nil {
+		return fmt.Errorf("RADIUS server is not running")
+	}
+	runningRadius.Stop()
+	logger.Info("RADIUS: stopped")
+	return nil
+}
+
+// RestartRadius restarts the embedded RADIUS servers, picking up the current
+// shared secret from settings. The in-memory session map is preserved.
+func RestartRadius() error {
+	if runningRadius == nil {
+		return fmt.Errorf("RADIUS server is not running")
+	}
+	var settingService SettingService
+	secret, _ := settingService.GetRadiusSecret()
+	if secret == "" {
+		secret = string(runningRadius.secret)
+	}
+	runningRadius.Stop()
+	if runningRadius.sessions == nil {
+		runningRadius.sessions = make(map[string]*radiusSession)
+	}
+	return runningRadius.listen(secret)
 }
 
 // handleAuth processes RADIUS Access-Request packets with MS-CHAPv2 authentication.
@@ -519,9 +564,10 @@ func (s *RadiusService) getClientIP(protocol string, inboundId int, username str
 		ID string `json:"id"`
 	}
 	type settingsJSON struct {
-		IpRange string        `json:"ipRange"`
-		LocalIp string        `json:"localIp"`
-		Clients []clientEntry `json:"clients"`
+		IpRanges []string      `json:"ipRanges"`
+		IpRange  string        `json:"ipRange"`
+		LocalIp  string        `json:"localIp"`
+		Clients  []clientEntry `json:"clients"`
 	}
 
 	var settings settingsJSON
@@ -540,53 +586,39 @@ func (s *RadiusService) getClientIP(protocol string, inboundId int, username str
 		return nil
 	}
 
-	return computeVpnClientIP(settings.IpRange, settings.LocalIp, inbound.Id, clientIndex, protocol)
+	ranges := settings.IpRanges
+	if len(ranges) == 0 && settings.IpRange != "" {
+		ranges = []string{settings.IpRange}
+	}
+	return computeVpnClientIP(ranges, inbound.Id, clientIndex, protocol)
 }
 
-// computeVpnClientIP computes a deterministic IP for a VPN client based on their
-// index in the client list. The IP is derived from the start of the IP range.
-func computeVpnClientIP(ipRange, localIp string, inboundId, clientIndex int, protocol string) net.IP {
-	if ipRange == "" {
-		subnet := vpnSubnet(localIp, inboundId, protocol)
-		ipRange = fmt.Sprintf("%s.10-%s.50", subnet, subnet)
+// computeVpnClientIP computes the deterministic IP for the L2TP/PPTP client at
+// the given index by walking the inbound's ranges in order: the client lives in
+// the range whose cumulative capacity first exceeds the index. Returns nil only
+// when the index exceeds the total capacity of every range (the normalizer keeps
+// capacity ahead of the client count so this should not happen in practice).
+func computeVpnClientIP(ranges []string, inboundId, clientIndex int, protocol string) net.IP {
+	if len(ranges) == 0 {
+		ranges = []string{defaultRange(fmt.Sprintf("10.%d.%d", protocolBase(protocol), inboundId))}
 	}
 
-	parts := strings.SplitN(ipRange, "-", 2)
-	startIP := net.ParseIP(strings.TrimSpace(parts[0])).To4()
-	if startIP == nil {
-		return nil
-	}
-
-	// Check bounds against end IP
-	if len(parts) == 2 {
-		endIP := net.ParseIP(strings.TrimSpace(parts[1])).To4()
-		if endIP != nil {
-			maxClients := int(endIP[3]) - int(startIP[3]) + 1
-			if clientIndex >= maxClients {
-				return nil
-			}
+	remaining := clientIndex
+	for _, r := range ranges {
+		start, end, ok := parseRange(r)
+		if !ok {
+			continue
 		}
-	}
-
-	ip := make(net.IP, 4)
-	copy(ip, startIP)
-	ip[3] += byte(clientIndex)
-	return ip
-}
-
-// vpnSubnet returns the /24 subnet prefix for a VPN inbound.
-func vpnSubnet(localIp string, inboundId int, protocol string) string {
-	if localIp != "" {
-		parts := strings.Split(localIp, ".")
-		if len(parts) >= 3 {
-			return strings.Join(parts[:3], ".")
+		capacity := int(end[3]) - int(start[3]) + 1
+		if remaining < capacity {
+			ip := make(net.IP, 4)
+			copy(ip, start)
+			ip[3] += byte(remaining)
+			return ip
 		}
+		remaining -= capacity
 	}
-	prefix := 0
-	if protocol == "pptp" {
-		prefix = 1
-	}
-	return fmt.Sprintf("10.%d.%d", prefix, inboundId)
+	return nil
 }
 
 // BuildVpnEmailToIPMap returns a map of email → deterministic tunnel IP(s) for all
@@ -610,9 +642,9 @@ func BuildVpnEmailToIPMap() map[string][]string {
 	db.Where("protocol IN ? AND enable = ?", []string{"l2tp", "pptp"}, true).Find(&pppInbounds)
 
 	type pppSettingsJSON struct {
-		IpRange string        `json:"ipRange"`
-		LocalIp string        `json:"localIp"`
-		Clients []clientEntry `json:"clients"`
+		IpRanges []string      `json:"ipRanges"`
+		IpRange  string        `json:"ipRange"`
+		Clients  []clientEntry `json:"clients"`
 	}
 
 	for _, inbound := range pppInbounds {
@@ -620,45 +652,51 @@ func BuildVpnEmailToIPMap() map[string][]string {
 		if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
 			continue
 		}
+		ranges := settings.IpRanges
+		if len(ranges) == 0 && settings.IpRange != "" {
+			ranges = []string{settings.IpRange}
+		}
 		for i, client := range settings.Clients {
 			if client.Email == "" {
 				continue
 			}
-			ip := computeVpnClientIP(settings.IpRange, settings.LocalIp, inbound.Id, i, string(inbound.Protocol))
+			ip := computeVpnClientIP(ranges, inbound.Id, i, string(inbound.Protocol))
 			if ip != nil {
 				result[client.Email] = append(result[client.Email], ip.String())
 			}
 		}
 	}
 
-	// --- OpenVPN: one deterministic CCD IP per enabled transport subnet ---
+	// --- OpenVPN: one deterministic CCD IP per enabled transport block ---
 	var ovpnInbounds []*model.Inbound
 	db.Where("protocol = ? AND enable = ?", "openvpn", true).Find(&ovpnInbounds)
 
-	type ovpnSettingsJSON struct {
-		UdpEnable *bool         `json:"udpEnable"`
-		TcpEnable *bool         `json:"tcpEnable"`
-		Clients   []clientEntry `json:"clients"`
-	}
-
 	for _, inbound := range ovpnInbounds {
-		var settings ovpnSettingsJSON
+		var settings openvpnSettings
 		if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
 			continue
 		}
-		udpOn := settings.UdpEnable == nil || *settings.UdpEnable
-		tcpOn := settings.TcpEnable == nil || *settings.TcpEnable
+		udpOn := settings.udpEnabled()
+		tcpOn := settings.tcpEnabled()
+		var udpNet, tcpNet net.IP
+		var udpPrefix, tcpPrefix int
+		if udpOn {
+			udpNet, udpPrefix = ovpnBlockFor(inbound, &settings, "udp")
+		}
+		if tcpOn {
+			tcpNet, tcpPrefix = ovpnBlockFor(inbound, &settings, "tcp")
+		}
 		for i, client := range settings.Clients {
 			if client.Email == "" {
 				continue
 			}
 			if udpOn {
-				if ip := ovpnClientIP(inbound.Id, i, "udp"); ip != "" {
+				if ip := ovpnBlockClientIP(udpNet, udpPrefix, i); ip != "" {
 					result[client.Email] = append(result[client.Email], ip)
 				}
 			}
 			if tcpOn {
-				if ip := ovpnClientIP(inbound.Id, i, "tcp"); ip != "" {
+				if ip := ovpnBlockClientIP(tcpNet, tcpPrefix, i); ip != "" {
 					result[client.Email] = append(result[client.Email], ip)
 				}
 			}

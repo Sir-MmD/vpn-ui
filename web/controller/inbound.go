@@ -17,11 +17,11 @@ import (
 
 // InboundController handles HTTP requests related to Xray inbounds management.
 type InboundController struct {
-	inboundService  service.InboundService
-	xrayService     service.XrayService
-	l2tpService     service.L2tpService
-	pptpService     service.PptpService
-	openvpnService  service.OpenVpnService
+	inboundService service.InboundService
+	xrayService    service.XrayService
+	l2tpService    service.L2tpService
+	pptpService    service.PptpService
+	openvpnService service.OpenVpnService
 }
 
 // NewInboundController creates a new InboundController and sets up its routes.
@@ -65,6 +65,7 @@ func (a *InboundController) initRouter(g *gin.RouterGroup) {
 
 // onL2tpChanged regenerates L2TP configs and restarts services when an L2TP inbound is modified.
 func (a *InboundController) onL2tpChanged() {
+	service.AutoExpandVpnRanges("l2tp")
 	if err := a.l2tpService.GenerateAllConfigs(); err != nil {
 		logger.Warning("L2TP: config generation failed:", err)
 	}
@@ -80,6 +81,7 @@ func (a *InboundController) onL2tpChanged() {
 
 // onPptpChanged regenerates PPTP configs and restarts services when a PPTP inbound is modified.
 func (a *InboundController) onPptpChanged() {
+	service.AutoExpandVpnRanges("pptp")
 	if err := a.pptpService.GenerateAllConfigs(); err != nil {
 		logger.Warning("PPTP: config generation failed:", err)
 	}
@@ -95,6 +97,7 @@ func (a *InboundController) onPptpChanged() {
 
 // onOpenVpnChanged regenerates OpenVPN configs and restarts services when an OpenVPN inbound is modified.
 func (a *InboundController) onOpenVpnChanged() {
+	service.AutoExpandVpnRanges("openvpn")
 	if err := a.openvpnService.GenerateAllConfigs(); err != nil {
 		logger.Warning("OpenVPN: config generation failed:", err)
 	}
@@ -180,6 +183,13 @@ func (a *InboundController) addInbound(c *gin.Context) {
 		inbound.Tag = fmt.Sprintf("inbound-%v:%v", inbound.Listen, inbound.Port)
 	}
 
+	// Assign/validate VPN client IP ranges (no-op for non-VPN protocols). A
+	// user-supplied range overlapping another inbound is rejected here.
+	if err := service.NormalizeVpnRanges(inbound, 0); err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+
 	inbound, needRestart, err := a.inboundService.AddInbound(inbound)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
@@ -246,6 +256,12 @@ func (a *InboundController) updateInbound(c *gin.Context) {
 	err = c.ShouldBind(inbound)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), err)
+		return
+	}
+	// Assign/validate VPN client IP ranges (no-op for non-VPN protocols),
+	// excluding this inbound so its own ranges aren't seen as overlaps.
+	if err := service.NormalizeVpnRanges(inbound, id); err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
 	inbound, needRestart, err := a.inboundService.UpdateInbound(inbound)

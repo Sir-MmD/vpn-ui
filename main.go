@@ -34,10 +34,10 @@ import (
 	"layeh.com/radius/rfc2866"
 )
 
-// runWebServer initializes and starts the web server for the 3x-ui panel.
-func runWebServer() {
-	log.Printf("Starting %v %v", config.GetName(), config.GetVersion())
-
+// initLogger initializes the logger at the configured level. It is shared by the
+// web server and by CLI subcommands (e.g. `setup`) that call into services which
+// log — without it those services dereference the package's nil logger and panic.
+func initLogger() {
 	switch config.GetLogLevel() {
 	case config.Debug:
 		logger.InitLogger(logging.DEBUG)
@@ -52,6 +52,13 @@ func runWebServer() {
 	default:
 		log.Fatalf("Unknown log level: %v", config.GetLogLevel())
 	}
+}
+
+// runWebServer initializes and starts the web server for the 3x-ui panel.
+func runWebServer() {
+	log.Printf("Starting %v %v", config.GetName(), config.GetVersion())
+
+	initLogger()
 
 	godotenv.Load()
 
@@ -624,6 +631,9 @@ func setupBackend() {
 		fmt.Println("setup must be run as root (or via sudo).")
 		os.Exit(1)
 	}
+	// Provision() and the services it calls log through the package logger, which
+	// is nil until initialized — do it here so `setup` doesn't panic.
+	initLogger()
 	var coreService service.CoreService
 	fmt.Println("Provisioning VPN backend (kernel modules, IP forwarding)...")
 	fmt.Println()

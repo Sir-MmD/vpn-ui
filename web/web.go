@@ -338,6 +338,10 @@ func (s *Server) startTask() {
 		}
 	})
 
+	// Ensure Xray keeps its per-VPN dokodemo ports bound (rebinds after a rare
+	// silent bind failure on restart, so L2TP/PPTP/OpenVPN internet self-heals)
+	s.cron.AddJob("@every 20s", job.NewCheckVpnDokodemoJob())
+
 	go func() {
 		time.Sleep(time.Second * 5)
 		// Statistics every 10 seconds, start the delay for 5 seconds for the first time, and staggered with the time to restart xray
@@ -492,6 +496,9 @@ func (s *Server) Start() (err error) {
 // Stop gracefully shuts down the web server, stops Xray, RADIUS, cron jobs, and Telegram bot.
 func (s *Server) Stop() error {
 	s.cancel()
+	// Terminate the supervised VPN daemons (openvpn/xl2tpd/pptpd) so they die
+	// with the panel rather than orphaning.
+	service.GetProcManager().StopAll()
 	s.radiusService.Stop()
 	s.xrayService.StopXray()
 	if s.cron != nil {

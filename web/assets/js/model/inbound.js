@@ -2907,8 +2907,9 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
     ipsecEnable = true,
     ipsecPsk = RandomUtil.randomSeq(16),
     allowRaw = false,
-    ipRange = "10.0.2.10-10.0.2.50",
-    localIp = "10.0.2.1",
+    clientToClient = false,
+    crossInbound = false,
+    ipRanges = [],
     dns1 = "8.8.8.8",
     dns2 = "8.8.4.4",
     mtu = 1400,
@@ -2918,8 +2919,10 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
     this.ipsecEnable = ipsecEnable;
     this.ipsecPsk = ipsecPsk;
     this.allowRaw = allowRaw;
-    this.ipRange = ipRange;
-    this.localIp = localIp;
+    this.clientToClient = clientToClient;
+    this.crossInbound = crossInbound;
+    // List of client IP ranges; empty rows/list are auto-assigned by the panel.
+    this.ipRanges = ipRanges;
     this.dns1 = dns1;
     this.dns2 = dns2;
     this.mtu = mtu;
@@ -2927,13 +2930,17 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
   }
 
   static fromJson(json = {}) {
+    // Back-compat: seed the ipRanges list from a legacy single ipRange field.
+    let ipRanges = Array.isArray(json.ipRanges) ? json.ipRanges.slice() : [];
+    if (ipRanges.length === 0 && json.ipRange) ipRanges = [json.ipRange];
     return new Inbound.L2tpSettings(
       Protocols.L2TP,
       json.ipsecEnable ?? true,
       json.ipsecPsk,
       json.allowRaw ?? false,
-      json.ipRange ?? "10.0.2.10-10.0.2.50",
-      json.localIp ?? "10.0.2.1",
+      json.clientToClient ?? false,
+      json.crossInbound ?? false,
+      ipRanges,
       json.dns1 ?? "8.8.8.8",
       json.dns2 ?? "8.8.4.4",
       json.mtu ?? 1400,
@@ -2946,8 +2953,9 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
       ipsecEnable: this.ipsecEnable,
       ipsecPsk: this.ipsecPsk,
       allowRaw: this.allowRaw,
-      ipRange: this.ipRange,
-      localIp: this.localIp,
+      clientToClient: this.clientToClient,
+      crossInbound: this.crossInbound,
+      ipRanges: (this.ipRanges || []).filter((r) => r && r.trim() !== ""),
       dns1: this.dns1,
       dns2: this.dns2,
       mtu: this.mtu,
@@ -3062,16 +3070,19 @@ Inbound.L2tpSettings.L2tpUser = class extends XrayCommonClass {
 Inbound.PptpSettings = class extends Inbound.Settings {
   constructor(
     protocol,
-    ipRange = "10.1.2.10-10.1.2.50",
-    localIp = "10.1.2.1",
+    clientToClient = false,
+    crossInbound = false,
+    ipRanges = [],
     dns1 = "8.8.8.8",
     dns2 = "8.8.4.4",
     mtu = 1400,
     pptpUsers = [new Inbound.PptpSettings.PptpUser()],
   ) {
     super(protocol);
-    this.ipRange = ipRange;
-    this.localIp = localIp;
+    this.clientToClient = clientToClient;
+    this.crossInbound = crossInbound;
+    // List of client IP ranges; empty rows/list are auto-assigned by the panel.
+    this.ipRanges = ipRanges;
     this.dns1 = dns1;
     this.dns2 = dns2;
     this.mtu = mtu;
@@ -3079,10 +3090,14 @@ Inbound.PptpSettings = class extends Inbound.Settings {
   }
 
   static fromJson(json = {}) {
+    // Back-compat: seed the ipRanges list from a legacy single ipRange field.
+    let ipRanges = Array.isArray(json.ipRanges) ? json.ipRanges.slice() : [];
+    if (ipRanges.length === 0 && json.ipRange) ipRanges = [json.ipRange];
     return new Inbound.PptpSettings(
       Protocols.PPTP,
-      json.ipRange ?? "10.1.2.10-10.1.2.50",
-      json.localIp ?? "10.1.2.1",
+      json.clientToClient ?? false,
+      json.crossInbound ?? false,
+      ipRanges,
       json.dns1 ?? "8.8.8.8",
       json.dns2 ?? "8.8.4.4",
       json.mtu ?? 1400,
@@ -3092,8 +3107,9 @@ Inbound.PptpSettings = class extends Inbound.Settings {
 
   toJson() {
     return {
-      ipRange: this.ipRange,
-      localIp: this.localIp,
+      clientToClient: this.clientToClient,
+      crossInbound: this.crossInbound,
+      ipRanges: (this.ipRanges || []).filter((r) => r && r.trim() !== ""),
       dns1: this.dns1,
       dns2: this.dns2,
       mtu: this.mtu,
@@ -3220,6 +3236,12 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
     serverKey = "",
     tlsCrypt = "",
     openvpnUsers = [new Inbound.OpenvpnSettings.OpenvpnUser()],
+    externalProxy = [],
+    cipherMode = "new",
+    ciphers = Inbound.OpenvpnSettings.CIPHER_MODES.new.slice(),
+    clientToClient = false,
+    crossInbound = false,
+    ipRanges = [],
   ) {
     super(protocol);
     this.udpEnable = udpEnable;
@@ -3234,9 +3256,21 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
     this.serverKey = serverKey;
     this.tlsCrypt = tlsCrypt;
     this.openvpnUsers = openvpnUsers;
+    this.externalProxy = externalProxy;
+    this.cipherMode = cipherMode;
+    this.ciphers = ciphers;
+    this.clientToClient = clientToClient;
+    this.crossInbound = crossInbound;
+    // Panel-managed, auto-assigned block (UDP 10.2.x; TCP mirrors to 10.3.x).
+    // Shown read-only in the form; not user-editable (OpenVPN needs one
+    // contiguous `server` block per transport).
+    this.ipRanges = ipRanges;
   }
 
   static fromJson(json = {}) {
+    const ciphers = Array.isArray(json.ciphers)
+      ? json.ciphers.slice()
+      : Inbound.OpenvpnSettings.CIPHER_MODES.new.slice();
     return new Inbound.OpenvpnSettings(
       Protocols.OPENVPN,
       json.udpEnable ?? true,
@@ -3251,6 +3285,12 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
       json.serverKey ?? "",
       json.tlsCrypt ?? "",
       Inbound.OpenvpnSettings.OpenvpnUser.fromJson(json.clients),
+      Array.isArray(json.externalProxy) ? json.externalProxy : [],
+      json.cipherMode ?? Inbound.OpenvpnSettings.detectCipherMode(ciphers),
+      ciphers,
+      json.clientToClient ?? false,
+      json.crossInbound ?? false,
+      Array.isArray(json.ipRanges) ? json.ipRanges.slice() : [],
     );
   }
 
@@ -3270,8 +3310,75 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
       clients: Inbound.OpenvpnSettings.OpenvpnUser.toJsonArray(
         this.openvpnUsers,
       ),
+      externalProxy: this.externalProxy,
+      cipherMode: this.cipherMode,
+      ciphers: this.ciphers,
+      clientToClient: this.clientToClient,
+      crossInbound: this.crossInbound,
+      ipRanges: this.ipRanges || [],
     };
   }
+};
+
+// Every data cipher the bundled OpenVPN 2.6 / OpenSSL 3 build can negotiate.
+// List order is the preference order used for the `data-ciphers` directive.
+Inbound.OpenvpnSettings.CIPHERS_AEAD = [
+  "AES-256-GCM",
+  "AES-192-GCM",
+  "AES-128-GCM",
+  "CHACHA20-POLY1305",
+];
+Inbound.OpenvpnSettings.CIPHERS_CBC = [
+  "AES-256-CBC",
+  "AES-192-CBC",
+  "AES-128-CBC",
+  "CAMELLIA-256-CBC",
+  "CAMELLIA-192-CBC",
+  "CAMELLIA-128-CBC",
+  "ARIA-256-CBC",
+  "ARIA-192-CBC",
+  "ARIA-128-CBC",
+  "SM4-CBC",
+  "SEED-CBC",
+  "BF-CBC",
+  "CAST5-CBC",
+  "DES-EDE3-CBC",
+  "DES-EDE-CBC",
+  "DES-CBC",
+  "RC2-CBC",
+  "RC2-64-CBC",
+  "RC2-40-CBC",
+];
+Inbound.OpenvpnSettings.ALL_CIPHERS = [
+  ...Inbound.OpenvpnSettings.CIPHERS_AEAD,
+  ...Inbound.OpenvpnSettings.CIPHERS_CBC,
+];
+// Preset cipher selections behind the "Mode" dropdown. Kept in the same
+// relative order as ALL_CIPHERS so set comparison in detectCipherMode works.
+Inbound.OpenvpnSettings.CIPHER_MODES = {
+  new: ["AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305"],
+  old: ["AES-256-CBC", "AES-192-CBC", "AES-128-CBC", "BF-CBC", "DES-EDE3-CBC"],
+  all: [
+    "AES-256-GCM",
+    "AES-128-GCM",
+    "CHACHA20-POLY1305",
+    "AES-256-CBC",
+    "AES-192-CBC",
+    "AES-128-CBC",
+    "BF-CBC",
+    "DES-EDE3-CBC",
+  ],
+};
+Inbound.OpenvpnSettings.detectCipherMode = function (ciphers) {
+  const canonical = Inbound.OpenvpnSettings.ALL_CIPHERS.filter((c) =>
+    ciphers.includes(c),
+  ).join(":");
+  for (const [mode, preset] of Object.entries(
+    Inbound.OpenvpnSettings.CIPHER_MODES,
+  )) {
+    if (preset.join(":") === canonical) return mode;
+  }
+  return "custom";
 };
 
 Inbound.OpenvpnSettings.OpenvpnUser = class extends XrayCommonClass {

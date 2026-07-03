@@ -37,7 +37,10 @@
         <a-input v-model.trim="inbound.listen"></a-input>
     </a-form-item>
 
-    <a-form-item label='{{ i18n "pages.inbounds.port" }}'>
+    <a-form-item
+        v-if="inbound.protocol !== 'openvpn'"
+        label='{{ i18n "pages.inbounds.port" }}'
+    >
         <a-input-number
             v-model.number="inbound.port"
             :min="1"
@@ -55,13 +58,41 @@
         >
             Most clients use port 1723
         </span>
-        <span
-            v-if="inbound.protocol === 'openvpn'"
-            :style="{ marginLeft: '8px', color: '#888' }"
-        >
-            UDP port (default: 1194)
-        </span>
     </a-form-item>
+    <template v-else>
+        <a-form-item label="TCP Port">
+            <a-space>
+                <a-switch
+                    :checked="inbound.settings.tcpEnable"
+                    @change="checked => ovpnToggleTransport('tcp', checked)"
+                ></a-switch>
+                <a-input-number
+                    v-if="inbound.settings.tcpEnable"
+                    v-model.number="inbound.settings.tcpPort"
+                    :min="1"
+                    :max="65535"
+                    placeholder="443"
+                ></a-input-number>
+                <span v-else :style="{ color: '#888' }">Disabled</span>
+            </a-space>
+        </a-form-item>
+        <a-form-item label="UDP Port">
+            <a-space>
+                <a-switch
+                    :checked="inbound.settings.udpEnable"
+                    @change="checked => ovpnToggleTransport('udp', checked)"
+                ></a-switch>
+                <a-input-number
+                    v-if="inbound.settings.udpEnable"
+                    v-model.number="inbound.port"
+                    :min="1"
+                    :max="65535"
+                    placeholder="1194"
+                ></a-input-number>
+                <span v-else :style="{ color: '#888' }">Disabled</span>
+            </a-space>
+        </a-form-item>
+    </template>
 
     <a-form-item>
         <template slot="label">

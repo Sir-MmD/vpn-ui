@@ -18,51 +18,76 @@
                   <span :style="{ opacity: 0.65 }">{{ i18n "pages.core.subtitle" }}</span>
                 </a-col>
                 <a-col>
-                  <a-button @click="loadStatus(true)">
-                    <a-icon type="reload"></a-icon>{{ i18n "pages.core.refresh" }}
-                  </a-button>
+                  <a-space>
+                    <a-button type="primary" @click="restartAll">
+                      <a-icon type="reload"></a-icon>Restart All Cores
+                    </a-button>
+                    <a-button @click="loadStatus(true)">
+                      <a-icon type="reload"></a-icon>{{ i18n "pages.core.refresh" }}
+                    </a-button>
+                  </a-space>
                 </a-col>
               </a-row>
             </a-card>
           </a-col>
 
           <!-- Per-core cards -->
-          <a-col :xs="24" :sm="12" :lg="8" v-for="core in cores" :key="core.name">
-            <a-card hoverable>
-              <template #title>
-                <a-icon :type="coreIcon(core.name)"></a-icon>
-                <span :style="{ marginLeft: '6px' }">[[ coreTitle(core.name) ]]</span>
-              </template>
-              <template #extra>
-                <a-tag :color="stateColor(core.state)">[[ stateText(core.state) ]]</a-tag>
-              </template>
+          <a-col :span="24">
+            <a-row type="flex" :gutter="[16, 16]">
+              <a-col :xs="24" :sm="12" :xl="8" v-for="core in cores" :key="core.name">
+                <a-card class="core-card" hoverable>
+                  <template #title>
+                    <a-icon :type="coreIcon(core.name)"></a-icon>
+                    <span :style="{ marginLeft: '8px' }">[[ coreTitle(core.name) ]]</span>
+                  </template>
+                  <template #extra>
+                    <span class="core-state" :class="'core-state-' + core.state">
+                      <span class="core-state-dot"></span>[[ stateText(core.state) ]]
+                    </span>
+                  </template>
 
-              <p v-if="core.version" :style="{ margin: '2px 0' }">
-                <b>{{ i18n "pages.core.version" }}:</b> [[ core.version ]]
-              </p>
-              <p v-if="core.name !== 'xray' && core.name !== 'radius'" :style="{ margin: '2px 0' }">
-                <b>{{ i18n "pages.core.inbounds" }}:</b> [[ core.inbounds ]]
-              </p>
-              <p v-if="core.extra && core.extra.ipsec !== undefined" :style="{ margin: '2px 0' }">
-                <b>IPsec:</b>
-                <a-tag :color="core.extra.ipsec ? 'green' : 'orange'">
-                  [[ core.extra.ipsec ? '{{ i18n "pages.core.stateRunning" }}' : '{{ i18n "pages.core.stateStopped" }}' ]]
-                </a-tag>
-              </p>
-              <a-alert v-if="core.detail" type="warning" :message="core.detail" banner
-                :style="{ marginTop: '8px' }"></a-alert>
+                  <div class="core-kv-list">
+                    <div class="core-kv">
+                      <span class="core-kv-label">{{ i18n "pages.core.version" }}</span>
+                      <span class="core-kv-value">[[ core.version || '—' ]]</span>
+                    </div>
+                    <div class="core-kv" v-if="core.name !== 'xray' && core.name !== 'radius'">
+                      <span class="core-kv-label">{{ i18n "pages.core.inbounds" }}</span>
+                      <span class="core-kv-value">[[ core.inbounds ]]</span>
+                    </div>
+                    <div class="core-kv" v-if="core.extra && core.extra.ipsec !== undefined">
+                      <span class="core-kv-label">IPsec</span>
+                      <span class="core-kv-value" :class="core.extra.ipsec ? 'core-value-ok' : 'core-value-warn'">
+                        [[ core.extra.ipsec ? '{{ i18n "pages.core.stateRunning" }}' : '{{ i18n "pages.core.stateStopped" }}' ]]
+                      </span>
+                    </div>
+                  </div>
 
-              <div :style="{ marginTop: '12px' }">
-                <a-space>
-                  <a-button size="small" type="primary" :disabled="!canRestart(core.name)"
-                    @click="restart(core.name)">{{ i18n "pages.core.restart" }}</a-button>
-                  <a-button size="small" type="danger" v-if="canStop(core.name)"
-                    @click="stop(core.name)">{{ i18n "pages.core.stop" }}</a-button>
-                  <a-button size="small" v-if="core.name === 'xray'"
-                    :href="basePath + 'panel/xray'">{{ i18n "pages.core.editConfig" }}</a-button>
-                </a-space>
-              </div>
-            </a-card>
+                  <a-alert v-if="core.detail" type="warning" :message="core.detail" banner
+                    :style="{ marginTop: '10px' }"></a-alert>
+
+                  <div class="core-actions">
+                    <a-space>
+                      <a-button size="small" type="primary" :disabled="!canRestart(core.name)"
+                        @click="restart(core.name)">
+                        <a-icon type="reload"></a-icon>{{ i18n "pages.core.restart" }}
+                      </a-button>
+                      <a-button size="small" type="danger" :disabled="!canStop(core.name)"
+                        @click="stop(core.name)">
+                        <a-icon type="pause-circle"></a-icon>{{ i18n "pages.core.stop" }}
+                      </a-button>
+                      <a-button size="small" @click="showLogs(core.name)">
+                        <a-icon type="file-text"></a-icon>{{ i18n "pages.core.logs" }}
+                      </a-button>
+                      <a-button size="small" v-if="core.name === 'xray'"
+                        :href="basePath + 'panel/xray'">
+                        <a-icon type="edit"></a-icon>{{ i18n "pages.core.editConfig" }}
+                      </a-button>
+                    </a-space>
+                  </div>
+                </a-card>
+              </a-col>
+            </a-row>
           </a-col>
 
           <!-- System / provisioning card -->
@@ -70,7 +95,7 @@
             <a-card hoverable>
               <template #title>
                 <a-icon type="hdd"></a-icon>
-                <span :style="{ marginLeft: '6px' }">{{ i18n "pages.core.system" }}</span>
+                <span :style="{ marginLeft: '8px' }">{{ i18n "pages.core.system" }}</span>
               </template>
               <template #extra>
                 <a-button type="primary" :loading="provisioning" @click="runProvision">
@@ -78,35 +103,54 @@
                 </a-button>
               </template>
 
-              <p :style="{ opacity: 0.65 }">{{ i18n "pages.core.provisionDesc" }}</p>
-              <a-row :gutter="[16, 8]">
-                <a-col :xs="12" :sm="8">
-                  <b>{{ i18n "pages.core.ipForward" }}:</b>
-                  <a-tag :color="system.ipForward ? 'green' : 'red'">
-                    [[ system.ipForward ? '{{ i18n "pages.core.enabled" }}' : '{{ i18n "pages.core.disabled" }}' ]]
-                  </a-tag>
+              <p class="system-desc">{{ i18n "pages.core.provisionDesc" }}</p>
+
+              <a-row :gutter="[12, 12]">
+                <a-col :xs="24" :md="8">
+                  <div class="sys-tile" :class="system.ipForward ? 'sys-tile-ok' : 'sys-tile-bad'">
+                    <a-icon class="sys-tile-icon" theme="filled"
+                      :type="system.ipForward ? 'check-circle' : 'close-circle'"></a-icon>
+                    <div>
+                      <div class="sys-tile-name">{{ i18n "pages.core.ipForward" }}</div>
+                      <div class="sys-tile-state">
+                        [[ system.ipForward ? '{{ i18n "pages.core.enabled" }}' : '{{ i18n "pages.core.disabled" }}' ]]
+                      </div>
+                    </div>
+                  </div>
                 </a-col>
-                <a-col :xs="12" :sm="8">
-                  <b>{{ i18n "pages.core.nftables" }}:</b>
-                  <a-tag :color="system.nftables ? 'green' : 'red'">
-                    [[ system.nftables ? '{{ i18n "pages.core.present" }}' : '{{ i18n "pages.core.absent" }}' ]]
-                  </a-tag>
+                <a-col :xs="24" :md="8">
+                  <div class="sys-tile" :class="system.nftables ? 'sys-tile-ok' : 'sys-tile-bad'">
+                    <a-icon class="sys-tile-icon" theme="filled"
+                      :type="system.nftables ? 'check-circle' : 'close-circle'"></a-icon>
+                    <div>
+                      <div class="sys-tile-name">{{ i18n "pages.core.nftables" }}</div>
+                      <div class="sys-tile-state">
+                        [[ system.nftables ? '{{ i18n "pages.core.present" }}' : '{{ i18n "pages.core.absent" }}' ]]
+                      </div>
+                    </div>
+                  </div>
                 </a-col>
-                <a-col :xs="12" :sm="8">
-                  <b>{{ i18n "pages.core.iproute" }}:</b>
-                  <a-tag :color="system.iproute ? 'green' : 'red'">
-                    [[ system.iproute ? '{{ i18n "pages.core.present" }}' : '{{ i18n "pages.core.absent" }}' ]]
-                  </a-tag>
+                <a-col :xs="24" :md="8">
+                  <div class="sys-tile" :class="system.iproute ? 'sys-tile-ok' : 'sys-tile-bad'">
+                    <a-icon class="sys-tile-icon" theme="filled"
+                      :type="system.iproute ? 'check-circle' : 'close-circle'"></a-icon>
+                    <div>
+                      <div class="sys-tile-name">{{ i18n "pages.core.iproute" }}</div>
+                      <div class="sys-tile-state">
+                        [[ system.iproute ? '{{ i18n "pages.core.present" }}' : '{{ i18n "pages.core.absent" }}' ]]
+                      </div>
+                    </div>
+                  </div>
                 </a-col>
               </a-row>
 
-              <a-divider :style="{ margin: '12px 0' }"></a-divider>
-              <b>{{ i18n "pages.core.kernelModules" }}:</b>
-              <div :style="{ marginTop: '8px' }">
-                <a-tag v-for="m in system.modules" :key="m.name" :color="m.loaded ? 'green' : 'red'"
-                  :style="{ marginBottom: '6px' }">
-                  [[ m.name ]] — [[ m.loaded ? '{{ i18n "pages.core.loaded" }}' : '{{ i18n "pages.core.missing" }}' ]]
-                </a-tag>
+              <div class="sys-section-title">{{ i18n "pages.core.kernelModules" }}</div>
+              <div class="module-grid">
+                <span v-for="m in system.modules" :key="m.name" class="module-chip"
+                  :class="m.loaded ? 'module-ok' : 'module-bad'">
+                  <a-icon :type="m.loaded ? 'check' : 'close'"></a-icon>
+                  [[ m.name ]]
+                </span>
               </div>
             </a-card>
           </a-col>
@@ -117,12 +161,29 @@
   </a-layout>
 
   <!-- Provision result -->
-  <a-modal v-model="provisionVisible" title='{{ i18n "pages.core.runSetup" }}' :footer="null">
+  <a-modal v-model="provisionVisible" title='{{ i18n "pages.core.runSetup" }}' :footer="null"
+    :class="themeSwitcher.currentTheme">
     <div v-for="item in provisionResult" :key="item.name" :style="{ marginBottom: '6px' }">
       <a-icon :type="item.ok ? 'check-circle' : 'close-circle'"
         :style="{ color: item.ok ? '#52c41a' : '#f5222d', marginRight: '8px' }"></a-icon>
       <span>[[ item.name ]] — [[ item.msg ]]</span>
     </div>
+  </a-modal>
+
+  <!-- Core logs -->
+  <a-modal v-model="logsVisible" :title="logsTitle + ' — {{ i18n "pages.core.logs" }}'" :footer="null"
+    :class="themeSwitcher.currentTheme" :width="isMobile ? '95%' : '80%'">
+    <div :style="{ textAlign: 'right', marginBottom: '8px' }">
+      <a-space>
+        <a-button size="small" :disabled="!logsContent" @click="downloadLogs">
+          <a-icon type="download"></a-icon>Download
+        </a-button>
+        <a-button size="small" :loading="logsLoading" @click="loadLogs(logsCore)">
+          <a-icon type="reload"></a-icon>{{ i18n "pages.core.refresh" }}
+        </a-button>
+      </a-space>
+    </div>
+    <pre class="core-logs">[[ logsContent || '{{ i18n "pages.core.noLogs" }}' ]]</pre>
   </a-modal>
 </a-layout>
 
@@ -143,6 +204,11 @@
       provisionVisible: false,
       provisionResult: [],
       basePath: '{{ .base_path }}',
+      logsVisible: false,
+      logsLoading: false,
+      logsCore: '',
+      logsTitle: '',
+      logsContent: '',
     },
     methods: {
       async loadStatus(showSpin) {
@@ -159,10 +225,45 @@
         await HttpUtil.post('{{ .base_path }}panel/core/restart/' + core);
         await this.loadStatus(false);
       },
+      async restartAll() {
+        this.spinning = true;
+        await HttpUtil.post('{{ .base_path }}panel/core/restart-all');
+        await this.loadStatus(false);
+      },
       async stop(core) {
         this.spinning = true;
         await HttpUtil.post('{{ .base_path }}panel/core/stop/' + core);
         await this.loadStatus(false);
+      },
+      async showLogs(core) {
+        this.logsCore = core;
+        this.logsTitle = this.coreTitle(core);
+        this.logsContent = '';
+        this.logsVisible = true;
+        await this.loadLogs(core);
+      },
+      async loadLogs(core) {
+        this.logsLoading = true;
+        const msg = await HttpUtil.get('{{ .base_path }}panel/core/logs/' + core);
+        this.logsLoading = false;
+        if (msg && msg.success) {
+          this.logsContent = msg.obj || '';
+        }
+      },
+      downloadLogs() {
+        if (!this.logsContent) return;
+        const d = new Date();
+        const p = (n) => String(n).padStart(2, '0');
+        const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+        const blob = new Blob([this.logsContent], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = (this.logsCore || 'core') + '-logs-' + stamp + '.txt';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
       },
       async runProvision() {
         this.provisioning = true;
@@ -180,9 +281,6 @@
       coreIcon(name) {
         return ({ xray: 'tool', l2tp: 'lock', pptp: 'api', openvpn: 'safety-certificate', radius: 'key' })[name] || 'appstore';
       },
-      stateColor(state) {
-        return ({ running: 'green', idle: 'blue', stopped: 'orange', not_installed: 'default', error: 'red' })[state] || 'default';
-      },
       stateText(state) {
         return ({
           running: '{{ i18n "pages.core.stateRunning" }}',
@@ -192,8 +290,8 @@
           error: '{{ i18n "pages.core.stateError" }}',
         })[state] || state;
       },
-      canStop(name) { return name === 'xray' || name === 'openvpn'; },
-      canRestart(name) { return name !== 'radius'; },
+      canStop(name) { return true; },
+      canRestart(name) { return true; },
     },
     mounted() {
       this.loadStatus(true);
@@ -204,4 +302,174 @@
     },
   });
 </script>
+<style>
+  /* Equal-height core cards with actions pinned to the bottom */
+  .core-card {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .core-card .ant-card-body {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .core-actions {
+    margin-top: auto;
+    padding-top: 14px;
+  }
+
+  /* Key/value rows inside a core card */
+  .core-kv {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 2px;
+    font-size: 13px;
+  }
+
+  .core-kv + .core-kv {
+    border-top: 1px dashed rgba(128, 128, 128, 0.25);
+  }
+
+  .core-kv-label {
+    opacity: 0.6;
+  }
+
+  .core-kv-value {
+    font-weight: 500;
+  }
+
+  .core-value-ok {
+    color: #52c41a;
+  }
+
+  .core-value-warn {
+    color: #faad14;
+  }
+
+  /* Status pill in the card header */
+  .core-state {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 1px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    background: rgba(128, 128, 128, 0.12);
+    white-space: nowrap;
+  }
+
+  .core-state-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+
+  .core-state-running { color: #52c41a; }
+  .core-state-idle { color: #1890ff; }
+  .core-state-stopped { color: #faad14; }
+  .core-state-not_installed { color: #8c8c8c; }
+  .core-state-error { color: #f5222d; }
+
+  /* System / provisioning */
+  .system-desc {
+    opacity: 0.65;
+    margin-bottom: 14px;
+  }
+
+  .sys-tile {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+  }
+
+  .sys-tile-ok {
+    border-color: rgba(82, 196, 26, 0.35);
+    background: rgba(82, 196, 26, 0.08);
+  }
+
+  .sys-tile-ok .sys-tile-icon {
+    color: #52c41a;
+  }
+
+  .sys-tile-bad {
+    border-color: rgba(245, 34, 45, 0.35);
+    background: rgba(245, 34, 45, 0.07);
+  }
+
+  .sys-tile-bad .sys-tile-icon {
+    color: #f5222d;
+  }
+
+  .sys-tile-icon {
+    font-size: 20px;
+  }
+
+  .sys-tile-name {
+    font-weight: 600;
+    font-size: 13px;
+  }
+
+  .sys-tile-state {
+    font-size: 12px;
+    opacity: 0.65;
+    text-transform: capitalize;
+  }
+
+  .sys-section-title {
+    font-weight: 600;
+    font-size: 13px;
+    margin-top: 18px;
+  }
+
+  .module-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .module-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    border: 1px solid;
+  }
+
+  .module-ok {
+    color: #52c41a;
+    border-color: rgba(82, 196, 26, 0.35);
+    background: rgba(82, 196, 26, 0.08);
+  }
+
+  .module-bad {
+    color: #f5222d;
+    border-color: rgba(245, 34, 45, 0.35);
+    background: rgba(245, 34, 45, 0.07);
+  }
+
+  .core-logs {
+    max-height: 60vh;
+    overflow: auto;
+    padding: 12px;
+    border-radius: 6px;
+    background: rgba(128, 128, 128, 0.1);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0;
+  }
+</style>
 {{ template "page/body_end" .}}

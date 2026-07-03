@@ -5,16 +5,30 @@
     :wrapper-col="{ md: {span:14} }"
 >
     <a-form-item label="IP Range">
-        <a-input
-            v-model.trim="inbound.settings.ipRange"
-            placeholder="10.1.2.10-10.1.2.50"
-        ></a-input>
-    </a-form-item>
-    <a-form-item label="Local IP">
-        <a-input
-            v-model.trim="inbound.settings.localIp"
-            placeholder="10.1.2.1"
-        ></a-input>
+        <a-button
+            icon="plus"
+            type="primary"
+            size="small"
+            @click="inbound.settings.ipRanges.push('')"
+        ></a-button>
+        <span :style="{ marginLeft: '8px', color: '#888' }">
+            Leave empty to auto-assign; a new range is added automatically when a
+            range fills up.
+        </span>
+        <template v-for="(row, index) in inbound.settings.ipRanges">
+            <a-input
+                :style="{ marginTop: '8px' }"
+                v-model.trim="inbound.settings.ipRanges[index]"
+                placeholder="auto-assigned (e.g. 10.1.5.2-10.1.5.254)"
+            >
+                <a-button
+                    icon="minus"
+                    slot="addonAfter"
+                    size="small"
+                    @click="inbound.settings.ipRanges.splice(index, 1)"
+                ></a-button>
+            </a-input>
+        </template>
     </a-form-item>
     <a-form-item label="DNS 1">
         <a-input
@@ -34,6 +48,24 @@
             :min="1000"
             :max="1500"
         ></a-input-number>
+    </a-form-item>
+    <a-form-item label="Client to Client">
+        <a-switch
+            v-model="inbound.settings.clientToClient"
+            @change="val => { if (!val) inbound.settings.crossInbound = false }"
+        ></a-switch>
+        <span :style="{ marginLeft: '8px', color: '#888' }">
+            Allow connected clients to reach each other
+        </span>
+    </a-form-item>
+    <a-form-item label="Cross Inbound">
+        <a-switch
+            v-model="inbound.settings.crossInbound"
+            :disabled="!inbound.settings.clientToClient"
+        ></a-switch>
+        <span :style="{ marginLeft: '8px', color: '#888' }">
+            Also reach clients of other inbounds (both inbounds must enable this)
+        </span>
     </a-form-item>
 </a-form>
 {{end}}

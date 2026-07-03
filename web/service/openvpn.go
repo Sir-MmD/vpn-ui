@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/database"
@@ -35,18 +36,188 @@ type OpenVpnService struct {
 
 // openvpnSettings represents the OpenVPN-specific settings stored in the inbound's Settings JSON.
 type openvpnSettings struct {
-	UdpEnable  *bool           `json:"udpEnable"` // nil == enabled (back-compat with pre-toggle inbounds)
-	TcpEnable  *bool           `json:"tcpEnable"` // nil == enabled
-	TcpPort    int             `json:"tcpPort"`
-	Dns1       string          `json:"dns1"`
-	Dns2       string          `json:"dns2"`
-	Mtu        int             `json:"mtu"`
-	CaCert     string          `json:"caCert"`
-	CaKey      string          `json:"caKey"`
-	ServerCert string          `json:"serverCert"`
-	ServerKey  string          `json:"serverKey"`
-	TlsCrypt   string          `json:"tlsCrypt"`
-	Clients    []openvpnClient `json:"clients"`
+	UdpEnable      *bool               `json:"udpEnable"` // nil == enabled (back-compat with pre-toggle inbounds)
+	TcpEnable      *bool               `json:"tcpEnable"` // nil == enabled
+	TcpPort        int                 `json:"tcpPort"`
+	Dns1           string              `json:"dns1"`
+	Dns2           string              `json:"dns2"`
+	Mtu            int                 `json:"mtu"`
+	CaCert         string              `json:"caCert"`
+	CaKey          string              `json:"caKey"`
+	ServerCert     string              `json:"serverCert"`
+	ServerKey      string              `json:"serverKey"`
+	TlsCrypt       string              `json:"tlsCrypt"`
+	CipherMode     string              `json:"cipherMode"` // old | new | all | custom (informative; Ciphers is authoritative)
+	Ciphers        []string            `json:"ciphers"`
+	ExternalProxy  []ovpnExternalProxy `json:"externalProxy"`
+	ClientToClient bool                `json:"clientToClient"`
+	CrossInbound   bool                `json:"crossInbound"`
+	IpRanges       []string            `json:"ipRanges"` // UDP-side /24 ranges; TCP mirrors into 10.3.x. Panel-managed.
+	Clients        []openvpnClient     `json:"clients"`
+}
+
+// effectiveRanges returns the inbound's UDP-side (10.2.x) client ranges, or nil
+// to signal the legacy id-derived /24.
+func (o *openvpnSettings) effectiveRanges() []string { return o.IpRanges }
+
+// ovpnExternalProxy is one `remote` override for exported client configs —
+// e.g. a relay/CDN address handed to clients instead of this server's IP.
+type ovpnExternalProxy struct {
+	Dest   string `json:"dest"`
+	Port   int    `json:"port"`
+	Remark string `json:"remark"`
+}
+
+// ovpnDefaultCiphers matches the historical hardcoded negotiation list and the
+// frontend's "New Devices" preset.
+var ovpnDefaultCiphers = []string{"AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305"}
+
+// ovpnLegacyProviderCiphers are ciphers OpenSSL 3 only exposes via the legacy
+// provider; selecting any of them requires `providers legacy default`.
+// (DES-EDE3-CBC lives in the default provider and is deliberately absent.)
+var ovpnLegacyProviderCiphers = map[string]bool{
+	"BF-CBC":      true,
+	"CAST5-CBC":   true,
+	"SEED-CBC":    true,
+	"DES-CBC":     true,
+	"DES-EDE-CBC": true,
+	"RC2-CBC":     true,
+	"RC2-64-CBC":  true,
+	"RC2-40-CBC":  true,
+}
+
+// dataCiphers returns the configured cipher preference list, falling back to
+// the defaults when the inbound predates cipher selection.
+func (o *openvpnSettings) dataCiphers() []string {
+	ciphers := make([]string, 0, len(o.Ciphers))
+	for _, c := range o.Ciphers {
+		if c = strings.TrimSpace(c); c != "" {
+			ciphers = append(ciphers, c)
+		}
+	}
+	if len(ciphers) == 0 {
+		return ovpnDefaultCiphers
+	}
+	return ciphers
+}
+
+// firstCbcCipher returns the highest-preference CBC cipher, or "" if the list
+// is AEAD-only. Used as the non-NCP fallback for old clients.
+func firstCbcCipher(ciphers []string) string {
+	for _, c := range ciphers {
+		if strings.HasSuffix(c, "-CBC") {
+			return c
+		}
+	}
+	return ""
+}
+
+func needsLegacyProvider(ciphers []string) bool {
+	for _, c := range ciphers {
+		if ovpnLegacyProviderCiphers[c] {
+			return true
+		}
+	}
+	return false
+}
+
+// Cipher support is probed once from the actual openvpn binary. The bundled
+// static (musl) build ships an OpenSSL that CANNOT dlopen the legacy provider
+// (`legacy.so: Dynamic loading not supported`), so BF-CBC/CAST5/SEED/DES/RC2 are
+// unavailable and `providers legacy default` is fatal — while a distro openvpn
+// (dynamic OpenSSL) can load it. We therefore ask the binary what it actually
+// supports instead of assuming.
+var (
+	ovpnCipherProbeOnce sync.Once
+	ovpnSupportedCipher map[string]bool
+	ovpnLegacyProvider  bool
+)
+
+// ovpnBinaryPath returns the openvpn executable the panel runs: the bundled
+// daemon if extracted, else a distro openvpn from PATH.
+func (s *OpenVpnService) ovpnBinaryPath() string {
+	return daemonBin("openvpn")
+}
+
+var (
+	ovpnDcoProbeOnce sync.Once
+	ovpnHasDco       bool
+)
+
+// hasDCO reports whether the openvpn build has Data Channel Offload compiled in
+// (the [DCO] flag in --version). It matters for client-to-client: with DCO
+// active OpenVPN ignores `client-to-client` and pushes packets to the tun
+// device (where TPROXY hijacks them), so the panel disables DCO in that case.
+func (s *OpenVpnService) hasDCO() bool {
+	ovpnDcoProbeOnce.Do(func() {
+		out, _ := exec.Command(s.ovpnBinaryPath(), "--version").CombinedOutput()
+		ovpnHasDco = strings.Contains(string(out), "[DCO]")
+	})
+	return ovpnHasDco
+}
+
+// parseOvpnCiphers adds every cipher token from `openvpn --show-ciphers` output
+// to set. Cipher lines start with an all-uppercase dashed token (AES-256-GCM,
+// CHACHA20-POLY1305, DES-EDE3-CBC); prose/header lines contain lowercase and are
+// skipped.
+func parseOvpnCiphers(output string, set map[string]bool) {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		name := fields[0]
+		if !strings.Contains(name, "-") || strings.ToUpper(name) != name {
+			continue
+		}
+		set[name] = true
+	}
+}
+
+// cipherSupport reports the data ciphers the openvpn binary can actually
+// negotiate, and whether the OpenSSL legacy provider loads. Cached — it shells
+// out to the binary.
+func (s *OpenVpnService) cipherSupport() (map[string]bool, bool) {
+	ovpnCipherProbeOnce.Do(func() {
+		set := map[string]bool{}
+		bin := s.ovpnBinaryPath()
+		if out, err := exec.Command(bin, "--show-ciphers").CombinedOutput(); err == nil {
+			parseOvpnCiphers(string(out), set)
+		}
+		// The legacy provider only counts if it loads AND contributes ciphers.
+		if out, err := exec.Command(bin, "--providers", "legacy", "default", "--show-ciphers").CombinedOutput(); err == nil &&
+			!strings.Contains(string(out), "failed to load provider") {
+			before := len(set)
+			parseOvpnCiphers(string(out), set)
+			if len(set) > before {
+				ovpnLegacyProvider = true
+			}
+		}
+		ovpnSupportedCipher = set
+	})
+	return ovpnSupportedCipher, ovpnLegacyProvider
+}
+
+// effectiveCiphers filters the configured preference list down to what the
+// openvpn binary supports, so a cipher the local build can't provide never
+// reaches a config file (which would make openvpn refuse to start / a client
+// reject the profile). Falls back to the always-present AEAD defaults if the
+// filter empties the list, and to the raw list if the probe was unavailable.
+func (s *OpenVpnService) effectiveCiphers(configured []string) []string {
+	supported, _ := s.cipherSupport()
+	if len(supported) == 0 {
+		return configured
+	}
+	out := make([]string, 0, len(configured))
+	for _, c := range configured {
+		if supported[strings.ToUpper(c)] {
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		return ovpnDefaultCiphers
+	}
+	return out
 }
 
 // udpEnabled / tcpEnabled report whether a transport is active. A nil pointer
@@ -94,26 +265,21 @@ func (s *OpenVpnService) configDir(inboundId int) string {
 	return fmt.Sprintf("/etc/openvpn/server-%d", inboundId)
 }
 
-// ovpnSubnet returns the /24 prefix for an OpenVPN inbound/transport.
-// UDP clients live in 10.2.{id}.0/24, TCP clients in 10.3.{id}.0/24 — the same
-// pools buildServerConfig hands to OpenVPN's `server` directive.
-func ovpnSubnet(inboundId int, proto string) string {
-	prefix := 2
-	if proto == "tcp" {
-		prefix = 3
-	}
-	return fmt.Sprintf("10.%d.%d", prefix, inboundId)
+// ovpnBlockFor returns the network address and prefix length of an OpenVPN
+// inbound's transport block, derived from its stored ranges. Clients live inside
+// this block; the server takes its .1. Defaults to the legacy 10.{2|3}.{id}.0/24
+// when no ranges are stored, so <=253-client inbounds are byte-identical to the
+// pre-multi-range behavior.
+func ovpnBlockFor(inbound *model.Inbound, settings *openvpnSettings, proto string) (net.IP, int) {
+	return ovpnBlock(settings.effectiveRanges(), proto, inbound.Id)
 }
 
-// ovpnClientIP returns the deterministic tunnel IP assigned (via client-config-dir)
-// to the client at index i for the given transport. The server takes .1, so
-// clients start at .2. Returns "" when the index would overflow the /24.
-func ovpnClientIP(inboundId, i int, proto string) string {
-	host := 2 + i
-	if host > 254 {
-		return ""
-	}
-	return fmt.Sprintf("%s.%d", ovpnSubnet(inboundId, proto), host)
+// ovpnClientIP returns the deterministic tunnel IP (pinned via client-config-dir)
+// for the client at index i on the given transport. Returns "" when the index
+// overflows the inbound's block.
+func ovpnClientIP(inbound *model.Inbound, settings *openvpnSettings, i int, proto string) string {
+	netAddr, prefix := ovpnBlockFor(inbound, settings, proto)
+	return ovpnBlockClientIP(netAddr, prefix, i)
 }
 
 // binaryPath returns the absolute path of the running panel binary, used for
@@ -230,13 +396,10 @@ func (s *OpenVpnService) generateServerConfigs(inbound *model.Inbound) error {
 	}
 
 	for _, proto := range []string{"udp", "tcp"} {
-		confPath := fmt.Sprintf("%s/server-%s.conf", dir, proto)
-		link := fmt.Sprintf("/etc/openvpn/server/server-%d-%s.conf", inbound.Id, proto)
 		if !enabled[proto] {
-			// Drop the systemd symlink so a disabled transport cannot be started.
-			os.Remove(link)
 			continue
 		}
+		confPath := fmt.Sprintf("%s/server-%s.conf", dir, proto)
 		conf := s.buildServerConfig(inbound, settings, proto, ports[proto], binaryPath)
 		if err := s.writeFile(confPath, conf); err != nil {
 			return err
@@ -244,10 +407,14 @@ func (s *OpenVpnService) generateServerConfigs(inbound *model.Inbound) error {
 		if err := s.writeClientConfigDir(inbound, settings, proto); err != nil {
 			logger.Warning("OpenVPN: CCD write failed for inbound", inbound.Id, err)
 		}
-		s.runCmd("ln", "-sf", confPath, link)
 	}
 
 	return nil
+}
+
+// ovpnProcName returns the process-manager key for an OpenVPN inbound/transport.
+func ovpnProcName(inboundId int, proto string) string {
+	return fmt.Sprintf("openvpn-server-%d-%s", inboundId, proto)
 }
 
 // writeClientConfigDir writes the per-client client-config-dir files that pin
@@ -263,15 +430,17 @@ func (s *OpenVpnService) writeClientConfigDir(inbound *model.Inbound, settings *
 	if err := os.MkdirAll(ccdDir, 0755); err != nil {
 		return err
 	}
+	netAddr, prefix := ovpnBlockFor(inbound, settings, proto)
+	mask := prefixToMask(prefix)
 	for i, client := range settings.Clients {
 		if client.ID == "" {
 			continue
 		}
-		ip := ovpnClientIP(inbound.Id, i, proto)
+		ip := ovpnBlockClientIP(netAddr, prefix, i)
 		if ip == "" {
 			continue
 		}
-		content := fmt.Sprintf("ifconfig-push %s 255.255.255.0\n", ip)
+		content := fmt.Sprintf("ifconfig-push %s %s\n", ip, mask)
 		if err := s.writeFile(fmt.Sprintf("%s/%s", ccdDir, client.ID), content); err != nil {
 			return err
 		}
@@ -284,13 +453,12 @@ func (s *OpenVpnService) buildServerConfig(inbound *model.Inbound, settings *ope
 	id := inbound.Id
 	dir := s.configDir(id)
 
-	// Determine subnet based on protocol
-	// UDP: 10.2.{id}.0/24, TCP: 10.3.{id}.0/24
-	subnetPrefix := 2
-	if proto == "tcp" {
-		subnetPrefix = 3
-	}
-	subnet := fmt.Sprintf("10.%d.%d.0", subnetPrefix, id)
+	// Client subnet/block for this transport (UDP => 10.2.x, TCP => 10.3.x).
+	// A single /24 for the common case; a wider aligned block once an inbound
+	// has grown past 253 clients (see normalizeOvpnRanges).
+	netAddr, prefix := ovpnBlockFor(inbound, settings, proto)
+	subnet := netAddr.String()
+	subnetMask := prefixToMask(prefix)
 
 	protoStr := proto
 	if proto == "tcp" {
@@ -324,9 +492,18 @@ func (s *OpenVpnService) buildServerConfig(inbound *model.Inbound, settings *ope
 	b.WriteString(fmt.Sprintf("dev %s\n", tunDev))
 	b.WriteString("dev-type tun\n")
 	b.WriteString("topology subnet\n")
-	b.WriteString(fmt.Sprintf("server %s 255.255.255.0\n", subnet))
+	b.WriteString(fmt.Sprintf("server %s %s\n", subnet, subnetMask))
 	// Pin every user to a deterministic tunnel IP so per-user routing rules work.
 	b.WriteString(fmt.Sprintf("client-config-dir %s/ccd-%s\n", dir, proto))
+	if settings.ClientToClient {
+		// Route traffic between clients internally in OpenVPN instead of sending
+		// it to the tun device (where TPROXY would hijack it into Xray). DCO
+		// ignores client-to-client, so turn it off when the build has it.
+		if s.hasDCO() {
+			b.WriteString("disable-dco\n")
+		}
+		b.WriteString("client-to-client\n")
+	}
 	b.WriteString("push \"redirect-gateway def1 bypass-dhcp\"\n")
 	b.WriteString(fmt.Sprintf("push \"dhcp-option DNS %s\"\n", dns1))
 	b.WriteString(fmt.Sprintf("push \"dhcp-option DNS %s\"\n", dns2))
@@ -340,8 +517,17 @@ func (s *OpenVpnService) buildServerConfig(inbound *model.Inbound, settings *ope
 	b.WriteString(fmt.Sprintf("key %s/server.key\n", dir))
 	b.WriteString(fmt.Sprintf("tls-crypt %s/tc.key\n", dir))
 	b.WriteString("dh none\n")
-	b.WriteString("data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305\n")
-	b.WriteString("cipher AES-256-GCM\n")
+	ciphers := s.effectiveCiphers(settings.dataCiphers())
+	_, legacyOK := s.cipherSupport()
+	if legacyOK && needsLegacyProvider(ciphers) {
+		b.WriteString("providers legacy default\n")
+	}
+	b.WriteString(fmt.Sprintf("data-ciphers %s\n", strings.Join(ciphers, ":")))
+	if cbc := firstCbcCipher(ciphers); cbc != "" {
+		// Old clients (no cipher negotiation) end up on the preferred CBC cipher.
+		b.WriteString(fmt.Sprintf("data-ciphers-fallback %s\n", cbc))
+	}
+	b.WriteString(fmt.Sprintf("cipher %s\n", ciphers[0]))
 	b.WriteString("auth SHA256\n")
 	b.WriteString("verify-client-cert none\n")
 	b.WriteString("username-as-common-name\n")
@@ -423,18 +609,20 @@ func (s *OpenVpnService) SetupRouting() error {
 	return s.nftService.ApplyNftRules()
 }
 
-// RestartServices restarts OpenVPN systemd services for all inbounds.
+// RestartServices launches (or stops) an OpenVPN child process per inbound and
+// transport, according to the enable toggles. Any managed OpenVPN process that
+// no longer corresponds to an enabled transport (disabled toggle, disabled or
+// deleted inbound) is stopped, so nothing lingers.
 func (s *OpenVpnService) RestartServices() error {
+	migrateFromSystemd()
+
 	inbounds, err := s.GetOpenVpnInbounds()
 	if err != nil {
 		return err
 	}
 
-	if len(inbounds) == 0 {
-		return nil
-	}
-
-	os.MkdirAll("/etc/openvpn/server", 0755)
+	bin := s.ovpnBinaryPath()
+	desired := map[string]bool{}
 
 	for _, inbound := range inbounds {
 		settings, err := s.parseSettings(inbound)
@@ -442,36 +630,35 @@ func (s *OpenVpnService) RestartServices() error {
 			logger.Warning("OpenVPN: skipping inbound", inbound.Id, err)
 			continue
 		}
-		// A transport runs only when both the inbound and that transport toggle
-		// are enabled; otherwise the systemd instance is stopped and disabled.
-		s.applyServiceState(fmt.Sprintf("openvpn-server@server-%d-udp", inbound.Id), inbound.Enable && settings.udpEnabled())
-		s.applyServiceState(fmt.Sprintf("openvpn-server@server-%d-tcp", inbound.Id), inbound.Enable && settings.tcpEnabled())
+		dir := s.configDir(inbound.Id)
+		for _, proto := range []string{"udp", "tcp"} {
+			on := inbound.Enable && (proto == "udp" && settings.udpEnabled() || proto == "tcp" && settings.tcpEnabled())
+			name := ovpnProcName(inbound.Id, proto)
+			if !on {
+				continue
+			}
+			desired[name] = true
+			confPath := fmt.Sprintf("%s/server-%s.conf", dir, proto)
+			args := []string{"--suppress-timestamps", "--config", confPath}
+			if err := procMgr.Start(name, bin, args, nil, dir); err != nil {
+				logger.Warning("OpenVPN: failed to start", name, err)
+			}
+		}
+	}
+
+	// Stop every managed OpenVPN process that shouldn't be running anymore.
+	for _, name := range procMgr.namesWithPrefix("openvpn-server-") {
+		if !desired[name] {
+			_ = procMgr.Stop(name)
+		}
 	}
 
 	return nil
 }
 
-// applyServiceState starts+enables (or stops+disables) a systemd unit.
-func (s *OpenVpnService) applyServiceState(unit string, want bool) {
-	if want {
-		s.runCmd("systemctl", "enable", "--now", unit)
-		s.runCmd("systemctl", "restart", unit)
-	} else {
-		s.runCmd("systemctl", "stop", unit)
-		s.runCmd("systemctl", "disable", unit)
-	}
-}
-
-// StopServices stops all OpenVPN systemd services.
+// StopServices stops all OpenVPN child processes.
 func (s *OpenVpnService) StopServices() {
-	inbounds, err := s.GetOpenVpnInbounds()
-	if err != nil {
-		return
-	}
-	for _, inbound := range inbounds {
-		s.runCmd("systemctl", "stop", fmt.Sprintf("openvpn-server@server-%d-udp", inbound.Id))
-		s.runCmd("systemctl", "stop", fmt.Sprintf("openvpn-server@server-%d-tcp", inbound.Id))
-	}
+	procMgr.StopByPrefix("openvpn-server-")
 }
 
 // GenerateClientConfig builds the .ovpn client config content for an inbound/protocol.
@@ -493,12 +680,6 @@ func (s *OpenVpnService) GenerateClientConfig(inbound *model.Inbound, proto stri
 		return "", fmt.Errorf("UDP transport is disabled for this inbound")
 	}
 
-	// Determine server IP
-	serverIP := s.getServerIP()
-	if serverIP == "" {
-		return "", fmt.Errorf("could not determine server IP")
-	}
-
 	port := inbound.Port
 	protoStr := "udp"
 	if proto == "tcp" {
@@ -506,19 +687,74 @@ func (s *OpenVpnService) GenerateClientConfig(inbound *model.Inbound, proto stri
 		protoStr = "tcp"
 	}
 
+	// External proxy entries override the auto-detected server address; each
+	// becomes a `remote` line (OpenVPN tries them in order). An entry without a
+	// port inherits the transport's real port.
+	type remote struct {
+		host string
+		port int
+	}
+	var remotes []remote
+	for _, ep := range settings.ExternalProxy {
+		dest := strings.TrimSpace(ep.Dest)
+		if dest == "" {
+			continue
+		}
+		epPort := ep.Port
+		if epPort == 0 {
+			epPort = port
+		}
+		remotes = append(remotes, remote{dest, epPort})
+	}
+	if len(remotes) == 0 {
+		serverIP := s.getServerIP()
+		if serverIP == "" {
+			return "", fmt.Errorf("could not determine server IP")
+		}
+		remotes = append(remotes, remote{serverIP, port})
+	}
+
 	var b strings.Builder
 	b.WriteString("client\n")
 	b.WriteString("dev tun\n")
 	b.WriteString(fmt.Sprintf("proto %s\n", protoStr))
-	b.WriteString(fmt.Sprintf("remote %s %d\n", serverIP, port))
+	for _, r := range remotes {
+		b.WriteString(fmt.Sprintf("remote %s %d\n", r.host, r.port))
+	}
 	b.WriteString("resolv-retry infinite\n")
 	b.WriteString("nobind\n")
 	b.WriteString("persist-key\n")
 	b.WriteString("persist-tun\n")
 	b.WriteString("remote-cert-tls server\n")
 	b.WriteString("auth-user-pass\n")
-	b.WriteString("data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305\n")
-	b.WriteString("cipher AES-256-GCM\n")
+	// This profile authenticates by username/password only and carries no
+	// <cert>/<key> (the server runs `verify-client-cert none`). OpenVPN Connect
+	// (openvpn3) otherwise rejects such a profile with "missing external
+	// certificate"; this directive tells it no client certificate is expected.
+	// The community CLI just treats it as a harmless env var.
+	b.WriteString("setenv CLIENT_CERT 0\n")
+	ciphers := s.effectiveCiphers(settings.dataCiphers())
+	_, legacyOK := s.cipherSupport()
+	joined := strings.Join(ciphers, ":")
+	if legacyOK && needsLegacyProvider(ciphers) {
+		// 2.6+ clients must load the OpenSSL legacy provider or they reject the
+		// data-ciphers list outright; `setenv opt` keeps the line ignorable on
+		// pre-2.6 clients that don't know --providers (their OpenSSL 1.x has
+		// these ciphers built in). Only emitted when this server's own openvpn
+		// can load the provider — otherwise the legacy ciphers were already
+		// filtered out of `ciphers` and the line would be dead weight.
+		b.WriteString("setenv opt providers legacy default\n")
+	}
+	if cbc := firstCbcCipher(ciphers); cbc != "" {
+		// `setenv opt` keeps the profile loadable on pre-2.5 clients that don't
+		// know data-ciphers; they fall back to the plain `cipher` line, which the
+		// server accepts via data-ciphers-fallback.
+		b.WriteString(fmt.Sprintf("setenv opt data-ciphers %s\n", joined))
+		b.WriteString(fmt.Sprintf("cipher %s\n", cbc))
+	} else {
+		b.WriteString(fmt.Sprintf("data-ciphers %s\n", joined))
+		b.WriteString(fmt.Sprintf("cipher %s\n", ciphers[0]))
+	}
 	b.WriteString("auth SHA256\n")
 	b.WriteString("verb 3\n")
 	b.WriteString("<ca>\n")

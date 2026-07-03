@@ -253,18 +253,6 @@
                             <a-icon type="qrcode"></a-icon>
                             {{ i18n "qrCode" }}
                           </a-menu-item>
-                          <template v-if="dbInbound.isOpenvpn">
-                            <a-menu-item key="ovpnUdp"
-                              v-if="dbInbound.toInbound().settings.udpEnable">
-                              <a-icon type="download"></a-icon>
-                              {{ i18n "pages.inbounds.export" }} UDP (.ovpn)
-                            </a-menu-item>
-                            <a-menu-item key="ovpnTcp"
-                              v-if="dbInbound.toInbound().settings.tcpEnable">
-                              <a-icon type="download"></a-icon>
-                              {{ i18n "pages.inbounds.export" }} TCP (.ovpn)
-                            </a-menu-item>
-                          </template>
                           <template v-if="dbInbound.isMultiUser()">
                             <a-menu-item key="addClient">
                               <a-icon type="user-add"></a-icon>
@@ -329,6 +317,16 @@
                         </a-menu>
                       </a-dropdown>
                     </template>
+                    <template slot="port" slot-scope="text, dbInbound">
+                      <template v-if="dbInbound.isOpenvpn">
+                        <span v-if="dbInbound.toInbound().settings.tcpEnable">TCP:
+                          [[ dbInbound.toInbound().settings.tcpPort ]]</span>
+                        <span v-if="dbInbound.toInbound().settings.udpEnable"
+                          :style="{ marginLeft: dbInbound.toInbound().settings.tcpEnable ? '8px' : '0' }">UDP:
+                          [[ dbInbound.port ]]</span>
+                      </template>
+                      <template v-else>[[ dbInbound.port ]]</template>
+                    </template>
                     <template slot="protocol" slot-scope="text, dbInbound">
                       <a-tag :style="{ margin: '0' }" color="purple">[[
                         dbInbound.protocol ]]</a-tag>
@@ -342,6 +340,22 @@
                         <a-tag :style="{ margin: '0' }"
                           v-if="dbInbound.toInbound().stream.isReality"
                           color="blue">Reality</a-tag>
+                      </template>
+                      <template v-if="dbInbound.isOpenvpn">
+                        <a-tooltip
+                          v-if="dbInbound.toInbound().settings.udpEnable"
+                          title="Export OpenVPN UDP config (.ovpn)">
+                          <a-button size="small" icon="download"
+                            :style="{ marginLeft: '4px', padding: '0 6px' }"
+                            @click="downloadOvpn(dbInbound.id, 'udp')">UDP</a-button>
+                        </a-tooltip>
+                        <a-tooltip
+                          v-if="dbInbound.toInbound().settings.tcpEnable"
+                          title="Export OpenVPN TCP config (.ovpn)">
+                          <a-button size="small" icon="download"
+                            :style="{ marginLeft: '4px', padding: '0 6px' }"
+                            @click="downloadOvpn(dbInbound.id, 'tcp')">TCP</a-button>
+                        </a-tooltip>
                       </template>
                     </template>
                     <template slot="clients" slot-scope="text, dbInbound">
@@ -1030,8 +1044,8 @@
   }, {
     title: '{{ i18n "pages.inbounds.port" }}',
     align: 'center',
-    dataIndex: "port",
     width: 40,
+    scopedSlots: { customRender: 'port' },
   }, {
     title: '{{ i18n "pages.inbounds.protocol" }}',
     align: 'left',
@@ -1388,12 +1402,6 @@
             break;
           case "delDepletedClients":
             this.delDepletedClients(dbInbound.id)
-            break;
-          case "ovpnUdp":
-            this.downloadOvpn(dbInbound.id, "udp");
-            break;
-          case "ovpnTcp":
-            this.downloadOvpn(dbInbound.id, "tcp");
             break;
         }
       },

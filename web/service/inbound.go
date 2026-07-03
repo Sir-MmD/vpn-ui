@@ -251,6 +251,17 @@ func (s *InboundService) checkEmailExistForInbound(inbound *model.Inbound) (stri
 	return "", nil
 }
 
+// isVpnProtocol reports whether a protocol is one of the panel's built-in VPN
+// backends (L2TP/PPTP/OpenVPN). These are NOT native Xray inbounds — Xray only
+// sees a separately-injected dokodemo-door that shares the inbound's tag — so
+// the live add/del inbound API must not touch them: DelInbound(tag) would drop
+// that dokodemo and AddInbound can't recreate it ("openvpn" etc. aren't Xray
+// protocols), silently killing the clients' route to the internet. Changes to
+// them are applied by a full Xray restart instead.
+func isVpnProtocol(p model.Protocol) bool {
+	return p == model.L2TP || p == model.PPTP || p == model.OPENVPN
+}
+
 // AddInbound creates a new inbound configuration.
 // It validates port uniqueness, client email uniqueness, and required fields,
 // then saves the inbound to the database and optionally adds it to the running Xray instance.
@@ -357,20 +368,25 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 
 	needRestart := false
 	if inbound.Enable {
-		s.xrayApi.Init(p.GetAPIPort())
-		inboundJson, err1 := json.MarshalIndent(inbound.GenXrayInboundConfig(), "", "  ")
-		if err1 != nil {
-			logger.Debug("Unable to marshal inbound config:", err1)
-		}
-
-		err1 = s.xrayApi.AddInbound(inboundJson)
-		if err1 == nil {
-			logger.Debug("New inbound added by api:", inbound.Tag)
-		} else {
-			logger.Debug("Unable to add inbound by api:", err1)
+		if isVpnProtocol(inbound.Protocol) {
+			// Its dokodemo is added by the full restart the caller triggers.
 			needRestart = true
+		} else {
+			s.xrayApi.Init(p.GetAPIPort())
+			inboundJson, err1 := json.MarshalIndent(inbound.GenXrayInboundConfig(), "", "  ")
+			if err1 != nil {
+				logger.Debug("Unable to marshal inbound config:", err1)
+			}
+
+			err1 = s.xrayApi.AddInbound(inboundJson)
+			if err1 == nil {
+				logger.Debug("New inbound added by api:", inbound.Tag)
+			} else {
+				logger.Debug("Unable to add inbound by api:", err1)
+				needRestart = true
+			}
+			s.xrayApi.Close()
 		}
-		s.xrayApi.Close()
 	}
 
 	return inbound, needRestart, err
@@ -546,32 +562,40 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 	}
 
 	needRestart := false
-	s.xrayApi.Init(p.GetAPIPort())
-	if s.xrayApi.DelInbound(tag) == nil {
-		logger.Debug("Old inbound deleted by api:", tag)
-	}
-	if inbound.Enable {
-		runtimeInbound, err2 := s.buildRuntimeInboundForAPI(tx, oldInbound)
-		if err2 != nil {
-			logger.Debug("Unable to prepare runtime inbound config:", err2)
-			needRestart = true
-		} else {
-			inboundJson, err2 := json.MarshalIndent(runtimeInbound.GenXrayInboundConfig(), "", "  ")
+	if isVpnProtocol(oldInbound.Protocol) {
+		// Leave the running dokodemo in place — the live del/add API would drop
+		// it and be unable to recreate it, cutting the clients' internet until a
+		// full restart. The caller's on{L2tp,Pptp,OpenVpn}Changed handles the
+		// restart that rebuilds it.
+		needRestart = true
+	} else {
+		s.xrayApi.Init(p.GetAPIPort())
+		if s.xrayApi.DelInbound(tag) == nil {
+			logger.Debug("Old inbound deleted by api:", tag)
+		}
+		if inbound.Enable {
+			runtimeInbound, err2 := s.buildRuntimeInboundForAPI(tx, oldInbound)
 			if err2 != nil {
-				logger.Debug("Unable to marshal updated inbound config:", err2)
+				logger.Debug("Unable to prepare runtime inbound config:", err2)
 				needRestart = true
 			} else {
-				err2 = s.xrayApi.AddInbound(inboundJson)
-				if err2 == nil {
-					logger.Debug("Updated inbound added by api:", oldInbound.Tag)
-				} else {
-					logger.Debug("Unable to update inbound by api:", err2)
+				inboundJson, err2 := json.MarshalIndent(runtimeInbound.GenXrayInboundConfig(), "", "  ")
+				if err2 != nil {
+					logger.Debug("Unable to marshal updated inbound config:", err2)
 					needRestart = true
+				} else {
+					err2 = s.xrayApi.AddInbound(inboundJson)
+					if err2 == nil {
+						logger.Debug("Updated inbound added by api:", oldInbound.Tag)
+					} else {
+						logger.Debug("Unable to update inbound by api:", err2)
+						needRestart = true
+					}
 				}
 			}
 		}
+		s.xrayApi.Close()
 	}
-	s.xrayApi.Close()
 
 	return inbound, needRestart, tx.Save(oldInbound).Error
 }

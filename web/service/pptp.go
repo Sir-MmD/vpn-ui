@@ -26,12 +26,15 @@ type PptpService struct {
 
 // pptpSettings represents the PPTP-specific settings stored in the inbound's Settings JSON.
 type pptpSettings struct {
-	IpRange string       `json:"ipRange"`
-	LocalIp string       `json:"localIp"`
-	Dns1    string       `json:"dns1"`
-	Dns2    string       `json:"dns2"`
-	Mtu     int          `json:"mtu"`
-	Clients []pptpClient `json:"clients"`
+	ClientToClient bool         `json:"clientToClient"`
+	CrossInbound   bool         `json:"crossInbound"`
+	IpRanges       []string     `json:"ipRanges"`
+	IpRange        string       `json:"ipRange"` // legacy single-range field (read-only fallback)
+	LocalIp        string       `json:"localIp"`
+	Dns1           string       `json:"dns1"`
+	Dns2           string       `json:"dns2"`
+	Mtu            int          `json:"mtu"`
+	Clients        []pptpClient `json:"clients"`
 }
 
 type pptpClient struct {
@@ -71,17 +74,32 @@ func (s *PptpService) parseSettings(inbound *model.Inbound) (*pptpSettings, erro
 	return settings, err
 }
 
-// GetSubnetForInbound returns 10.1.x where x is derived from the inbound ID.
-func (s *PptpService) GetSubnetForInbound(inbound *model.Inbound) string {
-	settings, err := s.parseSettings(inbound)
-	if err == nil && settings.LocalIp != "" {
-		parts := strings.Split(settings.LocalIp, ".")
-		if len(parts) >= 3 {
-			return strings.Join(parts[:3], ".")
+// effectiveRanges returns the inbound's configured IP ranges, seeding from the
+// legacy single ipRange field when the ipRanges list is empty.
+func (o *pptpSettings) effectiveRanges() []string {
+	if len(o.IpRanges) > 0 {
+		return o.IpRanges
+	}
+	if o.IpRange != "" {
+		return []string{o.IpRange}
+	}
+	return nil
+}
+
+// GetSubnetsForInbound returns every /24 prefix ("10.1.x") the inbound's client
+// ranges cover. Falls back to the legacy id-derived /24 when nothing is stored.
+func (s *PptpService) GetSubnetsForInbound(inbound *model.Inbound) []string {
+	if settings, err := s.parseSettings(inbound); err == nil {
+		if subs := subnetsOf(settings.effectiveRanges()); len(subs) > 0 {
+			return subs
 		}
 	}
-	// Deterministic: 10.1.{id}.0/24
-	return fmt.Sprintf("10.1.%d", inbound.Id)
+	return []string{fmt.Sprintf("10.1.%d", inbound.Id)}
+}
+
+// GetSubnetForInbound returns the inbound's first /24 subnet (legacy callers).
+func (s *PptpService) GetSubnetForInbound(inbound *model.Inbound) string {
+	return s.GetSubnetsForInbound(inbound)[0]
 }
 
 // GetTproxyPort returns the TPROXY port for this inbound (shared formula with L2TP).
@@ -148,30 +166,28 @@ func (s *PptpService) GeneratePptpdConfig(inbounds []*model.Inbound) error {
 			continue
 		}
 
-		subnet := s.GetSubnetForInbound(inbound)
-		ipRange := settings.IpRange
-		if ipRange == "" {
-			ipRange = fmt.Sprintf("%s.10-%s.50", subnet, subnet)
+		ranges := settings.effectiveRanges()
+		if len(ranges) == 0 {
+			subnet := s.GetSubnetForInbound(inbound)
+			ranges = []string{defaultRange(subnet)}
 		}
 		localIp := settings.LocalIp
-		if localIp == "" {
-			localIp = fmt.Sprintf("%s.1", subnet)
+		if start, _, ok := parseRange(ranges[0]); ok {
+			localIp = fmt.Sprintf("%d.%d.%d.1", start[0], start[1], start[2])
+		}
+
+		// pptpd remoteip is a comma-separated list of ranges in the "A.B.C.s-e"
+		// shorthand (last octet after the dash), e.g. "10.1.2.10-50,10.1.3.10-250".
+		var groups []string
+		for _, r := range ranges {
+			if start, end, ok := parseRange(r); ok {
+				groups = append(groups, fmt.Sprintf("%d.%d.%d.%d-%d", start[0], start[1], start[2], start[3], end[3]))
+			}
 		}
 
 		b.WriteString(fmt.Sprintf("option /etc/ppp/pptpd-options-%d\n", inbound.Id))
 		b.WriteString(fmt.Sprintf("localip %s\n", localIp))
-		// pptpd remoteip format: start-end (e.g., 10.1.2.10-50)
-		// Parse ipRange which is in format "10.1.2.10-10.1.2.50"
-		remoteIp := ipRange
-		parts := strings.SplitN(ipRange, "-", 2)
-		if len(parts) == 2 {
-			endParts := strings.Split(parts[1], ".")
-			if len(endParts) == 4 {
-				// Full IP on both sides: "10.1.2.10-10.1.2.50" -> "10.1.2.10-50"
-				remoteIp = fmt.Sprintf("%s-%s", parts[0], endParts[3])
-			}
-		}
-		b.WriteString(fmt.Sprintf("remoteip %s\n", remoteIp))
+		b.WriteString(fmt.Sprintf("remoteip %s\n", strings.Join(groups, ",")))
 	}
 
 	return s.writeFile("/etc/pptpd.conf", b.String())
@@ -259,22 +275,33 @@ func (s *PptpService) SetupAllTproxy() error {
 	return s.nftService.ApplyNftRules()
 }
 
-// RestartServices restarts pptpd.
+// RestartServices (re)launches pptpd as a panel-managed child process.
 func (s *PptpService) RestartServices() error {
+	migrateFromSystemd()
+
 	inbounds, err := s.GetPptpInbounds()
 	if err != nil {
 		return err
 	}
 
 	if len(inbounds) == 0 {
+		procMgr.Stop("pptpd")
 		return nil
 	}
 
-	if err := s.runCmd("systemctl", "restart", "pptpd"); err != nil {
-		logger.Warning("PPTP: failed to restart pptpd:", err)
+	// pptpd --fg runs in the foreground reading /etc/pptpd.conf; the panel
+	// supervises it and reaps its pppd children.
+	linkPptpCtrl()
+	if err := procMgr.Start("pptpd", daemonBin("pptpd"), pptpdArgs(), pppdEnv(), ""); err != nil {
+		logger.Warning("PPTP: failed to start pptpd:", err)
 	}
 
 	return nil
+}
+
+// StopServices stops the PPTP (pptpd) child process.
+func (s *PptpService) StopServices() {
+	procMgr.Stop("pptpd")
 }
 
 // InitPptp initializes PPTP services on panel startup.
