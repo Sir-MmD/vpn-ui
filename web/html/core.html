@@ -213,7 +213,7 @@
     methods: {
       async loadStatus(showSpin) {
         if (showSpin) this.spinning = true;
-        const msg = await HttpUtil.get('{{ .base_path }}panel/core/status');
+        const msg = await HttpUtil.get('/panel/core/status');
         if (msg && msg.success && msg.obj) {
           this.cores = msg.obj.cores || [];
           this.system = msg.obj.system || { modules: [] };
@@ -222,17 +222,17 @@
       },
       async restart(core) {
         this.spinning = true;
-        await HttpUtil.post('{{ .base_path }}panel/core/restart/' + core);
+        await HttpUtil.post('/panel/core/restart/' + core);
         await this.loadStatus(false);
       },
       async restartAll() {
         this.spinning = true;
-        await HttpUtil.post('{{ .base_path }}panel/core/restart-all');
+        await HttpUtil.post('/panel/core/restart-all');
         await this.loadStatus(false);
       },
       async stop(core) {
         this.spinning = true;
-        await HttpUtil.post('{{ .base_path }}panel/core/stop/' + core);
+        await HttpUtil.post('/panel/core/stop/' + core);
         await this.loadStatus(false);
       },
       async showLogs(core) {
@@ -244,7 +244,7 @@
       },
       async loadLogs(core) {
         this.logsLoading = true;
-        const msg = await HttpUtil.get('{{ .base_path }}panel/core/logs/' + core);
+        const msg = await HttpUtil.get('/panel/core/logs/' + core);
         this.logsLoading = false;
         if (msg && msg.success) {
           this.logsContent = msg.obj || '';
@@ -267,7 +267,7 @@
       },
       async runProvision() {
         this.provisioning = true;
-        const msg = await HttpUtil.post('{{ .base_path }}panel/core/provision');
+        const msg = await HttpUtil.post('/panel/core/provision');
         this.provisioning = false;
         if (msg && msg.success) {
           this.provisionResult = msg.obj || [];
