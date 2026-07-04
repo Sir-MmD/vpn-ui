@@ -25,6 +25,7 @@ type SettingController struct {
 	settingService service.SettingService
 	userService    service.UserService
 	panelService   service.PanelService
+	systemdService service.SystemdService
 }
 
 // NewSettingController creates a new SettingController and initializes its routes.
@@ -44,6 +45,31 @@ func (a *SettingController) initRouter(g *gin.RouterGroup) {
 	g.POST("/updateUser", a.updateUser)
 	g.POST("/restartPanel", a.restartPanel)
 	g.GET("/getDefaultJsonConfig", a.getDefaultXrayConfig)
+	g.GET("/service", a.serviceStatus)
+	g.GET("/service/log", a.serviceLog)
+	g.POST("/service", a.saveService)
+}
+
+// serviceStatus returns the current systemd unit state for the panel.
+func (a *SettingController) serviceStatus(c *gin.Context) {
+	jsonObj(c, a.systemdService.ServiceState(), nil)
+}
+
+// serviceLog returns the live systemd status + journal tail for the panel's unit.
+func (a *SettingController) serviceLog(c *gin.Context) {
+	jsonObj(c, a.systemdService.ServiceLog(), nil)
+}
+
+// saveService writes/updates the panel's systemd unit and applies the enable
+// (start-on-boot) and start (run-now) toggles.
+func (a *SettingController) saveService(c *gin.Context) {
+	var req service.SaveServiceRequest
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
+		return
+	}
+	err := a.systemdService.SaveService(req)
+	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 }
 
 // getAllSetting retrieves all current settings.

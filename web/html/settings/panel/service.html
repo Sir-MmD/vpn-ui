@@ -1,0 +1,149 @@
+{{define "settings/panel/service"}}
+<a-collapse default-active-key="1">
+    <a-collapse-panel key="1" header='{{ i18n "pages.settings.serviceSettings" }}'>
+        <a-alert v-if="serviceState.available === false" type="warning" show-icon banner
+            message='{{ i18n "pages.settings.service.noSystemd" }}' :style="{ marginBottom: '16px' }"></a-alert>
+
+        <a-setting-list-item paddings="small">
+            <template #title>{{ i18n "pages.settings.service.name" }}</template>
+            <template #description>{{ i18n "pages.settings.service.nameDesc" }}</template>
+            <template #control>
+                <a-input v-model="serviceState.name" placeholder="vpn-ui"></a-input>
+            </template>
+        </a-setting-list-item>
+
+        <a-setting-list-item paddings="small">
+            <template #title>{{ i18n "pages.settings.service.enable" }}</template>
+            <template #description>{{ i18n "pages.settings.service.enableDesc" }}</template>
+            <template #control>
+                <a-switch v-model="serviceState.enabled"></a-switch>
+            </template>
+        </a-setting-list-item>
+
+        <a-setting-list-item paddings="small">
+            <template #title>{{ i18n "pages.settings.service.start" }}</template>
+            <template #description>{{ i18n "pages.settings.service.startDesc" }}</template>
+            <template #control>
+                <a-switch v-model="serviceState.active"></a-switch>
+            </template>
+        </a-setting-list-item>
+
+        <a-setting-list-item paddings="small">
+            <template #title>{{ i18n "pages.settings.service.status" }}</template>
+            <template #description>{{ i18n "pages.settings.service.statusDesc" }}</template>
+            <template #control>
+                <a-space wrap>
+                    <a-tag :color="serviceState.installed ? 'green' : ''">
+                        <a-icon :type="serviceState.installed ? 'check' : 'minus'"></a-icon>
+                        {{ i18n "pages.settings.service.installed" }}
+                    </a-tag>
+                    <a-tag :color="serviceState.enabled ? 'green' : ''">
+                        <a-icon :type="serviceState.enabled ? 'check' : 'minus'"></a-icon>
+                        {{ i18n "pages.settings.service.onBoot" }}
+                    </a-tag>
+                    <a-tag :color="serviceState.active ? 'green' : 'red'">
+                        <a-icon :type="serviceState.active ? 'check-circle' : 'close-circle'"></a-icon>
+                        [[ serviceState.active ? '{{ i18n "pages.core.stateRunning" }}' : '{{ i18n "pages.core.stateStopped" }}' ]]
+                    </a-tag>
+                    <a-button size="small" @click="loadServiceState"><a-icon type="reload"></a-icon></a-button>
+                </a-space>
+            </template>
+        </a-setting-list-item>
+
+        <div :style="{ padding: '10px 20px' }">
+            <a-row :gutter="[16, 16]">
+                <!-- Left: editable unit file -->
+                <a-col :xs="24" :lg="12">
+                    <div :style="{ fontWeight: 600, marginBottom: '2px' }">{{ i18n "pages.settings.service.unit" }}</div>
+                    <div :style="{ opacity: 0.65, marginBottom: '8px', fontSize: '13px' }">{{ i18n "pages.settings.service.unitDesc" }}</div>
+                    <a-textarea v-model="serviceState.unit" :rows="16" spellcheck="false"
+                        :style="{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', fontSize: '12px' }"></a-textarea>
+                </a-col>
+                <!-- Right: live service status log — same terminal look as setup -->
+                <a-col :xs="24" :lg="12">
+                    <div :style="{ display: 'flex', alignItems: 'center', marginBottom: '2px' }">
+                        <span :style="{ fontWeight: 600 }">{{ i18n "pages.settings.service.liveLog" }}</span>
+                        <span :style="{ flex: 1 }"></span>
+                        <span :style="{ fontSize: '12px', opacity: 0.6, marginRight: '8px' }">{{ i18n "pages.settings.service.autoRefresh" }}</span>
+                        <a-switch size="small" v-model="serviceLogAuto" @change="toggleServiceLogAuto"></a-switch>
+                        <a-button size="small" :style="{ marginLeft: '8px' }" :loading="serviceLogLoading"
+                            @click="loadServiceLog"><a-icon type="reload"></a-icon></a-button>
+                    </div>
+                    <div :style="{ opacity: 0.65, marginBottom: '8px', fontSize: '13px' }">{{ i18n "pages.settings.service.liveLogDesc" }}</div>
+                    <div class="svc-term">
+                        <div class="svc-term-bar">
+                            <a-icon type="code" class="svc-term-icon"></a-icon>
+                            <span class="svc-term-title">vpn-ui — [[ serviceState.name ]].service</span>
+                            <span class="svc-term-dot" :class="serviceState.active ? 'on' : 'off'"></span>
+                        </div>
+                        <pre class="svc-term-body" ref="serviceLog">[[ serviceLog || '{{ i18n "pages.settings.service.noLog" }}' ]]</pre>
+                    </div>
+                </a-col>
+            </a-row>
+            <div :style="{ marginTop: '12px', textAlign: 'right' }">
+                <a-space>
+                    <a-button @click="resetServiceUnit">{{ i18n "pages.settings.service.loadDefault" }}</a-button>
+                    <a-button type="primary" :loading="serviceSaving"
+                        :disabled="serviceState.available === false" @click="saveService">
+                        <a-icon type="save"></a-icon>{{ i18n "pages.settings.service.apply" }}
+                    </a-button>
+                </a-space>
+            </div>
+        </div>
+    </a-collapse-panel>
+</a-collapse>
+<style>
+    /* Terminal look matching the setup console */
+    .svc-term {
+        border-radius: 10px;
+        overflow: hidden;
+        border: 1px solid rgba(0, 0, 0, 0.4);
+        background: #0d1117;
+        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
+    }
+
+    .svc-term-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        background: #161b22;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .svc-term-icon {
+        color: rgba(255, 255, 255, 0.4);
+        font-size: 13px;
+    }
+
+    .svc-term-title {
+        flex: 1;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.5);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .svc-term-dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+    }
+
+    .svc-term-dot.on { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
+    .svc-term-dot.off { background: #6e7681; }
+
+    .svc-term-body {
+        height: 340px;
+        overflow: auto;
+        margin: 0;
+        padding: 12px 14px;
+        background: #0d1117;
+        color: #c9d1d9;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+</style>
+{{end}}

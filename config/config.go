@@ -5,7 +5,6 @@ package config
 import (
 	_ "embed"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -83,21 +82,47 @@ func getBaseDir() string {
 	return exeDir
 }
 
-// GetDBFolderPath returns the path to the database folder based on environment variables or platform defaults.
+// GetDBFolderPath returns the folder that holds the database file. It defaults to
+// the directory of the binary (overridable with XUI_DB_FOLDER) so a copied or
+// moved install carries its data with it, rather than silently sharing a fixed
+// /etc/x-ui. Legacy installs are migrated from LegacyDBPath on first init.
 func GetDBFolderPath() string {
 	dbFolderPath := os.Getenv("XUI_DB_FOLDER")
 	if dbFolderPath != "" {
 		return dbFolderPath
 	}
-	if runtime.GOOS == "windows" {
-		return getBaseDir()
-	}
-	return "/etc/x-ui"
+	return getBaseDir()
 }
 
-// GetDBPath returns the full path to the database file.
+// dbBaseName is the database file's base name (without extension). It is fixed
+// rather than derived from GetName() so the on-disk DB is always "vpn-ui.db".
+const dbBaseName = "vpn-ui"
+
+// GetDBPath returns the full path to the database file (next to the binary).
 func GetDBPath() string {
-	return fmt.Sprintf("%s/%s.db", GetDBFolderPath(), GetName())
+	return fmt.Sprintf("%s/%s.db", GetDBFolderPath(), dbBaseName)
+}
+
+// LegacyDBPaths lists previous database names next to the binary to migrate from
+// on first init when the current DB doesn't exist yet:
+//   - <bindir>/x-ui.db — the prior next-to-binary name (before the vpn-ui rename)
+//
+// It deliberately does NOT reach into /etc/x-ui — a DB left there is not adopted.
+// The current GetDBPath is never included. Empty on a custom XUI_DB_FOLDER.
+func LegacyDBPaths() []string {
+	if os.Getenv("XUI_DB_FOLDER") != "" {
+		return nil
+	}
+	current := GetDBPath()
+	var out []string
+	for _, p := range []string{
+		fmt.Sprintf("%s/x-ui.db", GetDBFolderPath()),
+	} {
+		if p != current {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // GetLogFolder returns the path to the log folder based on environment variables or platform defaults.
@@ -112,45 +137,5 @@ func GetLogFolder() string {
 	return "/var/log/x-ui"
 }
 
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, in)
-	if err != nil {
-		return err
-	}
-
-	return out.Sync()
-}
-
-func init() {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	if os.Getenv("XUI_DB_FOLDER") != "" {
-		return
-	}
-	oldDBFolder := "/etc/x-ui"
-	oldDBPath := fmt.Sprintf("%s/%s.db", oldDBFolder, GetName())
-	newDBFolder := GetDBFolderPath()
-	newDBPath := fmt.Sprintf("%s/%s.db", newDBFolder, GetName())
-	_, err := os.Stat(newDBPath)
-	if err == nil {
-		return // new exists
-	}
-	_, err = os.Stat(oldDBPath)
-	if os.IsNotExist(err) {
-		return // old does not exist
-	}
-	_ = copyFile(oldDBPath, newDBPath) // ignore error
-}
+// DB migration (moving/renaming a legacy database to GetDBPath) is handled
+// cross-platform by database.InitDB via config.LegacyDBPaths — see migrateLegacyDB.

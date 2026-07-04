@@ -121,12 +121,64 @@ func isTableEmpty(tableName string) (bool, error) {
 }
 
 // InitDB sets up the database connection, migrates models, and runs seeders.
+// migrateLegacyDB moves a database (plus its sqlite sidecar files) from a prior
+// location/name to the current path when the current one doesn't exist yet, so
+// upgrades keep their users and inbounds. It tries each legacy candidate in order
+// and migrates the first that exists. Best-effort: any failure just leaves a
+// fresh DB to be created at the new path.
+func migrateLegacyDB(dbPath string) {
+	if _, err := os.Stat(dbPath); err == nil {
+		return // current DB already present — nothing to migrate
+	}
+	for _, legacy := range config.LegacyDBPaths() {
+		if legacy == dbPath {
+			continue
+		}
+		if _, err := os.Stat(legacy); err != nil {
+			continue // this legacy DB doesn't exist — try the next
+		}
+		for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+			src, dst := legacy+suffix, dbPath+suffix
+			if _, err := os.Stat(src); err != nil {
+				continue
+			}
+			if err := os.Rename(src, dst); err != nil {
+				// Different filesystem (e.g. /etc vs /root on separate mounts): copy.
+				if copyFile(src, dst) == nil {
+					_ = os.Remove(src)
+				}
+			}
+		}
+		log.Printf("migrated database from %s to %s", legacy, dbPath)
+		return
+	}
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
 func InitDB(dbPath string) error {
 	dir := path.Dir(dbPath)
 	err := os.MkdirAll(dir, fs.ModePerm)
 	if err != nil {
 		return err
 	}
+
+	migrateLegacyDB(dbPath)
 
 	var gormLogger logger.Interface
 

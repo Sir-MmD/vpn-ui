@@ -1152,6 +1152,7 @@
       showAlert: false,
       ipLimitEnable: false,
       pageSize: 0,
+      provisioned: true,
     },
     methods: {
       loading(spinning = true) {
@@ -1207,6 +1208,10 @@
         this.remarkModel = settings.remarkModel;
         this.datepicker = settings.datepicker;
         this.ipLimitEnable = settings.ipLimitEnable;
+        // Only treat as un-provisioned when the backend explicitly says so; a
+        // missing/failed value stays true so we never wrongly block (the server
+        // enforces the real guard).
+        this.provisioned = settings.provisioned !== false;
       },
       setInbounds(dbInbounds) {
         this.inbounds.splice(0);
@@ -1770,7 +1775,28 @@
           this.loading(false);
         }
       },
+      showSetupRequired() {
+        this.$confirm({
+          title: '{{ i18n "pages.inbounds.toasts.setupRequiredTitle" }}',
+          content: '{{ i18n "pages.inbounds.toasts.setupRequired" }}',
+          okText: '{{ i18n "pages.inbounds.toasts.setupRequiredOk" }}',
+          cancelText: '{{ i18n "cancel" }}',
+          class: themeSwitcher.currentTheme,
+          onOk: () => {
+            window.location.href = basePath + 'panel/core';
+          },
+        });
+      },
       async submit(url, data, modal) {
+        // Block creating a VPN inbound (L2TP/PPTP/OpenVPN) before the backend is
+        // set up; point the user at Core Settings. `data` is a plain object for
+        // add/clone and FormData for update, so data.protocol only matches creates.
+        if (typeof url === 'string' && url.endsWith('/inbounds/add') && !this.provisioned &&
+            data && [Protocols.L2TP, Protocols.PPTP, Protocols.OPENVPN].includes(data.protocol)) {
+          if (modal && typeof modal.close === 'function') modal.close();
+          this.showSetupRequired();
+          return;
+        }
         const msg = await HttpUtil.postWithModal(url, data, modal);
         if (msg.success) {
           await this.getDBInbounds();

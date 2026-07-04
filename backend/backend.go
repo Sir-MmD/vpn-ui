@@ -111,10 +111,27 @@ func Extract() ([]string, error) {
 			return written, err
 		}
 		dest := filepath.Join(dir, e.Name())
-		if err := os.WriteFile(dest, data, 0o755); err != nil {
+		if err := writeExecutable(dest, data); err != nil {
 			return written, err
 		}
 		written = append(written, dest)
 	}
 	return written, nil
+}
+
+// writeExecutable writes an executable to dest via a temp file + atomic rename.
+// A plain overwrite of a daemon that's currently running fails with ETXTBSY
+// ("text file busy") because the kernel keeps the running binary's file mapped.
+// Rename swaps the directory entry to a fresh inode instead — the running
+// process keeps executing the old inode, and the next start picks up the new one.
+func writeExecutable(dest string, data []byte) error {
+	tmp := dest + ".new"
+	if err := os.WriteFile(tmp, data, 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }

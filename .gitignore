@@ -42,3 +42,7 @@ docker-compose.override.yml
 /vpn-ui
 /vpn-ui.bak.*
 .claude/
+
+# caveman plugin tooling (not project code)
+.agents/
+skills-lock.json

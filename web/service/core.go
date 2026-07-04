@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/backend"
 	"github.com/mhsanaei/3x-ui/v2/config"
@@ -23,8 +24,9 @@ var vpnKernelModules = []string{
 	"nf_conntrack_pptp", // PPTP
 	"ip_gre",            // PPTP/GRE
 	"ppp_mppe",          // MPPE
-	"nf_tproxy_ipv4",    // TPROXY (L2TP/PPTP -> Xray)
+	"nf_tproxy_ipv4",    // TPROXY (L2TP/PPTP/OpenVPN -> Xray)
 	"af_key",            // IPsec
+	"tun",               // OpenVPN tun device
 }
 
 // CoreState is the coarse health of a backend "core".
@@ -65,10 +67,16 @@ type SystemStatus struct {
 }
 
 // ProvisionStep is one action taken by Provision(), for reporting to the UI/CLI.
+// Warn marks a step that succeeded but needs the operator's attention (e.g. a
+// kernel package was installed but its modules only load after a reboot). Log
+// holds the raw command output for that step (package-manager output, modprobe
+// errors, …), shown when the operator expands the step in the setup console.
 type ProvisionStep struct {
 	Name string `json:"name"`
 	OK   bool   `json:"ok"`
+	Warn bool   `json:"warn,omitempty"`
 	Msg  string `json:"msg"`
+	Log  string `json:"log,omitempty"`
 }
 
 // CoreService aggregates status and provisioning across all backend cores.
@@ -108,6 +116,18 @@ func moduleLoaded(name string) bool {
 	// /sys/module/<name> exists for both loadable-and-loaded and built-in modules.
 	_, err := os.Stat("/sys/module/" + name)
 	return err == nil
+}
+
+// moduleAvailable reports whether a module can be used on the running kernel —
+// already loaded, built into the kernel, or loadable on demand. It drives the
+// "do we need to install a kernel package?" decision, so it must NOT false-
+// negative on built-in modules (which have no /sys/module entry): `modprobe -nq`
+// resolves both loadable .ko files and built-ins, returning success for either.
+func moduleAvailable(name string) bool {
+	if moduleLoaded(name) {
+		return true
+	}
+	return exec.Command("modprobe", "-nq", name).Run() == nil
 }
 
 var (
@@ -337,6 +357,20 @@ func (s *CoreService) GetSystemStatus() SystemStatus {
 	return st
 }
 
+// IsProvisioned reports whether the VPN backend setup ("Initialize Setup") has
+// been completed. It is true when the persisted flag is set, or — for installs
+// provisioned before that flag existed — when the host already looks prepared:
+// IP forwarding is enabled and a bundled daemon is available (daemons are only
+// extracted by Provision). This fallback keeps already-set-up upgrades from
+// regressing to the setup call-to-action.
+func (s *CoreService) IsProvisioned() bool {
+	var ss SettingService
+	if ss.GetVpnProvisioned() {
+		return true
+	}
+	return procFileIsOne("/proc/sys/net/ipv4/ip_forward") && daemonInstalled("openvpn")
+}
+
 // --------------------------------------------------------------------------- //
 //  Control + provisioning
 // --------------------------------------------------------------------------- //
@@ -436,25 +470,44 @@ func filterLogs(keyword string) string {
 // Provision performs the host/kernel preparation that no bundled binary can do:
 // load + persist the required kernel modules and enable + persist IP forwarding.
 // It is idempotent and safe to run repeatedly. This is the in-binary replacement
-// for the host-prep half of setup-vpn-backend.sh.
+// for the host-prep half of setup-vpn-backend.sh. It collects and returns all
+// steps; use StartProvision for the streamed, non-blocking variant.
 func (s *CoreService) Provision() []ProvisionStep {
 	var steps []ProvisionStep
+	s.runProvisionSteps(func(st ProvisionStep) { steps = append(steps, st) })
+	return steps
+}
 
+// runProvisionSteps performs each provisioning action and invokes emit after
+// every step, so callers can stream progress to a live log. It is idempotent.
+// It returns the kernel modules that will only load after a reboot (empty when
+// none) together with the package that provides them, so the caller can prompt
+// the operator to reboot.
+func (s *CoreService) runProvisionSteps(emit func(ProvisionStep)) (rebootModules []string, rebootPkg string) {
 	for _, m := range vpnKernelModules {
 		if moduleLoaded(m) {
-			steps = append(steps, ProvisionStep{Name: "module " + m, OK: true, Msg: "already loaded"})
+			emit(ProvisionStep{Name: "module " + m, OK: true, Msg: "already loaded"})
 			continue
 		}
-		err := exec.Command("modprobe", m).Run()
-		steps = append(steps, ProvisionStep{Name: "modprobe " + m, OK: err == nil, Msg: msgOrOK(err)})
+		out, err := exec.Command("modprobe", m).CombinedOutput()
+		if err == nil {
+			emit(ProvisionStep{Name: "modprobe " + m, OK: true, Msg: "loaded"})
+		} else {
+			// Not present in the running kernel. Expected on minimal/cloud images;
+			// the kernel-modules step below installs it (rebooting into a fuller
+			// kernel when the module only ships there). Flag as a warning, not an
+			// error, so the console doesn't look broken mid-run.
+			emit(ProvisionStep{Name: "modprobe " + m, OK: true, Warn: true,
+				Msg: "not in the running kernel — resolving below", Log: strings.TrimSpace(string(out))})
+		}
 	}
 
 	modConf := strings.Join(vpnKernelModules, "\n") + "\n"
 	err := os.WriteFile("/etc/modules-load.d/vpn-ui.conf", []byte(modConf), 0644)
-	steps = append(steps, ProvisionStep{Name: "persist /etc/modules-load.d/vpn-ui.conf", OK: err == nil, Msg: msgOrOK(err)})
+	emit(ProvisionStep{Name: "persist /etc/modules-load.d/vpn-ui.conf", OK: err == nil, Msg: msgOrOK(err)})
 
 	err = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
-	steps = append(steps, ProvisionStep{Name: "sysctl net.ipv4.ip_forward=1", OK: err == nil, Msg: msgOrOK(err)})
+	emit(ProvisionStep{Name: "sysctl net.ipv4.ip_forward=1", OK: err == nil, Msg: msgOrOK(err)})
 
 	// Persist ip_forward plus loose rp_filter. Fedora/RHEL default rp_filter to
 	// strict (1), which drops the policy-routed TPROXY packets carrying VPN client
@@ -464,46 +517,236 @@ func (s *CoreService) Provision() []ProvisionStep {
 		"net.ipv4.conf.all.rp_filter=2\n" +
 		"net.ipv4.conf.default.rp_filter=2\n"
 	err = os.WriteFile("/etc/sysctl.d/99-vpn-ui.conf", []byte(sysctlConf), 0644)
-	steps = append(steps, ProvisionStep{Name: "persist /etc/sysctl.d/99-vpn-ui.conf", OK: err == nil, Msg: msgOrOK(err)})
+	emit(ProvisionStep{Name: "persist /etc/sysctl.d/99-vpn-ui.conf", OK: err == nil, Msg: msgOrOK(err)})
 
 	// Apply loose rp_filter now and, when firewalld is active (Fedora/RHEL), trust
 	// the VPN address space so its default-drop INPUT policy doesn't block the
 	// TPROXY'd data plane. No-op on Debian/Ubuntu.
 	ensureVpnHostNetworking()
-	steps = append(steps, ProvisionStep{Name: "relax rp_filter + trust VPN in firewalld", OK: true, Msg: firewallStepMsg()})
+	emit(ProvisionStep{Name: "relax rp_filter + trust VPN in firewalld", OK: true, Msg: firewallStepMsg()})
 
 	// Extract the daemons baked into the binary and generate their systemd units.
 	// On a build without an embedded bundle this is a no-op.
 	if backend.Available() {
 		files, exErr := backend.Extract()
-		steps = append(steps, ProvisionStep{Name: "extract bundled daemons", OK: exErr == nil, Msg: filesMsg(files, exErr)})
+		emit(ProvisionStep{Name: "extract bundled daemons", OK: exErr == nil, Msg: filesMsg(files, exErr)})
 
 		// pppd ships as a relocatable tree (it dlopens radius.so + OpenSSL
 		// providers, so it can't be one static binary). Extract it and, if the
-		// host has no pppd of its own, point /usr/sbin/pppd at the bundle.
+		// host has no pppd of its own, point /usr/sbin/pppd + /usr/lib/pppd at the
+		// bundle so both the daemon and its plugins resolve to it.
 		if backend.HasPppdBundle() {
 			pErr := backend.ExtractPppdBundle()
-			steps = append(steps, ProvisionStep{Name: "extract pppd bundle", OK: pErr == nil, Msg: msgOrOK(pErr)})
+			emit(ProvisionStep{Name: "extract pppd bundle", OK: pErr == nil, Msg: msgOrOK(pErr)})
 			lErr := backend.LinkSystemPppd()
-			steps = append(steps, ProvisionStep{Name: "link system pppd", OK: lErr == nil, Msg: msgOrOK(lErr)})
+			emit(ProvisionStep{Name: "link system pppd", OK: lErr == nil, Msg: msgOrOK(lErr)})
+			plErr := backend.LinkPluginDir()
+			emit(ProvisionStep{Name: "link pppd plugin dir", OK: plErr == nil, Msg: msgOrOK(plErr)})
 		}
 
 		// pptpd execs pptpctrl from a fixed compiled-in path; point it at the
 		// extracted bundle so pptpd works from any install dir.
 		clErr := backend.LinkPptpCtrl()
-		steps = append(steps, ProvisionStep{Name: "link pptpctrl", OK: clErr == nil, Msg: msgOrOK(clErr)})
+		emit(ProvisionStep{Name: "link pptpctrl", OK: clErr == nil, Msg: msgOrOK(clErr)})
 
 		// The bundled daemons run as child processes of the panel (not systemd),
 		// so any leftover units from the old design are torn down here.
 		migrateFromSystemd()
-		steps = append(steps, ProvisionStep{Name: "run daemons as child processes", OK: true, Msg: "ok"})
+		emit(ProvisionStep{Name: "run daemons as child processes", OK: true, Msg: "ok"})
 	}
+
+	// The VPN data plane needs nftables (TPROXY steering + traffic accounting) and
+	// iproute2 (the fwmark → table 100 policy route). They're present on almost
+	// every host, but minimal cloud/container images can omit them — without them
+	// clients connect but no traffic routes. Install when missing (no-op if present).
+	emit(ensureCommand("nftables", "nft", nftablesPackage))
+	emit(ensureCommand("iproute2 (ip)", "ip", iproutePackage))
 
 	// libreswan (IPsec for L2TP/IPsec) is the one VPN daemon that can't be baked
 	// into the binary, so install it from the host package manager.
-	steps = append(steps, ensureLibreswan())
+	emit(ensureLibreswan())
 
-	return steps
+	// L2TP/PPTP need PPP kernel modules that minimal/cloud kernels omit. Best-
+	// effort install of the distro's full kernel-modules package. When the modules
+	// ship only in a newer kernel, this reports that a reboot is needed to load them.
+	return s.provisionKernelModules(emit)
+}
+
+// provisionKernelModules makes the VPN PPP/L2TP kernel modules available when the
+// running kernel lacks them. It is best-effort and non-interactive: it installs
+// the right package for the distro, loads what it can into the running kernel,
+// and — when the modules only ship in a fuller kernel it had to install — pins
+// that kernel in the bootloader and reports that a reboot is needed (rather than
+// rebooting). It returns the modules that only load after a reboot and the
+// package that was installed.
+//
+// Per-distro behaviour (see KernelModulesPackage / InstallKernelModules):
+//   - Ubuntu: linux-modules-extra-<running> adds modules to the RUNNING kernel →
+//     no reboot. Cut-down flavours (kvm) fall back to linux-generic → reboot.
+//   - Debian: cloud images omit PPP/L2TP, so the generic linux-image-<arch> is
+//     installed → reboot, and the bootloader is pinned to it (a same-version
+//     cloud kernel would otherwise stay the GRUB default).
+//   - Fedora/RHEL/Alma/CentOS: kernel-modules-extra-<running> → no reboot.
+//   - Arch: stock kernel already ships the modules → nothing to do.
+func (s *CoreService) provisionKernelModules(emit func(ProvisionStep)) (rebootModules []string, rebootPkg string) {
+	missing := s.MissingKernelModules()
+	if len(missing) == 0 {
+		return nil, ""
+	}
+	distro := distroPretty()
+
+	pkg := KernelModulesPackage()
+	if pkg == "" {
+		emit(ProvisionStep{Name: "kernel modules", OK: false,
+			Msg: "missing " + strings.Join(missing, ", ") + " on " + distro +
+				" — no kernel-modules package known for this distro; load them manually"})
+		return nil, ""
+	}
+
+	emit(ProvisionStep{Name: "kernel modules (" + distro + ")", OK: true,
+		Msg: "missing " + strings.Join(missing, ", ") + " — installing " + pkg})
+
+	installed, still, newKernel, log, err := s.InstallKernelModules()
+	if err != nil {
+		emit(ProvisionStep{Name: "install " + pkg, OK: false, Msg: err.Error(), Log: log})
+		return nil, ""
+	}
+	if len(still) == 0 {
+		emit(ProvisionStep{Name: "install " + installed, OK: true,
+			Msg: "modules loaded into the running kernel — no reboot needed", Log: log})
+		return nil, ""
+	}
+
+	// Whatever is still missing only exists in a freshly installed kernel that
+	// isn't booted yet. Report it and make the bootloader boot that kernel.
+	if newKernel == "" {
+		emit(ProvisionStep{Name: "install " + installed, OK: true, Warn: true,
+			Msg: "installed; " + strings.Join(still, ", ") + " load after a reboot into the new kernel", Log: log})
+		return still, installed
+	}
+
+	emit(ProvisionStep{Name: "install " + installed, OK: true, Warn: true,
+		Msg: "installed kernel " + newKernel + "; " + strings.Join(still, ", ") + " load after reboot", Log: log})
+
+	bootMsg, bootErr := ensureBootloaderBootsKernel(newKernel)
+	emit(ProvisionStep{Name: "set default boot kernel", OK: bootErr == nil, Msg: bootStepMsg(bootMsg, bootErr)})
+
+	return still, installed
+}
+
+func bootStepMsg(msg string, err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return msg
+}
+
+// provisionRun holds the state of the single, in-progress or most-recent
+// background provisioning run, so the Core Settings page can poll a live log.
+// Provisioning is single-admin and one-at-a-time, so one global run suffices.
+var provisionRun struct {
+	mu             sync.Mutex
+	running        bool
+	done           bool
+	steps          []ProvisionStep
+	rebootRequired bool
+	rebootModules  []string
+	rebootPkg      string
+}
+
+// StartProvision launches provisioning in the background and returns true, or
+// returns false without starting a second run if one is already in progress.
+// On completion it persists the provisioned flag so the setup gate clears.
+func (s *CoreService) StartProvision() bool {
+	provisionRun.mu.Lock()
+	if provisionRun.running {
+		provisionRun.mu.Unlock()
+		return false
+	}
+	provisionRun.running = true
+	provisionRun.done = false
+	provisionRun.steps = nil
+	provisionRun.rebootRequired = false
+	provisionRun.rebootModules = nil
+	provisionRun.rebootPkg = ""
+	provisionRun.mu.Unlock()
+
+	go func() {
+		var cs CoreService // CoreService is zero-value usable and stateless
+		mods, pkg := cs.runProvisionSteps(func(st ProvisionStep) {
+			provisionRun.mu.Lock()
+			provisionRun.steps = append(provisionRun.steps, st)
+			provisionRun.mu.Unlock()
+		})
+		var ss SettingService
+		if err := ss.SetVpnProvisioned(true); err != nil {
+			logger.Warning("failed to persist vpnProvisioned flag:", err)
+		}
+		provisionRun.mu.Lock()
+		provisionRun.running = false
+		provisionRun.done = true
+		provisionRun.rebootRequired = len(mods) > 0
+		provisionRun.rebootModules = mods
+		provisionRun.rebootPkg = pkg
+		provisionRun.mu.Unlock()
+	}()
+	return true
+}
+
+// ProvisionRunState is a snapshot of the background provisioning run, returned to
+// the Core Settings page as it polls for live progress.
+type ProvisionRunState struct {
+	Running        bool            `json:"running"`
+	Done           bool            `json:"done"`
+	Steps          []ProvisionStep `json:"steps"`
+	RebootRequired bool            `json:"rebootRequired"`
+	RebootModules  []string        `json:"rebootModules"`
+	RebootPkg      string          `json:"rebootPkg"`
+}
+
+// ProvisionState returns the current/most-recent provisioning run's progress: a
+// copy of the steps emitted so far, whether it is running or done, and whether a
+// reboot is needed to finish (kernel modules that only load on a fresh boot).
+func (s *CoreService) ProvisionState() ProvisionRunState {
+	provisionRun.mu.Lock()
+	defer provisionRun.mu.Unlock()
+	steps := make([]ProvisionStep, len(provisionRun.steps))
+	copy(steps, provisionRun.steps)
+	mods := make([]string, len(provisionRun.rebootModules))
+	copy(mods, provisionRun.rebootModules)
+	return ProvisionRunState{
+		Running:        provisionRun.running,
+		Done:           provisionRun.done,
+		Steps:          steps,
+		RebootRequired: provisionRun.rebootRequired,
+		RebootModules:  mods,
+		RebootPkg:      provisionRun.rebootPkg,
+	}
+}
+
+// Reboot restarts the host machine after a short delay so the in-flight HTTP
+// response is delivered first. It is used to load kernel modules that a
+// provisioning package added but that only become active in a freshly booted
+// kernel (L2TP/PPTP on minimal cloud images).
+func (s *CoreService) Reboot() error {
+	if !commandExists("systemctl") && !commandExists("reboot") && !commandExists("shutdown") {
+		return fmt.Errorf("no reboot command available on this host")
+	}
+	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		if commandExists("systemctl") {
+			if err := exec.Command("systemctl", "reboot").Run(); err == nil {
+				return
+			}
+		}
+		if commandExists("reboot") {
+			if err := exec.Command("reboot").Run(); err == nil {
+				return
+			}
+		}
+		_ = exec.Command("shutdown", "-r", "now").Run()
+	}()
+	return nil
 }
 
 func filesMsg(files []string, err error) string {

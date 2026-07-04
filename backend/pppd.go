@@ -121,3 +121,27 @@ func LinkSystemPppd() error {
 	_ = os.MkdirAll(filepath.Dir(PppdSystem), 0o755)
 	return os.Symlink(PppdBundled, PppdSystem)
 }
+
+// PppdPluginDir is pppd's compiled-in plugin directory. A bare `plugin radius.so`
+// option is resolved by pppd relative to this path, so the bundled plugins must
+// be reachable here.
+const PppdPluginDir = "/usr/lib/pppd"
+
+// LinkPluginDir points /usr/lib/pppd at the bundle's plugin tree when the host
+// has no pppd of its own, so the bundled pppd resolves `plugin radius.so` /
+// `plugin pppol2tp.so` to the embedded plugins. No-op if the host already has a
+// plugin dir (host ppp installed) or when there's no bundle.
+func LinkPluginDir() error {
+	if !HasPppdBundle() {
+		return nil
+	}
+	if _, err := os.Lstat(PppdPluginDir); err == nil {
+		return nil // host ppp's plugin dir (or our prior link) already present
+	}
+	src := PppdBundleRoot + "/lib/pppd"
+	if _, err := os.Stat(src); err != nil {
+		return nil
+	}
+	_ = os.MkdirAll(filepath.Dir(PppdPluginDir), 0o755)
+	return os.Symlink(src, PppdPluginDir)
+}

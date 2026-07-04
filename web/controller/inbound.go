@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -175,6 +176,19 @@ func (a *InboundController) addInbound(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundCreateSuccess"), err)
 		return
 	}
+
+	// VPN protocols (L2TP/PPTP/OpenVPN) require the host backend to be provisioned
+	// first (kernel modules, daemons, IPsec). Block creation with a clear message
+	// until the operator runs setup from Core Settings. The UI guards this too;
+	// this is defense-in-depth against a direct API call.
+	if inbound.Protocol == model.L2TP || inbound.Protocol == model.PPTP || inbound.Protocol == model.OPENVPN {
+		var coreService service.CoreService
+		if !coreService.IsProvisioned() {
+			pureJsonMsg(c, http.StatusOK, false, I18nWeb(c, "pages.inbounds.toasts.setupRequired"))
+			return
+		}
+	}
+
 	user := session.GetLoginUser(c)
 	inbound.UserId = user.Id
 	if inbound.Listen == "" || inbound.Listen == "0.0.0.0" || inbound.Listen == "::" || inbound.Listen == "::0" {

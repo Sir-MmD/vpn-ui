@@ -406,7 +406,14 @@ func (s *L2tpService) RestartServices() error {
 			continue
 		}
 		if settings.IpsecEnable {
-			// Libreswan reads /etc/ipsec.conf on restart automatically
+			// Ensure the NSS db exists (fresh Ubuntu/Libreswan 5.x omits it, which
+			// makes ipsec.service's checknss pre-check fail) and the service is
+			// enabled for boot, then (re)start it. Libreswan reads /etc/ipsec.conf
+			// on restart automatically.
+			_, _ = initIpsecNSS()
+			if commandExists("systemctl") {
+				_ = exec.Command("systemctl", "enable", "ipsec").Run()
+			}
 			if err := s.runCmd("ipsec", "restart"); err != nil {
 				logger.Warning("L2TP: failed to restart ipsec:", err)
 			}

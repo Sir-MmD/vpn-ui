@@ -51,7 +51,8 @@ var defaultValueMap = map[string]string{
 	"tgLang":                      "en-US",
 	"twoFactorEnable":             "false",
 	"twoFactorToken":              "",
-	"subEnable":                   "true",
+	"systemdServiceName":          "vpn-ui",
+	"subEnable":                   "false",
 	"subJsonEnable":               "false",
 	"subTitle":                    "",
 	"subSupportUrl":               "",
@@ -106,6 +107,7 @@ var defaultValueMap = map[string]string{
 	"ldapDefaultTotalGB":    "0",
 	"ldapDefaultExpiryDays": "0",
 	"ldapDefaultLimitIP":    "0",
+	"vpnProvisioned":        "false",
 }
 
 // SettingService provides business logic for application settings management.
@@ -368,6 +370,32 @@ func (s *SettingService) GetTwoFactorEnable() (bool, error) {
 
 func (s *SettingService) SetTwoFactorEnable(value bool) error {
 	return s.setBool("twoFactorEnable", value)
+}
+
+// GetVpnProvisioned reports whether the VPN backend has been provisioned via the
+// Core Settings "Initialize Setup" flow. Any error (missing key, parse) is
+// treated as not-provisioned so a fresh install shows the setup call-to-action.
+func (s *SettingService) GetVpnProvisioned() bool {
+	v, err := s.getBool("vpnProvisioned")
+	if err != nil {
+		return false
+	}
+	return v
+}
+
+// SetVpnProvisioned persists whether the VPN backend has been provisioned.
+func (s *SettingService) SetVpnProvisioned(value bool) error {
+	return s.setBool("vpnProvisioned", value)
+}
+
+// GetSystemdServiceName returns the configured systemd unit name for the panel.
+func (s *SettingService) GetSystemdServiceName() (string, error) {
+	return s.getString("systemdServiceName")
+}
+
+// SetSystemdServiceName persists the systemd unit name for the panel.
+func (s *SettingService) SetSystemdServiceName(value string) error {
+	return s.setString("systemdServiceName", value)
 }
 
 func (s *SettingService) GetTwoFactorToken() (string, error) {
@@ -796,6 +824,7 @@ func (s *SettingService) GetDefaultSettings(host string) (any, error) {
 		"remarkModel":    func() (any, error) { return s.GetRemarkModel() },
 		"datepicker":     func() (any, error) { return s.GetDatepicker() },
 		"ipLimitEnable":  func() (any, error) { return s.GetIpLimitEnable() },
+		"provisioned":    func() (any, error) { var cs CoreService; return cs.IsProvisioned(), nil },
 	}
 
 	result := make(map[string]any)

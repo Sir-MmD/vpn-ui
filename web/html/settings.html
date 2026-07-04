@@ -86,6 +86,13 @@
                     </template>
                     {{ template "settings/panel/subscription/json" . }}
                   </a-tab-pane>
+                  <a-tab-pane key="6" :style="{ paddingTop: '20px' }">
+                    <template #tab>
+                      <a-icon type="cluster"></a-icon>
+                      <span>{{ i18n "pages.settings.serviceSettings" }}</span>
+                    </template>
+                    {{ template "settings/panel/service" . }}
+                  </a-tab-pane>
                 </a-tabs>
               </a-col>
             </a-row>
@@ -122,6 +129,12 @@
       entryProtocol: null,
       entryIsIP: false,
       user: {},
+      serviceState: { available: null, name: 'vpn-ui', installed: false, enabled: false, active: false, unit: '', defaultUnit: '', exePath: '' },
+      serviceSaving: false,
+      serviceLog: '',
+      serviceLogLoading: false,
+      serviceLogAuto: false,
+      serviceLogTimer: null,
       lang: LanguageManager.getLanguage(),
       inboundOptions: [],
       remarkModels: { i: 'Inbound', e: 'Email', o: 'Other' },
@@ -250,6 +263,49 @@
           this.allSetting = new AllSetting(msg.obj);
           app.changeRemarkSample();
           this.saveBtnDisable = true;
+        }
+      },
+      async loadServiceState() {
+        const msg = await HttpUtil.get("/panel/setting/service");
+        if (msg && msg.success && msg.obj) {
+          this.serviceState = msg.obj;
+        }
+      },
+      async loadServiceLog() {
+        this.serviceLogLoading = true;
+        const msg = await HttpUtil.get("/panel/setting/service/log");
+        this.serviceLogLoading = false;
+        if (msg && msg.success) {
+          this.serviceLog = msg.obj || '';
+          this.$nextTick(() => {
+            const el = this.$refs.serviceLog;
+            if (el) el.scrollTop = el.scrollHeight;
+          });
+        }
+      },
+      toggleServiceLogAuto(on) {
+        clearInterval(this.serviceLogTimer);
+        this.serviceLogTimer = null;
+        if (on) {
+          this.loadServiceLog();
+          this.serviceLogTimer = setInterval(() => this.loadServiceLog(), 3000);
+        }
+      },
+      resetServiceUnit() {
+        this.serviceState.unit = this.serviceState.defaultUnit || '';
+      },
+      async saveService() {
+        this.serviceSaving = true;
+        const msg = await HttpUtil.post("/panel/setting/service", {
+          name: this.serviceState.name,
+          unit: this.serviceState.unit,
+          enable: !!this.serviceState.enabled,
+          start: !!this.serviceState.active,
+        });
+        this.serviceSaving = false;
+        if (msg && msg.success) {
+          await this.loadServiceState();
+          await this.loadServiceLog();
         }
       },
       async loadInboundTags() {
@@ -602,6 +658,8 @@
       this.entryIsIP = this._isIp(this.entryHost);
       await this.getAllSetting();
       await this.loadInboundTags();
+      await this.loadServiceState();
+      await this.loadServiceLog();
       while (true) {
         await PromiseUtil.sleep(1000);
         this.saveBtnDisable = this.oldAllSetting.equals(this.allSetting);

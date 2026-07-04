@@ -89,6 +89,27 @@ build_arch() {
             fi
         done
     '
+
+    # pppd relocatable bundle. pppd dlopens plugins + OpenSSL providers, so it
+    # can't be one static binary — build/backend/pppd-bundle.sh assembles a
+    # loader-relocated tree from Alpine's musl ppp/openssl packages. Separate
+    # Alpine run so the (distro-package based) recipe stays self-contained.
+    local muslarch
+    case "$goarch" in
+        amd64) muslarch=x86_64 ;;
+        arm64) muslarch=aarch64 ;;
+        *) muslarch="$goarch" ;;
+    esac
+    # Alpine 3.22 ships ppp 2.5.2. Do NOT drop below 3.21: ppp 2.5.0 (Alpine 3.20)
+    # has a missing-braces bug in rc_read_config that makes the RADIUS plugin fail
+    # to read ANY config file ("RADIUS: Can't read config file") — fixed in 2.5.1.
+    echo "==> Building pppd bundle for $goarch"
+    docker run --rm ${DOCKER_NET:-} --platform "$platform" \
+        -e ARCH="$muslarch" \
+        -v "$outdir:/out" \
+        -v "$REPO_ROOT/build/backend/pppd-bundle.sh:/pppd-bundle.sh:ro" \
+        alpine:3.22 sh -e /pppd-bundle.sh
+
     echo "==> Done: $(ls -lh "$outdir")"
 }
 
