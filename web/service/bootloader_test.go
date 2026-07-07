@@ -93,7 +93,7 @@ func TestKernelPackageFallbacks(t *testing.T) {
 		{"linux-modules-extra-6.8.0-45-generic", []string{"linux-generic", "linux-image-generic"}},
 		{"kernel-modules-extra-6.12.0-0.fc41.x86_64", []string{"kernel-modules-extra"}},
 		{"linux-image-amd64", nil},
-		{"kernel-default-extra", nil},
+		{"kernel-default-extra", []string{"kernel-default"}},
 	}
 	for _, tt := range tests {
 		got := kernelPackageFallbacks(tt.pkg)

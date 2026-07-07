@@ -15,8 +15,8 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/logger"
 )
 
-// vpnKernelModules are the kernel modules the L2TP/PPTP/OpenVPN backends need.
-// These are host/kernel-space and cannot be bundled into the binary — the
+// vpnKernelModules are the REQUIRED kernel modules the L2TP/PPTP/OpenVPN backends
+// need. These are host/kernel-space and cannot be bundled into the binary — the
 // setup/provision step ensures they are loaded and persisted.
 var vpnKernelModules = []string{
 	"ppp_generic",       // PPP core
@@ -25,8 +25,19 @@ var vpnKernelModules = []string{
 	"ip_gre",            // PPTP/GRE
 	"ppp_mppe",          // MPPE
 	"nf_tproxy_ipv4",    // TPROXY (L2TP/PPTP/OpenVPN -> Xray)
-	"af_key",            // IPsec
 	"tun",               // OpenVPN tun device
+}
+
+// vpnOptionalKernelModules are loaded when the running kernel ships them but are
+// NOT required — their absence must not be flagged as a failure or trigger a
+// kernel-modules install / reboot.
+//
+//   - af_key (PF_KEY): legacy IPsec key-management interface. Modern libreswan uses
+//     the XFRM/netlink stack (built into the kernel, CONFIG_XFRM=y), not PF_KEY, and
+//     RHEL 10 / Rocky 10 dropped the af_key module entirely — so IPsec works fine
+//     without it. Loading it where present is harmless; its absence is expected.
+var vpnOptionalKernelModules = []string{
+	"af_key",
 }
 
 // CoreState is the coarse health of a backend "core".
@@ -50,10 +61,12 @@ type CoreStatus struct {
 	Extra    map[string]any `json:"extra,omitempty"`
 }
 
-// ModuleStatus reports whether a required kernel module is loaded.
+// ModuleStatus reports whether a kernel module is loaded. Optional modules (e.g.
+// af_key on kernels that dropped PF_KEY) don't count against readiness.
 type ModuleStatus struct {
-	Name   string `json:"name"`
-	Loaded bool   `json:"loaded"`
+	Name     string `json:"name"`
+	Loaded   bool   `json:"loaded"`
+	Optional bool   `json:"optional,omitempty"`
 }
 
 // SystemStatus reports the host/kernel prerequisites that can't be baked into
@@ -113,9 +126,26 @@ func systemctlActive(unit string) bool {
 }
 
 func moduleLoaded(name string) bool {
-	// /sys/module/<name> exists for both loadable-and-loaded and built-in modules.
-	_, err := os.Stat("/sys/module/" + name)
-	return err == nil
+	// A loaded module has /sys/module/<name>. A built-in module ALSO has that entry
+	// — but ONLY if it exports at least one module parameter; a param-less built-in
+	// (e.g. `tun`) has no /sys/module entry at all, so /sys alone false-negatives on
+	// it and it would show "not loaded"/red even though it's compiled into the kernel
+	// and always available. Fall back to the kernel's modules.builtin list for those.
+	if _, err := os.Stat("/sys/module/" + name); err == nil {
+		return true
+	}
+	return moduleBuiltin(name)
+}
+
+// moduleBuiltin reports whether the module is compiled into the running kernel,
+// per /lib/modules/<ver>/modules.builtin (which lists built-in modules as
+// "kernel/.../<name>.ko" paths). Built-ins are always available and need no load.
+func moduleBuiltin(name string) bool {
+	data, err := os.ReadFile("/lib/modules/" + runningKernel() + "/modules.builtin")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), "/"+name+".ko")
 }
 
 // moduleAvailable reports whether a module can be used on the running kernel —
@@ -354,6 +384,14 @@ func (s *CoreService) GetSystemStatus() SystemStatus {
 		}
 		st.Modules = append(st.Modules, ModuleStatus{Name: m, Loaded: loaded})
 	}
+	// Optional modules are shown only when the running kernel actually ships them,
+	// so a module the kernel dropped (af_key on RHEL 10+) doesn't surface as a red
+	// "not loaded" row or drag ModulesOK down.
+	for _, m := range vpnOptionalKernelModules {
+		if moduleAvailable(m) {
+			st.Modules = append(st.Modules, ModuleStatus{Name: m, Loaded: moduleLoaded(m), Optional: true})
+		}
+	}
 	return st
 }
 
@@ -502,7 +540,30 @@ func (s *CoreService) runProvisionSteps(emit func(ProvisionStep)) (rebootModules
 		}
 	}
 
-	modConf := strings.Join(vpnKernelModules, "\n") + "\n"
+	// Optional modules: load where the kernel ships them; a kernel that dropped one
+	// (af_key on RHEL 10+) is fine — IPsec uses XFRM — so report it as OK info, not
+	// a failure, and never let it drive the kernel-modules install/reboot below.
+	var loadableOptional []string
+	for _, m := range vpnOptionalKernelModules {
+		if moduleLoaded(m) {
+			loadableOptional = append(loadableOptional, m)
+			emit(ProvisionStep{Name: "module " + m, OK: true, Msg: "already loaded (optional)"})
+			continue
+		}
+		if !moduleAvailable(m) {
+			emit(ProvisionStep{Name: "module " + m, OK: true,
+				Msg: "not on this kernel — optional, IPsec uses XFRM instead"})
+			continue
+		}
+		if exec.Command("modprobe", m).Run() == nil {
+			loadableOptional = append(loadableOptional, m)
+			emit(ProvisionStep{Name: "modprobe " + m, OK: true, Msg: "loaded (optional)"})
+		}
+	}
+
+	// Persist only the modules present on this kernel, so systemd-modules-load
+	// doesn't log a failure each boot for an optional module the kernel dropped.
+	modConf := strings.Join(append(append([]string{}, vpnKernelModules...), loadableOptional...), "\n") + "\n"
 	err := os.WriteFile("/etc/modules-load.d/vpn-ui.conf", []byte(modConf), 0644)
 	emit(ProvisionStep{Name: "persist /etc/modules-load.d/vpn-ui.conf", OK: err == nil, Msg: msgOrOK(err)})
 
@@ -569,7 +630,38 @@ func (s *CoreService) runProvisionSteps(emit func(ProvisionStep)) (rebootModules
 	// L2TP/PPTP need PPP kernel modules that minimal/cloud kernels omit. Best-
 	// effort install of the distro's full kernel-modules package. When the modules
 	// ship only in a newer kernel, this reports that a reboot is needed to load them.
-	return s.provisionKernelModules(emit)
+	mods, pkg := s.provisionKernelModules(emit)
+
+	// Clear any distro deny-list/disable for our modules (and their dependencies) so
+	// systemd-modules-load auto-loads them on boot (Fedora/RHEL blacklist the L2TP
+	// modules; CIS-hardened hosts may `install <mod> /bin/false` others). This MUST
+	// run after the kernel-modules install above: on Fedora/RHEL the blacklist files
+	// ship WITH kernel-modules-extra, so they don't exist until that package is
+	// installed — clearing earlier would find nothing and the module would stay
+	// deny-listed after the reboot. Especially important on the reboot-required path,
+	// where the modules only load on the next boot and must not be deny-listed then.
+	if cleared, log := unblacklistVpnModules(); len(cleared) > 0 {
+		emit(ProvisionStep{Name: "enable VPN modules", OK: true,
+			Msg: "cleared distro deny-list/disable for " + strings.Join(cleared, ", ") + " (auto-loads on boot)", Log: log})
+
+		// An `install <mod> /bin/false` rule blocks even the explicit modprobe run
+		// earlier in this function, so a just-freed module isn't loaded yet. Load any
+		// that are available now; `blacklist`-only modules already loaded above.
+		var loaded []string
+		for _, m := range vpnKernelModules {
+			if moduleLoaded(m) {
+				continue
+			}
+			if exec.Command("modprobe", m).Run() == nil && moduleLoaded(m) {
+				loaded = append(loaded, m)
+			}
+		}
+		if len(loaded) > 0 {
+			emit(ProvisionStep{Name: "load freed VPN modules", OK: true, Msg: "loaded " + strings.Join(loaded, ", ")})
+		}
+	}
+
+	return mods, pkg
 }
 
 // provisionKernelModules makes the VPN PPP/L2TP kernel modules available when the
@@ -682,6 +774,24 @@ func (s *CoreService) StartProvision() bool {
 		if err := ss.SetVpnProvisioned(true); err != nil {
 			logger.Warning("failed to persist vpnProvisioned flag:", err)
 		}
+
+		// With provisioning finished and no reboot pending, actively bring the VPN
+		// stack up so a completed setup leaves everything running — the operator
+		// shouldn't have to reboot or re-run setup to get services started. Init*
+		// regenerate configs and (re)start the daemons for whatever inbounds already
+		// exist (a no-op when there are none, e.g. provision-then-add-inbound), and
+		// a forced xray restart binds the per-inbound dokodemo ports. When a reboot
+		// IS required (kernel modules only load into the freshly booted kernel) this
+		// is skipped: the post-reboot panel start runs the same Init* path.
+		if len(mods) == 0 {
+			cs.l2tpService.InitL2tp()
+			cs.pptpService.InitPptp()
+			cs.openvpnService.InitOpenVpn()
+			if err := cs.xrayService.RestartXray(true); err != nil {
+				logger.Warning("provision: failed to restart xray after setup:", err)
+			}
+		}
+
 		provisionRun.mu.Lock()
 		provisionRun.running = false
 		provisionRun.done = true
