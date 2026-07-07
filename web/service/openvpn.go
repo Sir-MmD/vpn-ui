@@ -52,7 +52,9 @@ type openvpnSettings struct {
 	ExternalProxy  []ovpnExternalProxy `json:"externalProxy"`
 	ClientToClient bool                `json:"clientToClient"`
 	CrossInbound   bool                `json:"crossInbound"`
-	IpRanges       []string            `json:"ipRanges"` // UDP-side /24 ranges; TCP mirrors into 10.3.x. Panel-managed.
+	UserLimit         int              `json:"userLimit"`         // simultaneous devices per account (1..64); 1 = legacy
+	UserLimitStrategy string           `json:"userLimitStrategy"` // at the cap: "reject" (default) or "accept" (evict oldest)
+	IpRanges       []string            `json:"ipRanges"`  // UDP-side /24 ranges; TCP mirrors into 10.3.x. Panel-managed.
 	Clients        []openvpnClient     `json:"clients"`
 }
 
@@ -432,6 +434,52 @@ func (s *OpenVpnService) writeClientConfigDir(inbound *model.Inbound, settings *
 	}
 	netAddr, prefix := ovpnBlockFor(inbound, settings, proto)
 	mask := prefixToMask(prefix)
+	k := normUserLimit(settings.UserLimit)
+
+	// User Limit K>=2: no fixed per-CN pin. Instead publish each account's aligned
+	// block to blocks-<proto>/<CN>; the client-connect hook leases a free IP inside
+	// it per device (duplicate-cn allows K simultaneous sessions on one account).
+	blocksDir := fmt.Sprintf("%s/blocks-%s", s.configDir(inbound.Id), proto)
+	os.RemoveAll(blocksDir)
+	if k > 1 {
+		if err := os.MkdirAll(blocksDir, 0755); err != nil {
+			return err
+		}
+		// Fresh lease dir on every (re)gen — a config change restarts the daemon,
+		// dropping all sessions, so no live lease can be lost here.
+		leaseDir := fmt.Sprintf("%s/leases-%s", s.configDir(inbound.Id), proto)
+		os.RemoveAll(leaseDir)
+		_ = os.MkdirAll(leaseDir, 0755)
+
+		// Publish the User Limit Strategy for the connect hook: "reject" refuses a
+		// (K+1)-th device; "accept" evicts the account's oldest device via the mgmt
+		// socket. One file per proto so udp/tcp share the inbound's setting.
+		strategy := normUserLimitStrategy(settings.UserLimitStrategy)
+		if err := s.writeFile(fmt.Sprintf("%s/strategy-%s", s.configDir(inbound.Id), proto), strategy+"\n"); err != nil {
+			return err
+		}
+
+		subnets := ovpnSubnetsOrDefault(settings, proto, inbound.Id)
+		for i, client := range settings.Clients {
+			if client.ID == "" {
+				continue
+			}
+			ips := vpnAccountDeviceIPs(subnets, i, k)
+			if len(ips) == 0 {
+				continue
+			}
+			// "<serverBlockMask> <ip1> <ip2> ...": the hook leases a free IP from the
+			// list and pushes ifconfig-push <freeIP> <serverBlockMask> (topology
+			// subnet). An explicit IP list, so K need not be a power of two.
+			content := mask + " " + strings.Join(ips, " ") + "\n"
+			if err := s.writeFile(fmt.Sprintf("%s/%s", blocksDir, client.ID), content); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// K==1 (legacy): pin each account to one deterministic IP via CCD.
 	for i, client := range settings.Clients {
 		if client.ID == "" {
 			continue
@@ -495,6 +543,15 @@ func (s *OpenVpnService) buildServerConfig(inbound *model.Inbound, settings *ope
 	b.WriteString(fmt.Sprintf("server %s %s\n", subnet, subnetMask))
 	// Pin every user to a deterministic tunnel IP so per-user routing rules work.
 	b.WriteString(fmt.Sprintf("client-config-dir %s/ccd-%s\n", dir, proto))
+	// User Limit K>=2: allow K simultaneous sessions per account (same CN). The
+	// client-connect hook leases each device a distinct IP inside the account's
+	// block, so routing-by-source still resolves to the right account.
+	if normUserLimit(settings.UserLimit) > 1 {
+		b.WriteString("duplicate-cn\n")
+		// The "accept" strategy force-disconnects the account's oldest device via
+		// `client-kill <CID>` on the management socket — which is already declared
+		// unconditionally below (status/management block), so nothing to add here.
+	}
 	if settings.ClientToClient {
 		// Route traffic between clients internally in OpenVPN instead of sending
 		// it to the tun device (where TPROXY would hijack it into Xray). DCO
@@ -538,7 +595,7 @@ func (s *OpenVpnService) buildServerConfig(inbound *model.Inbound, settings *ope
 	b.WriteString("keepalive 10 120\n")
 	b.WriteString("persist-key\n")
 	b.WriteString("persist-tun\n")
-	b.WriteString(fmt.Sprintf("status /var/run/openvpn/status-%d-%s.log 10\n", id, proto))
+	b.WriteString(fmt.Sprintf("status /var/run/openvpn/status-%d-%s.log 5\n", id, proto))
 	b.WriteString("status-version 3\n")
 	b.WriteString(fmt.Sprintf("management /var/run/openvpn/mgmt-%d-%s.sock unix\n", id, proto))
 	b.WriteString("verb 3\n")
@@ -725,6 +782,13 @@ func (s *OpenVpnService) GenerateClientConfig(inbound *model.Inbound, proto stri
 	b.WriteString("nobind\n")
 	b.WriteString("persist-key\n")
 	b.WriteString("persist-tun\n")
+	if proto == "udp" {
+		// Notify the server on clean exit (SIGTERM) so it frees the client's slot
+		// immediately instead of waiting out the keepalive timeout — important for
+		// the per-account User Limit, where the freed IP should be reusable right
+		// away. UDP only; a TCP disconnect is seen by the server as a socket close.
+		b.WriteString("explicit-exit-notify 3\n")
+	}
 	b.WriteString("remote-cert-tls server\n")
 	b.WriteString("auth-user-pass\n")
 	// This profile authenticates by username/password only and carries no

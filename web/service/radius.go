@@ -34,13 +34,20 @@ type RadiusService struct {
 	acctServer *radius.PacketServer
 	mu         sync.Mutex
 	sessions   map[string]*radiusSession // key: Acct-Session-Id
+	pending    map[string]time.Time      // key: freshly allocated IP awaiting Acct-Start (User Limit blocks)
 	secret     []byte
 }
+
+// pendingLeaseTTL is how long a block-allocated IP is held between the
+// Access-Accept that assigned it and the Acct-Start that confirms it. An auth
+// that never starts a session (retry, abandoned dial) frees the IP after this.
+const pendingLeaseTTL = 90 * time.Second
 
 type radiusSession struct {
 	email    string
 	ip       string
-	protocol string // "l2tp", "pptp", or "openvpn"
+	protocol string    // "l2tp", "pptp", or "openvpn"
+	started  time.Time // Acct-Start time; used to pick the oldest device to evict
 }
 
 // runningRadius points at the RadiusService whose servers are currently bound.
@@ -51,6 +58,7 @@ var runningRadius *RadiusService
 // Start launches the RADIUS auth (1812) and accounting (1813) servers on localhost.
 func (s *RadiusService) Start(secret string) error {
 	s.sessions = make(map[string]*radiusSession)
+	s.pending = make(map[string]time.Time)
 	return s.listen(secret)
 }
 
@@ -215,11 +223,20 @@ func (s *RadiusService) handleAuth(w radius.ResponseWriter, r *radius.Request) {
 	sendKey, _ := rfc3079.MakeKey(ntResponse, []byte(password), true)
 	microsoft.MSMPPERecvKey_Add(accept, recvKey)
 	microsoft.MSMPPESendKey_Add(accept, sendKey)
-	microsoft.MSMPPEEncryptionPolicy_Add(accept, microsoft.MSMPPEEncryptionPolicy_Value_EncryptionAllowed)
-	microsoft.MSMPPEEncryptionTypes_Add(accept, microsoft.MSMPPEEncryptionTypes_Value_RC440or128BitAllowed)
+	microsoft.MSMPPEEncryptionPolicy_Add(accept, microsoft.MSMPPEEncryptionPolicy_Value_EncryptionRequired)
+	// 128-bit only: with "40or128 allowed" the server pppd settles on weak 40-bit
+	// MPPE (offers +L -S), which 128-bit-requiring clients (Windows/NM default)
+	// reject with "MPPE required but peer negotiation failed".
+	microsoft.MSMPPEEncryptionTypes_Add(accept, microsoft.MSMPPEEncryptionTypes_Value_RC4128bitAllowed)
 
-	// Assign deterministic IP so per-user Xray routing works via source IP
-	clientIP := s.getClientIP(protocol, inboundId, username)
+	// Assign deterministic IP so per-user Xray routing works via source IP. A deny
+	// means the account is at its User Limit and the strategy is "reject".
+	clientIP, deny := s.getClientIP(protocol, inboundId, username)
+	if deny {
+		logger.Infof("RADIUS: auth rejected — user-limit reached (strategy=reject) user=%s nas=%s", username, nasID)
+		w.Write(r.Response(radius.CodeAccessReject))
+		return
+	}
 	if clientIP != nil {
 		rfc2865.FramedIPAddress_Set(accept, clientIP)
 	}
@@ -268,7 +285,9 @@ func (s *RadiusService) handleAcct(w radius.ResponseWriter, r *radius.Request) {
 			email:    email,
 			ip:       ip,
 			protocol: protocol,
+			started:  time.Now(),
 		}
+		delete(s.pending, ip) // confirmed: the session now holds this block IP
 		s.mu.Unlock()
 
 		// Add nft accounting counters for this client
@@ -318,6 +337,7 @@ func (s *RadiusService) handleAcct(w radius.ResponseWriter, r *radius.Request) {
 						email:    email,
 						ip:       ip,
 						protocol: protocol,
+						started:  time.Now(),
 					}
 					s.mu.Unlock()
 					s.nftService.AddClientAccounting(protocol, ip)
@@ -551,28 +571,32 @@ func parseNASIdentifier(nasID string) (protocol string, inboundId int, err error
 	return protocol, inboundId, nil
 }
 
-// getClientIP computes the deterministic IP for a VPN client.
-// Returns nil if the client is not found or the IP range is exhausted.
-func (s *RadiusService) getClientIP(protocol string, inboundId int, username string) net.IP {
+// getClientIP computes the deterministic IP for a VPN client. Returns (nil,false)
+// if the client is not found or the range is exhausted, and (nil,true) when the
+// account is at its User Limit and the strategy is "reject" — the caller must then
+// send an Access-Reject rather than a keyless Access-Accept.
+func (s *RadiusService) getClientIP(protocol string, inboundId int, username string) (net.IP, bool) {
 	db := database.GetDB()
 	var inbound model.Inbound
 	if err := db.First(&inbound, inboundId).Error; err != nil {
-		return nil
+		return nil, false
 	}
 
 	type clientEntry struct {
 		ID string `json:"id"`
 	}
 	type settingsJSON struct {
-		IpRanges []string      `json:"ipRanges"`
-		IpRange  string        `json:"ipRange"`
-		LocalIp  string        `json:"localIp"`
-		Clients  []clientEntry `json:"clients"`
+		IpRanges          []string      `json:"ipRanges"`
+		IpRange           string        `json:"ipRange"`
+		LocalIp           string        `json:"localIp"`
+		UserLimit         int           `json:"userLimit"`
+		UserLimitStrategy string        `json:"userLimitStrategy"`
+		Clients           []clientEntry `json:"clients"`
 	}
 
 	var settings settingsJSON
 	if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
-		return nil
+		return nil, false
 	}
 
 	clientIndex := -1
@@ -583,14 +607,126 @@ func (s *RadiusService) getClientIP(protocol string, inboundId int, username str
 		}
 	}
 	if clientIndex < 0 {
-		return nil
+		return nil, false
 	}
 
 	ranges := settings.IpRanges
 	if len(ranges) == 0 && settings.IpRange != "" {
 		ranges = []string{settings.IpRange}
 	}
-	return computeVpnClientIP(ranges, inbound.Id, clientIndex, protocol)
+
+	// User Limit K>=2 (L2TP/PPTP only — OpenVPN ignores the RADIUS Framed-IP and
+	// assigns from its own pool in the connect hook): hand out a FREE IP from the
+	// account's block so K devices on one account each get a distinct IP. When the
+	// block is full the strategy decides: "reject" denies the dial, "accept" evicts
+	// the oldest device. K==1 (and OpenVPN) keeps the legacy per-index IP.
+	k := normUserLimit(settings.UserLimit)
+	if protocol != "openvpn" && k > 1 {
+		subnets := pppSubnetsOrDefault(ranges, protocol, inbound.Id)
+		strategy := normUserLimitStrategy(settings.UserLimitStrategy)
+		return s.allocateBlockIP(clientIndex, k, subnets, protocol, strategy)
+	}
+	return computeVpnClientIP(ranges, inbound.Id, clientIndex, protocol), false
+}
+
+// allocateBlockIP picks the lowest free IP inside account `clientIndex`'s K-block
+// (User Limit) that no live session and no other pending allocation is using, and
+// marks it pending until Acct-Start confirms it. When all K are in use (device cap
+// reached) the strategy decides: "reject" returns (nil,true) so the caller denies
+// the dial; "accept" disconnects the account's OLDEST live device, frees its IP and
+// hands it to the new one. Returns (ip,false) on success, (nil,true) on deny.
+func (s *RadiusService) allocateBlockIP(clientIndex, k int, subnets []string, protocol, strategy string) (net.IP, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending == nil {
+		s.pending = make(map[string]time.Time)
+	}
+	now := time.Now()
+
+	// In-use set = live session IPs + still-valid pending allocations. Expired
+	// pending leases (auth without a following Acct-Start) are reclaimed here.
+	used := make(map[string]bool, len(s.sessions)+len(s.pending))
+	for _, sess := range s.sessions {
+		used[sess.ip] = true
+	}
+	for ip, ts := range s.pending {
+		if now.Sub(ts) > pendingLeaseTTL {
+			delete(s.pending, ip)
+			continue
+		}
+		used[ip] = true
+	}
+
+	// Set of this account's K device IPs, for matching live sessions during evict.
+	blockIPs := make(map[string]bool, k)
+	for d := 0; d < k; d++ {
+		if ip := vpnAccountDeviceIP(subnets, clientIndex, k, d); ip != "" {
+			blockIPs[ip] = true
+			if !used[ip] {
+				s.pending[ip] = now
+				return net.ParseIP(ip).To4(), false
+			}
+		}
+	}
+
+	// Block full. "accept": evict the account's oldest live device and reuse its IP.
+	if strategy == "accept" {
+		if victimSID, victimIP := oldestBlockSession(s.sessions, blockIPs); victimIP != "" {
+			delete(s.sessions, victimSID)
+			s.nftService.RemoveClientAccounting(protocol, victimIP)
+			killPPPByIP(victimIP) // force the old device's ppp link down
+			s.pending[victimIP] = now
+			logger.Infof("RADIUS: user-limit accept — evicted oldest device ip=%s proto=%s to admit new device", victimIP, protocol)
+			return net.ParseIP(victimIP).To4(), false
+		}
+		// No live device to evict (all slots pending/mid-handshake) — deny for now.
+	}
+
+	// "reject" (default) or nothing evictable: deny the dial.
+	return nil, true
+}
+
+// oldestBlockSession returns the (session id, IP) of the longest-connected live
+// session whose IP falls inside blockIPs (one account's K device IPs), or ("","")
+// when none do. Pure selection — the eviction side effects (nft/kill/pending) are
+// the caller's.
+func oldestBlockSession(sessions map[string]*radiusSession, blockIPs map[string]bool) (sid, ip string) {
+	var started time.Time
+	for id, sess := range sessions {
+		if !blockIPs[sess.ip] {
+			continue
+		}
+		if sid == "" || sess.started.Before(started) {
+			sid, ip, started = id, sess.ip, sess.started
+		}
+	}
+	return sid, ip
+}
+
+// killPPPByIP force-disconnects an L2TP/PPTP device by deleting the PPP interface
+// whose peer address is ip (freeing the tunnel IP). The supervising daemon reaps
+// the orphaned pppd. Best-effort: any lookup/exec error is ignored.
+func killPPPByIP(ip string) {
+	out, err := exec.Command("ip", "-o", "addr", "show").Output()
+	if err != nil {
+		return
+	}
+	needle := "peer " + ip + "/"
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, needle) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		iface := strings.TrimSuffix(fields[1], ":") // "3: ppp0 ..." -> "ppp0"
+		if !strings.HasPrefix(iface, "ppp") {
+			continue
+		}
+		_ = exec.Command("ip", "link", "delete", iface).Run()
+		return
+	}
 }
 
 // computeVpnClientIP computes the deterministic IP for the L2TP/PPTP client at
@@ -623,8 +759,9 @@ func computeVpnClientIP(ranges []string, inboundId, clientIndex int, protocol st
 
 // BuildVpnEmailToIPMap returns a map of email → deterministic tunnel IP(s) for all
 // enabled L2TP/PPTP/OpenVPN clients. Used by the Xray config generator to translate
-// email-based routing rules into source-IP rules. An OpenVPN client can map to two
-// IPs (one per enabled transport subnet), so the values are slices.
+// email-based routing rules into source-IP rules. Values are slices: an OpenVPN
+// client maps to one IP per enabled transport, and under User Limit K>=2 every
+// account maps to its K device IPs (times the enabled transports for OpenVPN).
 func BuildVpnEmailToIPMap() map[string][]string {
 	result := make(map[string][]string)
 	db := database.GetDB()
@@ -642,9 +779,10 @@ func BuildVpnEmailToIPMap() map[string][]string {
 	db.Where("protocol IN ? AND enable = ?", []string{"l2tp", "pptp"}, true).Find(&pppInbounds)
 
 	type pppSettingsJSON struct {
-		IpRanges []string      `json:"ipRanges"`
-		IpRange  string        `json:"ipRange"`
-		Clients  []clientEntry `json:"clients"`
+		IpRanges  []string      `json:"ipRanges"`
+		IpRange   string        `json:"ipRange"`
+		UserLimit int           `json:"userLimit"`
+		Clients   []clientEntry `json:"clients"`
 	}
 
 	for _, inbound := range pppInbounds {
@@ -656,13 +794,20 @@ func BuildVpnEmailToIPMap() map[string][]string {
 		if len(ranges) == 0 && settings.IpRange != "" {
 			ranges = []string{settings.IpRange}
 		}
+		k := normUserLimit(settings.UserLimit)
+		// K>=2: each account maps to its K device IPs, so one source rule (an
+		// explicit IP list) covers every device. K==1 keeps the legacy single IP.
+		subnets := pppSubnetsOrDefault(ranges, string(inbound.Protocol), inbound.Id)
 		for i, client := range settings.Clients {
 			if client.Email == "" {
 				continue
 			}
-			ip := computeVpnClientIP(ranges, inbound.Id, i, string(inbound.Protocol))
-			if ip != nil {
-				result[client.Email] = append(result[client.Email], ip.String())
+			if k <= 1 {
+				if ip := computeVpnClientIP(ranges, inbound.Id, i, string(inbound.Protocol)); ip != nil {
+					result[client.Email] = append(result[client.Email], ip.String())
+				}
+			} else {
+				result[client.Email] = append(result[client.Email], vpnAccountDeviceIPs(subnets, i, k)...)
 			}
 		}
 	}
@@ -678,6 +823,7 @@ func BuildVpnEmailToIPMap() map[string][]string {
 		}
 		udpOn := settings.udpEnabled()
 		tcpOn := settings.tcpEnabled()
+		k := normUserLimit(settings.UserLimit)
 		var udpNet, tcpNet net.IP
 		var udpPrefix, tcpPrefix int
 		if udpOn {
@@ -686,24 +832,68 @@ func BuildVpnEmailToIPMap() map[string][]string {
 		if tcpOn {
 			tcpNet, tcpPrefix = ovpnBlockFor(inbound, &settings, "tcp")
 		}
+		// K>=2: per-account device IP lists (one block per enabled transport). K==1
+		// keeps the legacy single continuous per-index IP per transport.
+		udpSubnets := ovpnSubnetsOrDefault(&settings, "udp", inbound.Id)
+		tcpSubnets := ovpnSubnetsOrDefault(&settings, "tcp", inbound.Id)
 		for i, client := range settings.Clients {
 			if client.Email == "" {
 				continue
 			}
-			if udpOn {
-				if ip := ovpnBlockClientIP(udpNet, udpPrefix, i); ip != "" {
-					result[client.Email] = append(result[client.Email], ip)
+			if k <= 1 {
+				if udpOn {
+					if ip := ovpnBlockClientIP(udpNet, udpPrefix, i); ip != "" {
+						result[client.Email] = append(result[client.Email], ip)
+					}
 				}
+				if tcpOn {
+					if ip := ovpnBlockClientIP(tcpNet, tcpPrefix, i); ip != "" {
+						result[client.Email] = append(result[client.Email], ip)
+					}
+				}
+				continue
+			}
+			if udpOn {
+				result[client.Email] = append(result[client.Email], vpnAccountDeviceIPs(udpSubnets, i, k)...)
 			}
 			if tcpOn {
-				if ip := ovpnBlockClientIP(tcpNet, tcpPrefix, i); ip != "" {
-					result[client.Email] = append(result[client.Email], ip)
-				}
+				result[client.Email] = append(result[client.Email], vpnAccountDeviceIPs(tcpSubnets, i, k)...)
 			}
 		}
 	}
 
 	return result
+}
+
+// pppSubnetsOrDefault returns the ordered /24 prefixes ("A.B.C") an L2TP/PPTP
+// inbound owns, falling back to the legacy id-derived /24 when none are stored.
+func pppSubnetsOrDefault(ranges []string, proto string, id int) []string {
+	if subs := subnetsOf(ranges); len(subs) > 0 {
+		return subs
+	}
+	return []string{fmt.Sprintf("10.%d.%d", protocolBase(proto), id)}
+}
+
+// ovpnSubnetsOrDefault returns the ordered /24 prefixes for an OpenVPN transport
+// (udp => 10.2.x, tcp => 10.3.x mirror), falling back to the legacy id-derived
+// /24 when no ranges are stored.
+func ovpnSubnetsOrDefault(settings *openvpnSettings, proto string, id int) []string {
+	subs := subnetsOf(settings.effectiveRanges())
+	if len(subs) == 0 {
+		second := 2
+		if proto == "tcp" {
+			second = 3
+		}
+		return []string{fmt.Sprintf("10.%d.%d", second, id)}
+	}
+	if proto == "tcp" {
+		out := make([]string, len(subs))
+		for i, s := range subs {
+			out[i] = mirrorOvpnSubnet(s)
+		}
+		return out
+	}
+	return subs
 }
 
 // GenerateRadiusClientConfig writes the radcli config files for a given inbound.

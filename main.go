@@ -3,16 +3,20 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	_ "unsafe"
 
 	"github.com/mhsanaei/3x-ui/v2/config"
@@ -490,6 +494,248 @@ func openvpnAuth() {
 }
 
 // openvpnConnect handles OpenVPN client-connect via RADIUS Acct-Start.
+// ovpnLeaseBlockIP implements the OpenVPN side of the per-account "User Limit"
+// block allocation. When the panel has published blocks-<proto>/<CN> for this
+// inbound (User Limit K>=2), it leases the lowest free IP inside that account's
+// block and returns (ip, serverBlockMask, false) for a `ifconfig-push`. Returns
+// ("","",false) for K==1 inbounds (no block file) — the caller keeps the pool IP.
+//
+// When the block is full the User Limit Strategy decides: "accept" force-kills the
+// account's oldest device via the management socket and reuses its IP (returns that
+// ip); "reject" (default) returns ("","",true) so the caller fails the connect and
+// OpenVPN refuses the device.
+//
+// "Free" = not currently held by an established client (OpenVPN's own status
+// file, authoritative) and not held by a fresh lease (a short-TTL marker that
+// bridges the gap between this connect and the client appearing in the status
+// file). Leaked leases self-expire, so no long-lived bookkeeping is needed.
+func ovpnLeaseBlockIP(inboundId int, username, poolIP string) (string, string, bool) {
+	proto := "udp"
+	if strings.HasPrefix(poolIP, "10.3.") {
+		proto = "tcp"
+	}
+	dir := fmt.Sprintf("/etc/openvpn/server-%d", inboundId)
+	blockFile := filepath.Join(dir, "blocks-"+proto, username)
+	data, err := os.ReadFile(blockFile)
+	if err != nil {
+		return "", "", false // no block published -> K==1, keep the pool IP
+	}
+	parts := strings.Fields(strings.TrimSpace(string(data)))
+	if len(parts) < 2 {
+		return "", "", false
+	}
+	// Block file format: "<serverBlockMask> <ip1> <ip2> ..." — the account's K
+	// device IPs (an explicit list, so the block size need not be a power of two).
+	mask := parts[0]
+	candidates := parts[1:]
+
+	statusPath := fmt.Sprintf("/var/run/openvpn/status-%d-%s.log", inboundId, proto)
+	inUse := ovpnStatusIPs(statusPath)
+
+	leaseDir := filepath.Join(dir, "leases-"+proto)
+	_ = os.MkdirAll(leaseDir, 0755)
+	now := time.Now()
+	if entries, e := os.ReadDir(leaseDir); e == nil {
+		for _, ent := range entries {
+			p := filepath.Join(leaseDir, ent.Name())
+			fi, se := os.Stat(p)
+			if se != nil {
+				continue
+			}
+			if now.Sub(fi.ModTime()) > 30*time.Second {
+				os.Remove(p) // stale gap-lease
+				continue
+			}
+			inUse[ent.Name()] = true // lease file is named by the leased IP
+		}
+	}
+
+	for _, ip := range candidates {
+		if inUse[ip] {
+			continue
+		}
+		_ = os.WriteFile(filepath.Join(leaseDir, ip), []byte(username), 0644)
+		return ip, mask, false
+	}
+
+	// Block full (device cap reached). "accept": admit this device by reusing the
+	// oldest existing device's IP and disconnecting THAT device; "reject": refuse.
+	if ovpnReadStrategy(dir, proto) == "accept" {
+		// Capture the victim's client-ID here, while only the existing devices hold
+		// the block IPs (this new client is not in the status yet). We reuse the
+		// victim's IP for this client, so once it connects two clients share that IP
+		// briefly — killing by the pre-captured CID disconnects the OLD one, not the
+		// one we just admitted.
+		victimIP, victimRAddr := ovpnOldestFromStatus(statusPath, candidates)
+		if victimIP == "" {
+			victimIP = candidates[0] // status not yet populated -> evict the first slot
+		}
+		// The kill MUST happen AFTER this hook returns: client-connect runs
+		// synchronously and blocks OpenVPN's management event loop, so a kill issued
+		// from here would deadlock. Hand it to a detached helper (openvpn-evict).
+		ovpnSpawnEvict(inboundId, proto, victimIP, victimRAddr)
+		_ = os.WriteFile(filepath.Join(leaseDir, victimIP), []byte(username), 0644)
+		return victimIP, mask, false
+	}
+	return "", "", true // reject the new device
+}
+
+// ovpnReadStrategy returns the inbound's User Limit Strategy ("accept", else the
+// default "reject") from the panel-published strategy-<proto> file.
+func ovpnReadStrategy(dir, proto string) string {
+	data, err := os.ReadFile(filepath.Join(dir, "strategy-"+proto))
+	if err != nil {
+		return "reject"
+	}
+	if strings.TrimSpace(string(data)) == "accept" {
+		return "accept"
+	}
+	return "reject"
+}
+
+// ovpnOldestFromStatus reads the OpenVPN status-version 3 FILE and returns the
+// virtual IP and client-ID (among ips) of the client connected longest, or ("","")
+// if none appear yet. The connect hook uses the file (not the live management
+// socket) to pick the eviction victim, because while the hook runs OpenVPN's
+// management loop is blocked (see openvpnEvict).
+func ovpnOldestFromStatus(statusPath string, ips []string) (ip, raddr string) {
+	want := make(map[string]bool, len(ips))
+	for _, w := range ips {
+		want[w] = true
+	}
+	data, err := os.ReadFile(statusPath)
+	if err != nil {
+		return "", ""
+	}
+	bestSince := int64(1) << 62
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "CLIENT_LIST\t") {
+			continue
+		}
+		// status v3: [2]RealAddr [3]VirtualAddr [8]ConnectedSince(time_t)
+		f := strings.Split(line, "\t")
+		if len(f) <= 8 || !want[f[3]] {
+			continue
+		}
+		if since, perr := strconv.ParseInt(strings.TrimSpace(f[8]), 10, 64); perr == nil && since < bestSince {
+			bestSince, ip, raddr = since, f[3], strings.TrimSpace(f[2])
+		}
+	}
+	return ip, raddr
+}
+
+// ovpnSpawnEvict launches a detached `openvpn-evict` helper that disconnects the
+// victim client once OpenVPN is servicing its management socket again. Fire-and-
+// forget: the connect hook must not wait on it. raddr is the victim's real address
+// (IP:port — the unambiguous per-client kill key); ip is the fallback when the
+// status file had no entry yet.
+func ovpnSpawnEvict(inboundId int, proto, ip, raddr string) {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(exe, "openvpn-evict", strconv.Itoa(inboundId), proto, ip, raddr)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // survive the hook exiting
+	_ = cmd.Start()                                       // no Wait — detached
+}
+
+// openvpnEvict runs detached from the (synchronous, management-blocking) client-
+// connect hook. It waits for that hook to return so OpenVPN resumes servicing its
+// management socket, then disconnects the victim via `kill <real-address>` (the
+// classic per-client kill — `client-kill <CID>` only applies to deferred-auth
+// clients). The new client reuses the victim's VIRTUAL IP, but real addresses are
+// unique, so this hits the old device, not the one just admitted. Falls back to the
+// OLDEST client on <ip> when no real address was pre-captured.
+// Usage: x-ui openvpn-evict <id> <proto> <ip> [real-address]
+func openvpnEvict() {
+	if len(os.Args) < 5 {
+		return
+	}
+	inboundId, _ := strconv.Atoi(os.Args[2])
+	proto := os.Args[3]
+	targetIP := os.Args[4]
+	raddr := ""
+	if len(os.Args) >= 6 {
+		raddr = os.Args[5]
+	}
+	time.Sleep(1500 * time.Millisecond) // let the connect hook return first
+
+	sock := fmt.Sprintf("/var/run/openvpn/mgmt-%d-%s.sock", inboundId, proto)
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	reader := bufio.NewReader(conn)
+
+	if raddr == "" {
+		// No pre-captured real address: query live and pick the OLDEST client on
+		// targetIP (min connected-since) so the just-admitted client (newest) is
+		// never the one killed when two share the virtual IP.
+		if _, err := fmt.Fprint(conn, "status 3\n"); err != nil {
+			return
+		}
+		bestSince := int64(1) << 62
+		for {
+			line, rerr := reader.ReadString('\n')
+			if s := strings.TrimRight(line, "\r\n"); s != "" {
+				if strings.HasPrefix(s, "CLIENT_LIST\t") {
+					f := strings.Split(s, "\t")
+					if len(f) > 8 && f[3] == targetIP {
+						if since, perr := strconv.ParseInt(strings.TrimSpace(f[8]), 10, 64); perr == nil && since < bestSince {
+							bestSince, raddr = since, strings.TrimSpace(f[2])
+						}
+					}
+				}
+				if s == "END" {
+					break
+				}
+			}
+			if rerr != nil {
+				break
+			}
+		}
+	}
+	if raddr == "" {
+		return
+	}
+	fmt.Fprintf(conn, "kill %s\n", raddr)
+	// Read past the management greeting / async lines until the kill verdict so the
+	// command is flushed and processed before we close the socket.
+	for i := 0; i < 20; i++ {
+		line, rerr := reader.ReadString('\n')
+		s := strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(s, "SUCCESS") || strings.HasPrefix(s, "ERROR") {
+			break
+		}
+		if rerr != nil {
+			break
+		}
+	}
+}
+
+// ovpnStatusIPs parses an OpenVPN status-version 3 file and returns the set of
+// virtual (tunnel) IPs currently held by connected clients.
+func ovpnStatusIPs(statusPath string) map[string]bool {
+	set := map[string]bool{}
+	data, err := os.ReadFile(statusPath)
+	if err != nil {
+		return set
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		// CLIENT_LIST<TAB>CommonName<TAB>RealAddr<TAB>VirtualAddr<TAB>...
+		if !strings.HasPrefix(line, "CLIENT_LIST\t") {
+			continue
+		}
+		f := strings.Split(line, "\t")
+		if len(f) > 3 && f[3] != "" {
+			set[f[3]] = true
+		}
+	}
+	return set
+}
+
 // Usage: x-ui openvpn-connect {inbound_id}
 // Reads common_name and ifconfig_pool_remote_ip from environment.
 func openvpnConnect() {
@@ -504,6 +750,23 @@ func openvpnConnect() {
 
 	if username == "" || ip == "" {
 		os.Exit(0) // Nothing to do
+	}
+
+	// User Limit K>=2: if the panel published a block for this account, lease a
+	// free IP inside it and push it to this device (duplicate-cn lets K devices
+	// share the CN). os.Args[3] is OpenVPN's writable per-session config file.
+	leased, mask, reject := ovpnLeaseBlockIP(inboundId, username, ip)
+	if reject {
+		// User Limit reached with strategy=reject: a non-zero exit from a
+		// client-connect script makes OpenVPN refuse this device.
+		fmt.Fprintln(os.Stderr, "user limit reached; rejecting client")
+		os.Exit(1)
+	}
+	if leased != "" {
+		if len(os.Args) >= 4 && os.Args[3] != "" {
+			_ = os.WriteFile(os.Args[3], []byte(fmt.Sprintf("ifconfig-push %s %s\n", leased, mask)), 0644)
+		}
+		ip = leased
 	}
 
 	secret := readRadiusSecret()
@@ -697,6 +960,8 @@ func main() {
 		openvpnConnect()
 	case "openvpn-disconnect":
 		openvpnDisconnect()
+	case "openvpn-evict":
+		openvpnEvict()
 	default:
 		fmt.Println("Invalid subcommands")
 		fmt.Println()

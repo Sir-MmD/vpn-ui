@@ -215,6 +215,30 @@ func decodeClientCount(raw map[string]json.RawMessage) int {
 	return 0
 }
 
+// decodeUserLimit returns the per-inbound User Limit (devices per account),
+// clamped to [1,64]. Absent/legacy => 1.
+func decodeUserLimit(raw map[string]json.RawMessage) int {
+	if b, ok := raw["userLimit"]; ok {
+		var k int
+		if json.Unmarshal(b, &k) == nil {
+			return normUserLimit(k)
+		}
+	}
+	return 1
+}
+
+// normUserLimitStrategy normalizes the per-inbound "User Limit Strategy" — what
+// happens when a (K+1)-th device connects to an account already at its User Limit.
+// "accept" disconnects the oldest existing device and admits the new one; anything
+// else (default/unset) is "reject" — the new device is refused. Only meaningful
+// when User Limit K>1.
+func normUserLimitStrategy(s string) string {
+	if s == "accept" {
+		return "accept"
+	}
+	return "reject"
+}
+
 // inboundRanges returns the effective /24 ranges an inbound currently owns, used
 // to build the cross-inbound occupancy set. Falls back to a protocol default
 // derived from the inbound id when nothing is stored (legacy inbounds).
@@ -341,14 +365,15 @@ func normalizeRanges(inbound *model.Inbound, excludeId int) error {
 
 	ranges := decodeRanges(raw)
 	clientCount := decodeClientCount(raw)
+	userLimit := decodeUserLimit(raw)
 	used := usedVpnSubnets(excludeId)
 
 	var normalized []string
 	var err error
 	if proto == "openvpn" {
-		normalized, err = normalizeOvpnRanges(inbound.Id, clientCount, used)
+		normalized, err = normalizeOvpnRanges(inbound.Id, clientCount, userLimit, used)
 	} else {
-		normalized, err = normalizePppRanges(proto, ranges, clientCount, used)
+		normalized, err = normalizePppRanges(proto, ranges, clientCount, userLimit, used)
 	}
 	if err != nil {
 		return err
@@ -377,7 +402,7 @@ func normalizeRanges(inbound *model.Inbound, excludeId int) error {
 // normalizePppRanges validates L2TP/PPTP ranges (rejecting overlaps), assigns a
 // free /24 when none are given, and appends free /24s until capacity covers the
 // client count.
-func normalizePppRanges(proto string, ranges []string, clientCount int, used map[string]bool) ([]string, error) {
+func normalizePppRanges(proto string, ranges []string, clientCount, userLimit int, used map[string]bool) ([]string, error) {
 	own := map[string]bool{}
 	var valid []string
 	for _, r := range ranges {
@@ -402,7 +427,16 @@ func normalizePppRanges(proto string, ranges []string, clientCount int, used map
 		own[sub] = true
 	}
 
-	for rangeCapacity(valid) < clientCount {
+	// Capacity target: for K==1 it's the legacy host count (rangeCapacity, which
+	// respects a narrow user range); for K>=2 each account consumes a whole
+	// K-block, so capacity is counted in account blocks per /24.
+	haveCapacity := func() bool {
+		if userLimit <= 1 {
+			return rangeCapacity(valid) >= clientCount
+		}
+		return vpnAccountsCapacity(subnetsOf(valid), userLimit) >= clientCount
+	}
+	for !haveCapacity() {
 		sub := nextFreeSubnet(proto, used, own)
 		if sub == "" {
 			break // address space exhausted — best effort, stop expanding
@@ -417,13 +451,16 @@ func normalizePppRanges(proto string, ranges []string, clientCount int, used map
 // /24s for an OpenVPN inbound large enough for clientCount. For <=253 clients it
 // yields the single legacy /24 (10.2.{id}) whenever that /24 is free, keeping
 // existing deployments byte-identical.
-func normalizeOvpnRanges(inboundId, clientCount int, used map[string]bool) ([]string, error) {
+func normalizeOvpnRanges(inboundId, clientCount, userLimit int, used map[string]bool) ([]string, error) {
 	needed := clientCount
 	if needed < 1 {
 		needed = 1
 	}
+	// Each /24 holds accountsPerSubnet(K) account blocks (253 for K==1, so this
+	// stays byte-identical to the legacy sizing for existing inbounds).
+	per := accountsPerSubnet(userLimit)
 	num24 := 1
-	for num24*253 < needed {
+	for num24*per < needed {
 		num24 *= 2
 	}
 	if num24 > 64 {
@@ -533,4 +570,106 @@ func ovpnBlockClientIP(netAddr net.IP, prefix, i int) string {
 		return ""
 	}
 	return u32ToIP(base + host).String()
+}
+
+// ============================ User Limit (per-account device blocks) =========
+//
+// A per-inbound "User Limit" K lets ONE account drive K simultaneous devices,
+// each with a distinct source IP inside an aligned CIDR block, all matched by a
+// single routing rule (the block CIDR). K is a power of two in [1,64].
+//
+// K==1 is the legacy one-IP-per-account behavior and is deliberately left
+// byte-identical: every K>=2 code path is gated, so existing inbounds (which
+// have no userLimit, decoding to 1) are completely unaffected.
+//
+// Layout for K>=2: each /24 an inbound owns is carved into K-aligned sub-blocks.
+// The first sub-block (holds .0 network + .1 gateway) and the last (holds .255
+// broadcast) are skipped, leaving 256/K - 2 clean blocks. Account `subIdx` in a
+// /24 takes block (subIdx+1), i.e. host octets [(subIdx+1)*K, (subIdx+1)*K+K-1].
+
+const maxUserLimit = 64
+
+// normUserLimit clamps a raw user-limit to a valid device count in [1,64]. Any
+// integer is allowed (not just powers of two): an account owns K consecutive
+// tunnel IPs, matched in routing by an explicit IP list, so no CIDR alignment is
+// required. 0/unset decodes to 1 (legacy single-IP behavior).
+func normUserLimit(k int) int {
+	if k <= 1 {
+		return 1
+	}
+	if k > maxUserLimit {
+		return maxUserLimit
+	}
+	return k
+}
+
+// accountsPerSubnet is how many K-sized account blocks fit in one /24. K==1 keeps
+// the legacy .2-.254 window (253 accounts). For K>=2, account s occupies hosts
+// [(s+1)*K, (s+2)*K-1]; the last host must stay <=254 (leaving .0 network, .1
+// gateway, .255 broadcast free), giving floor(255/K)-1 blocks. This equals the
+// old 256/K-2 for every power-of-two K, so pow2 sizing is byte-identical.
+func accountsPerSubnet(k int) int {
+	k = normUserLimit(k)
+	if k == 1 {
+		return 253
+	}
+	n := 255/k - 1
+	if n < 0 {
+		n = 0
+	}
+	return n
+}
+
+// vpnAccountsCapacity returns how many K-account blocks the given ordered /24
+// prefixes ("A.B.C") can hold in total.
+func vpnAccountsCapacity(subnets []string, k int) int {
+	return len(subnets) * accountsPerSubnet(k)
+}
+
+// vpnAccountBlock maps account index i to its (/24 prefix, first-host octet) under
+// user limit k>=2, walking the ordered /24 prefixes. ok=false past capacity.
+func vpnAccountBlock(subnets []string, i, k int) (subnet string, hostBase int, ok bool) {
+	k = normUserLimit(k)
+	per := accountsPerSubnet(k)
+	if per <= 0 {
+		return "", 0, false
+	}
+	sIdx := i / per
+	sub := i % per
+	if sIdx >= len(subnets) {
+		return "", 0, false
+	}
+	return subnets[sIdx], (sub + 1) * k, true
+}
+
+// vpnAccountDeviceIPs returns the K tunnel IPs of account i's block under user
+// limit k>=2, device 0..K-1 in order (e.g. K=6 -> ".6",".7",...,".11"). nil past
+// capacity. Blocks are consecutive [base, base+K) ranges with no CIDR alignment,
+// so K need not be a power of two; routing matches the whole account with this
+// explicit IP list and the OpenVPN block file leases a free IP from it.
+func vpnAccountDeviceIPs(subnets []string, i, k int) []string {
+	kk := normUserLimit(k)
+	subnet, hostBase, ok := vpnAccountBlock(subnets, i, kk)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, kk)
+	for d := 0; d < kk; d++ {
+		out = append(out, fmt.Sprintf("%s.%d", subnet, hostBase+d))
+	}
+	return out
+}
+
+// vpnAccountDeviceIP returns the tunnel IP of device d in [0,k) for account i
+// under user limit k>=2. "" past capacity or for an out-of-range device index.
+func vpnAccountDeviceIP(subnets []string, i, k, d int) string {
+	kk := normUserLimit(k)
+	if d < 0 || d >= kk {
+		return ""
+	}
+	subnet, hostBase, ok := vpnAccountBlock(subnets, i, kk)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("%s.%d", subnet, hostBase+d)
 }

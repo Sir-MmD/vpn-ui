@@ -28,6 +28,8 @@ type PptpService struct {
 type pptpSettings struct {
 	ClientToClient bool         `json:"clientToClient"`
 	CrossInbound   bool         `json:"crossInbound"`
+	UserLimit         int       `json:"userLimit"`         // simultaneous devices per account (1..64); 1 = legacy
+	UserLimitStrategy string    `json:"userLimitStrategy"` // at the cap: "reject" (default) or "accept" (evict oldest)
 	IpRanges       []string     `json:"ipRanges"`
 	IpRange        string       `json:"ipRange"` // legacy single-range field (read-only fallback)
 	LocalIp        string       `json:"localIp"`
@@ -218,7 +220,9 @@ func (s *PptpService) GeneratePPPOptions(inbound *model.Inbound) error {
 	b.WriteString("refuse-pap\n")
 	b.WriteString("refuse-chap\n")
 	b.WriteString("require-mschap-v2\n")
-	b.WriteString("require-mppe\n")
+	// require-mppe-128 (not plain require-mppe): forces 128-bit MPPE so the
+	// server offers the S bit; plain require-mppe would accept weak 40-bit.
+	b.WriteString("require-mppe-128\n")
 	// Disable IPv6CP: the PPTP data path (nftables TPROXY -> Xray) is IPv4-only,
 	// so a negotiated IPv6 link would leak IPv6 traffic and DNS past Xray.
 	b.WriteString("noipv6\n")

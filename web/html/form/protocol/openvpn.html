@@ -41,6 +41,18 @@
             :max="1500"
         ></a-input-number>
     </a-form-item>
+    <a-form-item label="User Limit">
+        <a-input-number v-model="inbound.settings.userLimit" :min="1" :max="64" :step="1" :precision="0" style="width: 90px"></a-input-number>
+        <span :style="{ marginLeft: '8px', color: '#888' }">
+            Simultaneous devices per account (each device gets its own IP; any number 1-64)
+        </span>
+    </a-form-item>
+    <a-form-item label="User Limit Strategy" v-if="inbound.settings.userLimit > 1">
+        <a-radio-group v-model="inbound.settings.userLimitStrategy">
+            <a-radio value="reject">Reject new connection</a-radio>
+            <a-radio value="accept">Accept (disconnect oldest device)</a-radio>
+        </a-radio-group>
+    </a-form-item>
     <a-form-item label="Client to Client">
         <a-switch
             v-model="inbound.settings.clientToClient"

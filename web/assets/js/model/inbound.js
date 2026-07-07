@@ -2913,6 +2913,8 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
     dns1 = "8.8.8.8",
     dns2 = "8.8.4.4",
     mtu = 1400,
+    userLimit = 1,
+    userLimitStrategy = "reject",
     l2tpUsers = [new Inbound.L2tpSettings.L2tpUser()],
   ) {
     super(protocol);
@@ -2926,6 +2928,10 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
     this.dns1 = dns1;
     this.dns2 = dns2;
     this.mtu = mtu;
+    // Simultaneous devices per account (1..64); 1 = legacy one-IP.
+    this.userLimit = userLimit;
+    // At the User Limit cap: "reject" a new device, or "accept" (evict oldest).
+    this.userLimitStrategy = userLimitStrategy;
     this.l2tpUsers = l2tpUsers;
   }
 
@@ -2944,6 +2950,8 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
       json.dns1 ?? "8.8.8.8",
       json.dns2 ?? "8.8.4.4",
       json.mtu ?? 1400,
+      json.userLimit ?? 1,
+      json.userLimitStrategy ?? "reject",
       Inbound.L2tpSettings.L2tpUser.fromJson(json.clients),
     );
   }
@@ -2959,6 +2967,8 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
       dns1: this.dns1,
       dns2: this.dns2,
       mtu: this.mtu,
+      userLimit: this.userLimit,
+      userLimitStrategy: this.userLimitStrategy,
       clients: Inbound.L2tpSettings.L2tpUser.toJsonArray(this.l2tpUsers),
     };
   }
@@ -3076,6 +3086,8 @@ Inbound.PptpSettings = class extends Inbound.Settings {
     dns1 = "8.8.8.8",
     dns2 = "8.8.4.4",
     mtu = 1400,
+    userLimit = 1,
+    userLimitStrategy = "reject",
     pptpUsers = [new Inbound.PptpSettings.PptpUser()],
   ) {
     super(protocol);
@@ -3086,6 +3098,10 @@ Inbound.PptpSettings = class extends Inbound.Settings {
     this.dns1 = dns1;
     this.dns2 = dns2;
     this.mtu = mtu;
+    // Simultaneous devices per account (1..64); 1 = legacy one-IP.
+    this.userLimit = userLimit;
+    // At the User Limit cap: "reject" a new device, or "accept" (evict oldest).
+    this.userLimitStrategy = userLimitStrategy;
     this.pptpUsers = pptpUsers;
   }
 
@@ -3101,6 +3117,8 @@ Inbound.PptpSettings = class extends Inbound.Settings {
       json.dns1 ?? "8.8.8.8",
       json.dns2 ?? "8.8.4.4",
       json.mtu ?? 1400,
+      json.userLimit ?? 1,
+      json.userLimitStrategy ?? "reject",
       Inbound.PptpSettings.PptpUser.fromJson(json.clients),
     );
   }
@@ -3113,6 +3131,8 @@ Inbound.PptpSettings = class extends Inbound.Settings {
       dns1: this.dns1,
       dns2: this.dns2,
       mtu: this.mtu,
+      userLimit: this.userLimit,
+      userLimitStrategy: this.userLimitStrategy,
       clients: Inbound.PptpSettings.PptpUser.toJsonArray(this.pptpUsers),
     };
   }
@@ -3242,6 +3262,8 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
     clientToClient = false,
     crossInbound = false,
     ipRanges = [],
+    userLimit = 1,
+    userLimitStrategy = "reject",
   ) {
     super(protocol);
     this.udpEnable = udpEnable;
@@ -3265,6 +3287,10 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
     // Shown read-only in the form; not user-editable (OpenVPN needs one
     // contiguous `server` block per transport).
     this.ipRanges = ipRanges;
+    // Simultaneous devices per account (1..64); 1 = legacy one-IP.
+    this.userLimit = userLimit;
+    // At the User Limit cap: "reject" a new device, or "accept" (evict oldest).
+    this.userLimitStrategy = userLimitStrategy;
   }
 
   static fromJson(json = {}) {
@@ -3291,6 +3317,8 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
       json.clientToClient ?? false,
       json.crossInbound ?? false,
       Array.isArray(json.ipRanges) ? json.ipRanges.slice() : [],
+      json.userLimit ?? 1,
+      json.userLimitStrategy ?? "reject",
     );
   }
 
@@ -3316,6 +3344,8 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
       clientToClient: this.clientToClient,
       crossInbound: this.crossInbound,
       ipRanges: this.ipRanges || [],
+      userLimit: this.userLimit,
+      userLimitStrategy: this.userLimitStrategy,
     };
   }
 };
