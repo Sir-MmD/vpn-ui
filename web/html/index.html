@@ -90,6 +90,17 @@
                   </a-row>
                 </a-card>
               </a-col>
+              <a-col :sm="24" :lg="24">
+                <a-card hoverable :title="'{{ i18n "pages.index.vpnServices" }}'">
+                  <div :style="{ display: 'flex', flexWrap: 'wrap', gap: '16px' }">
+                    <div v-for="c in vpnCoreStatuses()" :key="c.name"
+                      :style="{ flex: '1 1 0', minWidth: '84px', textAlign: 'center' }">
+                      <div :style="{ fontWeight: 600, marginBottom: '8px' }">[[ coreLabel(c.name) ]]</div>
+                      <a-badge :color="coreStateColor(c.state)" :text="coreStateText(c.state)"></a-badge>
+                    </div>
+                  </div>
+                </a-card>
+              </a-col>
               <a-col :sm="24" :lg="12">
                 <a-card hoverable>
                   <template #title>
@@ -139,6 +150,10 @@
                       <a-icon type="reload"></a-icon>
                       <span v-if="!isMobile">{{ i18n "pages.index.restartXray" }}</span>
                     </a-space>
+                    <a-space direction="horizontal" @click="openGeofiles()" class="jc-center">
+                      <a-icon type="global"></a-icon>
+                      <span v-if="!isMobile">{{ i18n "pages.index.geofiles" }}</span>
+                    </a-space>
                     <a-space direction="horizontal" @click="openSelectV2rayVersion" class="jc-center">
                       <a-icon type="tool"></a-icon>
                       <span v-if="!isMobile">
@@ -169,19 +184,9 @@
               </a-col>
               <a-col :sm="24" :lg="12">
                 <a-card title='VPN-UI' hoverable>
-                  <a rel="noopener" href="https://github.com/MHSanaei/3x-ui/releases" target="_blank">
+                  <a rel="noopener" href="https://github.com/Sir-MmD/vpn-ui" target="_blank">
                     <a-tag color="green">
                       <span>v{{ .cur_ver }}</span>
-                    </a-tag>
-                  </a>
-                  <a rel="noopener" href="https://t.me/XrayUI" target="_blank">
-                    <a-tag color="green">
-                      <span>@XrayUI</span>
-                    </a-tag>
-                  </a>
-                  <a rel="noopener" href="https://github.com/MHSanaei/3x-ui/wiki" target="_blank">
-                    <a-tag color="purple">
-                      <span>{{ i18n "pages.index.documentation" }}</span>
                     </a-tag>
                   </a>
                 </a-card>
@@ -383,6 +388,61 @@
       </a-collapse-panel>
     </a-collapse>
   </a-modal>
+  <a-modal id="geofiles-modal" v-model="geofilesModal.visible" title='{{ i18n "pages.index.geofiles" }}'
+    :closable="true" @ok="() => geofilesModal.visible = false" :class="themeSwitcher.currentTheme" footer="">
+    <a-collapse default-active-key="2">
+      <a-collapse-panel key="2" header='Geofiles'>
+        <a-list class="ant-version-list w-100" bordered>
+          <a-list-item class="ant-version-list-item"
+            v-for="file, index in ['geosite.dat', 'geoip.dat', 'geosite_IR.dat', 'geoip_IR.dat', 'geosite_RU.dat', 'geoip_RU.dat']">
+            <a-tag :color="index % 2 == 0 ? 'purple' : 'green'">[[ file ]]</a-tag>
+            <a-icon type="reload" @click="updateGeofile(file)" class="mr-8" />
+          </a-list-item>
+        </a-list>
+        <div class="mt-5 d-flex justify-end"><a-button @click="updateGeofile('')">{{ i18n
+            "pages.index.geofilesUpdateAll" }}</a-button></div>
+      </a-collapse-panel>
+      <a-collapse-panel key="3" header='{{ i18n "pages.index.customGeoTitle" }}'>
+        <div class="custom-geo-section">
+        <a-alert type="info" show-icon class="mb-10"
+          message='{{ i18n "pages.index.customGeoRoutingHint" }}'></a-alert>
+        <div class="mb-10">
+          <a-button type="primary" icon="plus" @click="openCustomGeoModal(null)" :loading="customGeoLoading">
+            {{ i18n "pages.index.customGeoAdd" }}
+          </a-button>
+          <a-button class="ml-8" icon="reload" @click="updateAllCustomGeo" :loading="customGeoUpdatingAll">{{ i18n
+            "pages.index.geofilesUpdateAll" }}</a-button>
+        </div>
+        <a-table :columns="customGeoColumns" :data-source="customGeoList" :pagination="false" :row-key="r => r.id"
+          :loading="customGeoLoading" size="small" :scroll="{ x: 520 }">
+          <template slot="extDat" slot-scope="text, record">
+            <code class="custom-geo-ext-code">[[ customGeoExtDisplay(record) ]]</code>
+          </template>
+          <template slot="lastUpdatedAt" slot-scope="text, record">
+            <span v-if="record.lastUpdatedAt">[[ customGeoFormatTime(record.lastUpdatedAt) ]]</span>
+            <span v-else>—</span>
+          </template>
+          <template slot="action" slot-scope="text, record">
+            <a-space size="small">
+              <a-tooltip :overlay-class-name="themeSwitcher.currentTheme">
+                <template slot="title">{{ i18n "pages.index.customGeoEdit" }}</template>
+                <a-button type="link" size="small" icon="edit" @click="openCustomGeoModal(record)"></a-button>
+              </a-tooltip>
+              <a-tooltip :overlay-class-name="themeSwitcher.currentTheme">
+                <template slot="title">{{ i18n "pages.index.customGeoDownload" }}</template>
+                <a-button type="link" size="small" icon="reload" @click="downloadCustomGeo(record.id)" :loading="customGeoActionId === record.id"></a-button>
+              </a-tooltip>
+              <a-tooltip :overlay-class-name="themeSwitcher.currentTheme">
+                <template slot="title">{{ i18n "pages.index.customGeoDelete" }}</template>
+                <a-button type="link" size="small" icon="delete" @click="confirmDeleteCustomGeo(record)"></a-button>
+              </a-tooltip>
+            </a-space>
+          </template>
+        </a-table>
+        </div>
+      </a-collapse-panel>
+    </a-collapse>
+  </a-modal>
   <a-modal v-model="customGeoModal.visible" :title="customGeoModal.editId ? '{{ i18n "pages.index.customGeoModalEdit" }}' : '{{ i18n "pages.index.customGeoModalAdd" }}'"
     :confirm-loading="customGeoModal.saving" @ok="submitCustomGeo" :ok-text="'{{ i18n "pages.index.customGeoModalSave" }}'" :cancel-text="'{{ i18n "close" }}'"
     :class="themeSwitcher.currentTheme">
@@ -434,7 +494,7 @@
         <a-checkbox v-model="logModal.syslog" @change="openLogs()">SysLog</a-checkbox>
       </a-form-item>
       <a-form-item style="float: right;">
-        <a-button type="primary" icon="download" @click="FileManager.downloadTextFile(logModal.logs?.join('\n'), 'x-ui.log')"></a-button>
+        <a-button type="primary" icon="download" @click="FileManager.downloadTextFile(logModal.logs?.join('\n'), 'vpn-ui.log')"></a-button>
       </a-form-item>
     </a-form>
     <div class="ant-input log-container" v-html="logModal.formattedLogs"></div>
@@ -514,6 +574,26 @@
         :max-points="cpuHistoryLong.length" :fill-opacity="0.18" :marker-radius="3.2" :show-tooltip="true" />
       <div style="margin-top:4px;font-size:11px;opacity:0.65">Timeframe: [[ cpuHistoryModal.bucket ]] sec per point (total [[ cpuHistoryLong.length ]] points)</div>
     </div>
+  </a-modal>
+  <!-- Unsupported-distro warning -->
+  <a-modal id="distro-warn-modal" v-model="distroModal.visible" :closable="false"
+    :mask-closable="false" :class="themeSwitcher.currentTheme" width="520px">
+    <template slot="title">
+      <span style="color:#cf1322;font-weight:600">⚠&nbsp; Unsupported distribution</span>
+    </template>
+    <div style="padding:4px 2px">
+      <p style="margin-bottom:10px">
+        <b>[[ distroModal.pretty ]]</b> is not on vpn-ui's officially tested distro list.
+        The panel may still run, but <b style="color:#cf1322">expect errors</b>.
+      </p>
+      <p style="margin-bottom:0;opacity:0.7;font-size:12px;line-height:1.5">
+        Officially tested: [[ distroModal.tested ]]
+      </p>
+    </div>
+    <template slot="footer">
+      <a-button @click="dismissDistroWarning(false)">Close</a-button>
+      <a-button type="primary" @click="dismissDistroWarning(true)">Close and don't show again</a-button>
+    </template>
   </a-modal>
 </a-layout>
 {{template "page/body_scripts" .}}
@@ -849,7 +929,7 @@
           if (message.startsWith("XRAY:"))
             message = "<b>XRAY: </b>" + message.substring(5);
           else
-            message = "<b>X-UI: </b>" + message;
+            message = "<b>VPN-UI: </b>" + message;
         }
 
         formattedLogs += message ? ' - ' + message : '';
@@ -989,8 +1069,56 @@
         alias: '{{ i18n "pages.index.customGeoValidationAlias" }}',
         url: '{{ i18n "pages.index.customGeoValidationUrl" }}',
       },
+      coreStatuses: [],
+      geofilesModal: { visible: false },
+      distroModal: { visible: false, pretty: '', tested: '' },
     },
     methods: {
+      // --- VPN daemon statuses (dashboard card) --------------------------
+      async getCoreStatuses() {
+        try {
+          const msg = await HttpUtil.get('/panel/core/status');
+          if (msg && msg.success && msg.obj) this.coreStatuses = msg.obj.cores || [];
+        } catch (e) { /* dashboard card is best-effort */ }
+      },
+      // --- Unsupported-distro warning (dashboard modal) -----------------
+      async checkDistroSupport() {
+        try {
+          const msg = await HttpUtil.get('/panel/api/server/distroStatus');
+          if (!msg || !msg.success || !msg.obj || msg.obj.supported) return;
+          // "don't show again" is keyed by the distro name, so moving to a
+          // different unsupported distro warns again.
+          if (localStorage.getItem('vpnui.distroWarnDismissed') === msg.obj.pretty) return;
+          this.distroModal.pretty = msg.obj.pretty || 'This system';
+          this.distroModal.tested = msg.obj.tested || '';
+          this.distroModal.visible = true;
+        } catch (e) { /* best-effort — never block the dashboard */ }
+      },
+      dismissDistroWarning(forever) {
+        if (forever) {
+          try { localStorage.setItem('vpnui.distroWarnDismissed', this.distroModal.pretty); } catch (e) { /* ignore */ }
+        }
+        this.distroModal.visible = false;
+      },
+      vpnCoreStatuses() {
+        const order = ['l2tp', 'ipsec', 'pptp', 'openvpn', 'radius'];
+        const byName = {};
+        (this.coreStatuses || []).forEach(c => { byName[c.name] = c; });
+        return order.map(n => byName[n] || { name: n, state: 'unknown' });
+      },
+      coreLabel(name) {
+        return { l2tp: 'L2TP', ipsec: 'IPsec', pptp: 'PPTP', openvpn: 'OpenVPN', radius: 'RADIUS' }[name] || name;
+      },
+      coreStateColor(state) {
+        return { running: '#52c41a', idle: '#1890ff', stopped: '#faad14', not_installed: '#8c8c8c', error: '#f5222d' }[state] || '#8c8c8c';
+      },
+      coreStateText(state) {
+        return { running: 'Running', idle: 'Idle', stopped: 'Stopped', not_installed: 'Not installed', error: 'Error', unknown: '—' }[state] || state;
+      },
+      openGeofiles() {
+        this.geofilesModal.visible = true;
+        this.loadCustomGeo();
+      },
       loading(spinning, tip = '{{ i18n "loading"}}') {
         this.loadingStates.spinning = spinning;
         this.loadingTip = tip;
@@ -1049,15 +1177,18 @@
           console.error('Failed to fetch bucketed cpu history', e)
         }
       },
-      async openSelectV2rayVersion() {
-        this.loading(true);
-        const msg = await HttpUtil.get('/panel/api/server/getXrayVersion');
-        this.loading(false);
-        if (!msg.success) {
-          return;
-        }
-        versionModal.show(msg.obj);
-        this.loadCustomGeo();
+      openSelectV2rayVersion() {
+        // The Xray core is a pinned, patched build bundled into the panel binary
+        // (see the corebundle package + the locked ServerService.UpdateXray).
+        // Switching/updating the core version is disabled by design, so the
+        // version picker is replaced with a notice. The tag still shows the
+        // running core version.
+        this.$info({
+          title: '{{ i18n "pages.index.xrayCoreLockedTitle" }}',
+          content: '{{ i18n "pages.index.xrayCoreLocked" }}',
+          okText: '{{ i18n "confirm" }}',
+          class: themeSwitcher.currentTheme,
+        });
       },
       customGeoFormatTime(ts) {
         if (!ts) return '';
@@ -1206,7 +1337,7 @@
           class: themeSwitcher.currentTheme,
           cancelText: '{{ i18n "cancel"}}',
           onOk: async () => {
-            versionModal.hide();
+            this.geofilesModal.visible = false;
             this.loading(true, '{{ i18n "pages.index.dontRefresh"}}');
             const url = isSingleFile
               ? `/panel/api/server/updateGeofile/${fileName}`
@@ -1254,7 +1385,7 @@
       },
       downloadXrayLogs() {
         if (!Array.isArray(this.xraylogModal.logs) || this.xraylogModal.logs.length === 0) {
-          FileManager.downloadTextFile('', 'x-ui.log');
+          FileManager.downloadTextFile('', 'vpn-ui.log');
           return;
         }
         const lines = this.xraylogModal.logs.map(l => {
@@ -1269,7 +1400,7 @@
             return JSON.stringify(l);
           }
         }).join('\n');
-        FileManager.downloadTextFile(lines, 'x-ui.log');
+        FileManager.downloadTextFile(lines, 'vpn-ui.log');
       },
       async openConfig() {
         this.loading(true);
@@ -1327,6 +1458,7 @@
           }
           try {
             await this.getStatus();
+            await this.getCoreStatuses();
           } catch (e) {
             console.error(e);
           }
@@ -1345,6 +1477,8 @@
 
       // Initial status fetch
       await this.getStatus();
+      await this.getCoreStatuses();
+      this.checkDistroSupport();
 
       // Setup WebSocket for real-time updates
       if (window.wsClient) {

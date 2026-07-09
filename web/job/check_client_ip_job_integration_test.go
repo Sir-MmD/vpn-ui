@@ -15,7 +15,7 @@ import (
 	"github.com/op/go-logging"
 )
 
-// 3x-ui logger must be initialised once before any code path that can
+// vpn-ui logger must be initialised once before any code path that can
 // log a warning. otherwise log.Warningf panics on a nil logger.
 var loggerInitOnce sync.Once
 
@@ -33,8 +33,8 @@ func setupIntegrationDB(t *testing.T) {
 	dbDir := t.TempDir()
 	logDir := t.TempDir()
 
-	t.Setenv("XUI_DB_FOLDER", dbDir)
-	t.Setenv("XUI_LOG_FOLDER", logDir)
+	t.Setenv("VPNUI_DB_FOLDER", dbDir)
+	t.Setenv("VPNUI_LOG_FOLDER", logDir)
 
 	// updateInboundClientIps calls log.SetOutput on the package global,
 	// which would leak to other tests in the same binary.
@@ -45,7 +45,7 @@ func setupIntegrationDB(t *testing.T) {
 		log.SetFlags(origLogFlags)
 	})
 
-	if err := database.InitDB(filepath.Join(dbDir, "3x-ui.db")); err != nil {
+	if err := database.InitDB(filepath.Join(dbDir, "vpn-ui.db")); err != nil {
 		t.Fatalf("database.InitDB failed: %v", err)
 	}
 	// LIFO cleanup order: this runs before t.TempDir's own cleanup.
@@ -233,7 +233,7 @@ func TestUpdateInboundClientIps_ExcessLiveIpIsStillBanned(t *testing.T) {
 // just for the path helper (which would pull a lot more deps into the
 // test binary). The env-derived log folder is deterministic.
 func readIpLimitLogPath() string {
-	folder := os.Getenv("XUI_LOG_FOLDER")
+	folder := os.Getenv("VPNUI_LOG_FOLDER")
 	if folder == "" {
 		folder = filepath.Join(".", "log")
 	}

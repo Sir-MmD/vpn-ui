@@ -1,0 +1,63 @@
+# vpn-ui test unit config. Paths are relative to test_unit/ unless absolute.
+
+binary = "test_subject/vpn-ui"              # panel binary in test_subject/ (+ its bin/)
+concurrency = 2                            # distros at once; 2 safe on 31Gi, 5+ oversubscribes
+client_image = "images:ubuntu/26.04/cloud"  # all client VMs
+keep_failed_vms = false                     # keep a failed job's VMs for post-mortem
+
+# Distro matrix. enabled = false (or --only) skips one.
+servers = [
+  {name = "ubuntu-22", image = "images:ubuntu/22.04/cloud",  enabled = true},
+  {name = "ubuntu-24", image = "images:ubuntu/24.04/cloud",  enabled = true},
+  {name = "ubuntu-26", image = "images:ubuntu/26.04/cloud",  enabled = true},
+  {name = "debian-12", image = "images:debian/12/cloud",     enabled = true},
+  {name = "debian-13", image = "images:debian/13/cloud",     enabled = true},
+  {name = "fedora-43", image = "images:fedora/43/cloud",     enabled = true},
+  {name = "fedora-44", image = "images:fedora/44/cloud",     enabled = true},
+  {name = "alma-8",    image = "images:almalinux/8/cloud",   enabled = true},
+  {name = "alma-9",    image = "images:almalinux/9/cloud",   enabled = true},
+  {name = "alma-10",   image = "images:almalinux/10/cloud",  enabled = true},
+  {name = "rocky-8",   image = "images:rockylinux/8/cloud",  enabled = true},
+  {name = "rocky-9",   image = "images:rockylinux/9/cloud",  enabled = true},
+  {name = "rocky-10",  image = "images:rockylinux/10/cloud", enabled = true},
+  {name = "arch",      image = "images:archlinux/cloud",     enabled = true},
+]
+
+[panel]                    # defaults match the binary
+port = 2083
+username = "admin"
+password = "admin"
+base_path = "/"
+scheme = "http"
+
+[vm]
+agent_timeout = 300        # wait for the incus-agent
+panel_timeout = 300        # wait for the panel on :port
+provision_timeout = 1200   # wait for provisioning
+
+[vm.server]
+cpu = 1
+memory = "2GiB"
+
+[vm.client]
+cpu = 1
+memory = "1GiB"
+
+[dns_leak]
+api_base = "https://bash.ws"
+
+[dns_resolve]
+domain = "cloudflare.com"  # dig +short through the tunnel
+
+# Traffic accounting on account A; *_mb pulled via HTTP range off a big file.
+[traffic_test]
+usage_mb = 15              # "counted correctly" download
+multi_user_mb = 8          # per-device for K-device aggregation (pulled N times, keep small)
+limit_mb = 100             # account limit for the termination test
+over_mb = 120              # download to exceed the limit (> limit_mb)
+settle_timeout = 40        # seconds to poll the counter / auto-disable flag
+urls = [
+  "https://proof.ovh.net/files/1Gb.dat",
+  "https://ash-speed.hetzner.com/1GB.bin",
+  "http://speedtest.tele2.net/1GB.zip",
+]

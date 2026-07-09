@@ -18,7 +18,7 @@
     {
       "tag": "api",
       "listen": "127.0.0.1",
-      "port": 62789,
+      "port": 62790,
       "protocol": "tunnel",
       "settings": {
         "address": "127.0.0.1"
@@ -84,6 +84,6 @@
   "stats": {},
   "metrics": {
     "tag": "metrics_out",
-    "listen": "127.0.0.1:11111"
+    "listen": "127.0.0.1:21111"
   }
 }

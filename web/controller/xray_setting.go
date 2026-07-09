@@ -2,6 +2,7 @@ package controller
 
 import (
 	"encoding/json"
+	"strconv"
 
 	"github.com/mhsanaei/3x-ui/v2/util/common"
 	"github.com/mhsanaei/3x-ui/v2/web/service"
@@ -36,6 +37,7 @@ func (a *XraySettingController) initRouter(g *gin.RouterGroup) {
 
 	g.POST("/", a.getXraySetting)
 	g.POST("/warp/:action", a.warp)
+	g.POST("/warpsocks/:action", a.warpsocks)
 	g.POST("/nord/:action", a.nord)
 	g.POST("/update", a.updateSetting)
 	g.POST("/resetOutboundsTraffic", a.resetOutboundsTraffic)
@@ -140,6 +142,29 @@ func (a *XraySettingController) warp(c *gin.Context) {
 	}
 
 	jsonObj(c, resp, err)
+}
+
+// warpsocks drives the "official WARP-CLI" SOCKS5 background lifecycle. install
+// and uninstall kick off a non-blocking run and return the initial run state;
+// the modal then polls "state" (~1s) for the live log. "installed" reports
+// whether warp-cli is already present so the modal can offer Reinstall/Uninstall.
+func (a *XraySettingController) warpsocks(c *gin.Context) {
+	action := c.Param("action")
+	switch action {
+	case "install":
+		port, _ := strconv.Atoi(c.PostForm("port"))
+		service.StartWarpSocks("reinstall", port)
+		jsonObj(c, service.WarpSocksState(), nil)
+	case "uninstall":
+		service.StartWarpSocks("uninstall", 0)
+		jsonObj(c, service.WarpSocksState(), nil)
+	case "state":
+		jsonObj(c, service.WarpSocksState(), nil)
+	case "installed":
+		jsonObj(c, gin.H{"installed": service.WarpSocksInstalled()}, nil)
+	default:
+		jsonObj(c, service.WarpSocksState(), nil)
+	}
 }
 
 // nord handles NordVPN-related operations based on the action parameter.

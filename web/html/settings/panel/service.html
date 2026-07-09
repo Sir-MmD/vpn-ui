@@ -70,13 +70,23 @@
                             @click="loadServiceLog"><a-icon type="reload"></a-icon></a-button>
                     </div>
                     <div :style="{ opacity: 0.65, marginBottom: '8px', fontSize: '13px' }">{{ i18n "pages.settings.service.liveLogDesc" }}</div>
-                    <div class="svc-term">
-                        <div class="svc-term-bar">
-                            <a-icon type="code" class="svc-term-icon"></a-icon>
-                            <span class="svc-term-title">vpn-ui — [[ serviceState.name ]].service</span>
-                            <span class="svc-term-dot" :class="serviceState.active ? 'on' : 'off'"></span>
+                    <!-- Live service status log — shared core-setup terminal look (assets/css/terminal.css) -->
+                    <div class="term">
+                        <div class="term-bar">
+                            <a-icon type="code" class="term-bar-icon"></a-icon>
+                            <span class="term-bar-title">vpn-ui — [[ serviceState.name ]].service</span>
+                            <span :style="{ flex: '0 0 auto', width: '9px', height: '9px', borderRadius: '50%', background: serviceState.active ? '#3fb950' : '#6e7681', boxShadow: serviceState.active ? '0 0 6px #3fb950' : 'none' }"></span>
                         </div>
-                        <pre class="svc-term-body" ref="serviceLog">[[ serviceLog || '{{ i18n "pages.settings.service.noLog" }}' ]]</pre>
+                        <div class="term-body" ref="serviceLog" :style="{ height: '340px', maxHeight: '340px' }">
+                            <template v-if="serviceLog">
+                                <div class="term-line" v-for="(l, i) in serviceLog.split('\n')" :key="i">
+                                    <span class="term-name">[[ l || ' ' ]]</span>
+                                </div>
+                            </template>
+                            <div v-else class="term-line">
+                                <span class="term-msg">{{ i18n "pages.settings.service.noLog" }}</span>
+                            </div>
+                        </div>
                     </div>
                 </a-col>
             </a-row>
@@ -92,58 +102,4 @@
         </div>
     </a-collapse-panel>
 </a-collapse>
-<style>
-    /* Terminal look matching the setup console */
-    .svc-term {
-        border-radius: 10px;
-        overflow: hidden;
-        border: 1px solid rgba(0, 0, 0, 0.4);
-        background: #0d1117;
-        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
-    }
-
-    .svc-term-bar {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 8px 12px;
-        background: #161b22;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-    }
-
-    .svc-term-icon {
-        color: rgba(255, 255, 255, 0.4);
-        font-size: 13px;
-    }
-
-    .svc-term-title {
-        flex: 1;
-        font-size: 12px;
-        color: rgba(255, 255, 255, 0.5);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    }
-
-    .svc-term-dot {
-        width: 9px;
-        height: 9px;
-        border-radius: 50%;
-    }
-
-    .svc-term-dot.on { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
-    .svc-term-dot.off { background: #6e7681; }
-
-    .svc-term-body {
-        height: 340px;
-        overflow: auto;
-        margin: 0;
-        padding: 12px 14px;
-        background: #0d1117;
-        color: #c9d1d9;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 12px;
-        line-height: 1.5;
-        white-space: pre-wrap;
-        word-break: break-word;
-    }
-</style>
 {{end}}

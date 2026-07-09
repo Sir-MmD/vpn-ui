@@ -1,4 +1,4 @@
-// Package web provides the main web server implementation for the 3x-ui panel,
+// Package web provides the main web server implementation for the vpn-ui panel,
 // including HTTP/HTTPS serving, routing, templates, and background job scheduling.
 package web
 
@@ -93,7 +93,7 @@ func EmbeddedAssets() embed.FS {
 	return assetsFS
 }
 
-// Server represents the main web server for the 3x-ui panel with controllers, services, and scheduled jobs.
+// Server represents the main web server for the vpn-ui panel with controllers, services, and scheduled jobs.
 type Server struct {
 	httpServer *http.Server
 	listener   net.Listener
@@ -221,7 +221,7 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 		sessionOptions.MaxAge = sessionMaxAge * 60 // minutes -> seconds
 	}
 	store.Options(sessionOptions)
-	engine.Use(sessions.Sessions("3x-ui", store))
+	engine.Use(sessions.Sessions("vpn-ui", store))
 	engine.Use(func(c *gin.Context) {
 		c.Set("base_path", basePath)
 	})
@@ -309,10 +309,12 @@ func (s *Server) startTask() {
 		if err := s.radiusService.Start(radiusSecret); err != nil {
 			logger.Warning("RADIUS: failed to start:", err)
 		}
-		// Pass RADIUS service and secret to L2TP/PPTP/OpenVPN services
-		s.l2tpService.SetRadius(s.radiusService, radiusSecret)
-		s.pptpService.SetRadius(s.radiusService, radiusSecret)
-		s.openvpnService.SetRadius(s.radiusService, radiusSecret)
+		// Pass the RADIUS service (by pointer, so all three share the one instance
+		// whose mutex/session map the running RADIUS servers use) and secret to the
+		// L2TP/PPTP/OpenVPN services.
+		s.l2tpService.SetRadius(&s.radiusService, radiusSecret)
+		s.pptpService.SetRadius(&s.radiusService, radiusSecret)
+		s.openvpnService.SetRadius(&s.radiusService, radiusSecret)
 	}
 
 	// Initialize L2TP/PPTP/OpenVPN services before Xray so TPROXY/NAT rules are in place
@@ -456,6 +458,7 @@ func (s *Server) Start() (err error) {
 	if err != nil {
 		return err
 	}
+	scheme := "http"
 	if certFile != "" || keyFile != "" {
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err == nil {
@@ -464,6 +467,7 @@ func (s *Server) Start() (err error) {
 			}
 			listener = network.NewAutoHttpsListener(listener)
 			listener = tls.NewListener(listener, c)
+			scheme = "https"
 			logger.Info("Web server running HTTPS on", listener.Addr())
 		} else {
 			logger.Error("Error loading certificates:", err)
@@ -473,6 +477,16 @@ func (s *Server) Start() (err error) {
 		logger.Info("Web server running HTTP on", listener.Addr())
 	}
 	s.listener = listener
+
+	// Always print the access URL to stdout so the operator sees the port on
+	// launch (the logger.Info above may go to syslog/file and be invisible on a
+	// bare run). Empty/wildcard listen means all interfaces.
+	basePath, _ := s.settingService.GetBasePath()
+	hostDisp := listen
+	if hostDisp == "" || hostDisp == "0.0.0.0" || hostDisp == "::" {
+		hostDisp = "0.0.0.0"
+	}
+	fmt.Printf("\nvpn-ui panel listening on %s://%s:%d%s\n\n", scheme, hostDisp, port, basePath)
 
 	s.httpServer = &http.Server{
 		Handler: engine,

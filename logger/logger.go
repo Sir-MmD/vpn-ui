@@ -1,4 +1,4 @@
-// Package logger provides logging functionality for the 3x-ui panel with
+// Package logger provides logging functionality for the vpn-ui panel with
 // dual-backend logging (console/syslog and file) and buffered log storage for web UI.
 package logger
 
@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/config"
@@ -15,7 +14,7 @@ import (
 
 const (
 	maxLogBufferSize = 10240                 // Maximum log entries kept in memory
-	logFileName      = "3xui.log"            // Log file name
+	logFileName      = "vpn-ui.log"            // Log file name
 	timeFormat       = "2006/01/02 15:04:05" // Log timestamp format
 )
 
@@ -34,20 +33,20 @@ var (
 // InitLogger initializes dual logging backends: console/syslog and file.
 // Console logging uses the specified level, file logging always uses DEBUG level.
 func InitLogger(level logging.Level) {
-	newLogger := logging.MustGetLogger("x-ui")
+	newLogger := logging.MustGetLogger("vpn-ui")
 	backends := make([]logging.Backend, 0, 2)
 
 	// Console/syslog backend with configurable level
 	if consoleBackend := initDefaultBackend(); consoleBackend != nil {
 		leveledBackend := logging.AddModuleLevel(consoleBackend)
-		leveledBackend.SetLevel(level, "x-ui")
+		leveledBackend.SetLevel(level, "vpn-ui")
 		backends = append(backends, leveledBackend)
 	}
 
 	// File backend with DEBUG level for comprehensive logging
 	if fileBackend := initFileBackend(); fileBackend != nil {
 		leveledBackend := logging.AddModuleLevel(fileBackend)
-		leveledBackend.SetLevel(logging.DEBUG, "x-ui")
+		leveledBackend.SetLevel(logging.DEBUG, "vpn-ui")
 		backends = append(backends, leveledBackend)
 	}
 
@@ -57,25 +56,17 @@ func InitLogger(level logging.Level) {
 }
 
 // initDefaultBackend creates the console/syslog logging backend.
-// Windows: Uses stderr directly (no syslog support)
-// Unix-like: Attempts syslog, falls back to stderr
+// Attempts syslog, falls back to stderr.
 func initDefaultBackend() logging.Backend {
 	var backend logging.Backend
 	includeTime := false
 
-	if runtime.GOOS == "windows" {
-		// Windows: Use stderr directly (no syslog support)
+	if syslogBackend, err := logging.NewSyslogBackend(""); err != nil {
+		fmt.Fprintf(os.Stderr, "syslog backend disabled: %v\n", err)
 		backend = logging.NewLogBackend(os.Stderr, "", 0)
-		includeTime = true
+		includeTime = os.Getppid() > 0
 	} else {
-		// Unix-like: Try syslog, fallback to stderr
-		if syslogBackend, err := logging.NewSyslogBackend(""); err != nil {
-			fmt.Fprintf(os.Stderr, "syslog backend disabled: %v\n", err)
-			backend = logging.NewLogBackend(os.Stderr, "", 0)
-			includeTime = os.Getppid() > 0
-		} else {
-			backend = syslogBackend
-		}
+		backend = syslogBackend
 	}
 
 	return logging.NewBackendFormatter(backend, newFormatter(includeTime))

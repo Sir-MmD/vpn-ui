@@ -259,6 +259,7 @@ func (s *CoreService) GetCoresStatus() []CoreStatus {
 	return []CoreStatus{
 		s.xrayStatus(),
 		s.l2tpStatus(),
+		s.ipsecStatus(),
 		s.pptpStatus(),
 		s.openvpnStatus(),
 		s.radiusStatus(),
@@ -291,16 +292,38 @@ func (s *CoreService) l2tpStatus() CoreStatus {
 		return cs
 	}
 	cs.Version = daemonVersion("xl2tpd")
-	cs.Extra = map[string]any{
-		"ipsec":     systemctlActive("ipsec"),
-		"libreswan": commandExists("ipsec"),
-	}
 	switch {
 	case procMgr.IsRunning("xl2tpd"):
 		cs.State = CoreRunning
 	case cs.Inbounds == 0:
 		cs.State = CoreIdle
 	default:
+		cs.State = CoreStopped
+	}
+	return cs
+}
+
+// ipsecStatus reports libreswan (IPsec) as its own core. It runs either as our
+// bundled USE_DH2 pluto (a supervised procMgr child, when a bundle is embedded)
+// or as the host's ipsec.service — either way it underpins L2TP/IPsec but
+// installs, versions and runs independently of xl2tpd, so it gets its own card.
+func (s *CoreService) ipsecStatus() CoreStatus {
+	cs := CoreStatus{Name: "ipsec"}
+	if !ipsecAvailable() {
+		cs.State = CoreNotInstalled
+		cs.Detail = "libreswan (ipsec) not installed"
+		return cs
+	}
+	if maj, min, ok := libreswanVersion(); ok {
+		cs.Version = fmt.Sprintf("%d.%d", maj, min)
+	}
+	running := systemctlActive("ipsec")
+	if usingBundledIpsec() {
+		running = bundledPlutoRunning()
+	}
+	if running {
+		cs.State = CoreRunning
+	} else {
 		cs.State = CoreStopped
 	}
 	return cs
@@ -426,6 +449,9 @@ func (s *CoreService) RestartCore(name string) error {
 		return s.openvpnService.RestartServices()
 	case "radius":
 		return RestartRadius()
+	case "ipsec":
+		_, err := restartIpsecService()
+		return err
 	default:
 		return fmt.Errorf("unknown core: %s", name)
 	}
@@ -462,6 +488,8 @@ func (s *CoreService) StopCore(name string) error {
 		return nil
 	case "radius":
 		return StopRadius()
+	case "ipsec":
+		return stopIpsecService()
 	default:
 		return fmt.Errorf("core %s does not support stop", name)
 	}
@@ -486,6 +514,8 @@ func (s *CoreService) CoreLogs(name string) string {
 		return out
 	case "radius":
 		return filterLogs("radius")
+	case "ipsec":
+		return ipsecFailureDiagnostics()
 	}
 	return ""
 }
@@ -508,7 +538,7 @@ func filterLogs(keyword string) string {
 // Provision performs the host/kernel preparation that no bundled binary can do:
 // load + persist the required kernel modules and enable + persist IP forwarding.
 // It is idempotent and safe to run repeatedly. This is the in-binary replacement
-// for the host-prep half of setup-vpn-backend.sh. It collects and returns all
+// for the legacy host-prep shell script. It collects and returns all
 // steps; use StartProvision for the streamed, non-blocking variant.
 func (s *CoreService) Provision() []ProvisionStep {
 	var steps []ProvisionStep

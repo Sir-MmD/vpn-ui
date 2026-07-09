@@ -756,6 +756,40 @@
               v-model.number="outbound.stream.xhttp.xmux.hKeepAlivePeriod"
             ></a-input-number>
           </a-form-item>
+          <a-form-item label="Max Each Post Bytes">
+            <a-input
+              v-model.trim="outbound.stream.xhttp.scMaxEachPostBytes"
+            ></a-input>
+          </a-form-item>
+          <a-form-item label="X-Padding Bytes">
+            <a-input
+              v-model.trim="outbound.stream.xhttp.xPaddingBytes"
+              placeholder="100-1000"
+            ></a-input>
+          </a-form-item>
+          <!-- The complete xhttp settings object as JSON. Full-width, label on
+               its own row (the horizontal 8/14 grid is too narrow for it). Every
+               field round-trips verbatim via the model's passthrough, so this
+               handles any xhttp object shape (downloadSettings, headers, obfs,
+               uplink*/session*/seq*, future keys...), not just the modeled ones. -->
+          <a-form-item
+            label="XHTTP Object"
+            :label-col="{ span: 24 }"
+            :wrapper-col="{ span: 24 }"
+          >
+            <a-textarea
+              :auto-size="{ minRows: 6, maxRows: 20 }"
+              :value="xhttpObjectText(outbound.stream.xhttp)"
+              @change="setXhttpObject(outbound.stream, $event.target.value)"
+              placeholder='{"path":"/","host":"","mode":"auto","xmux":{...},"downloadSettings":{...}}'
+            ></a-textarea>
+            <div
+              v-if="xhttpObjectErr"
+              style="color: #e74c3c; font-size: 12px; margin-top: 4px;"
+            >
+              [[ xhttpObjectErr ]]
+            </div>
+          </a-form-item>
         </template>
 
         <!-- hysteria -->

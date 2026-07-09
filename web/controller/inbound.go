@@ -49,6 +49,7 @@ func (a *InboundController) initRouter(g *gin.RouterGroup) {
 	g.POST("/:id/copyClients", a.copyInboundClients)
 	g.POST("/:id/delClient/:clientId", a.delInboundClient)
 	g.POST("/updateClient/:clientId", a.updateInboundClient)
+	g.POST("/bulkUpdateClients", a.bulkUpdateClients)
 	g.POST("/:id/resetClientTraffic/:email", a.resetClientTraffic)
 	g.POST("/resetAllTraffics", a.resetAllTraffics)
 	g.POST("/resetAllClientTraffics/:id", a.resetAllClientTraffics)
@@ -478,6 +479,48 @@ func (a *InboundController) updateInboundClient(c *gin.Context) {
 	} else if inbound.Protocol == model.OPENVPN {
 		a.onOpenVpnChanged()
 	} else if needRestart {
+		a.xrayService.SetToNeedRestart()
+	}
+}
+
+// bulkUpdateClients applies one operation (add/subtract days or traffic, enable,
+// disable) to many selected clients at once, then regenerates the touched subsystems
+// once each. The payload arrives as a JSON string in the form field "data" (the panel
+// axios interceptor form-encodes bodies).
+func (a *InboundController) bulkUpdateClients(c *gin.Context) {
+	var body struct {
+		Data string `form:"data" json:"data"`
+	}
+	if err := c.ShouldBind(&body); err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	var req service.BulkClientUpdateRequest
+	if err := json.Unmarshal([]byte(body.Data), &req); err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	result, touched, err := a.inboundService.BulkUpdateClients(req)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	jsonObj(c, result, nil)
+
+	xrayRestart := false
+	for proto := range touched {
+		switch proto {
+		case string(model.L2TP):
+			a.onL2tpChanged()
+		case string(model.PPTP):
+			a.onPptpChanged()
+		case string(model.OPENVPN):
+			a.onOpenVpnChanged()
+		default:
+			xrayRestart = true
+		}
+	}
+	if xrayRestart {
 		a.xrayService.SetToNeedRestart()
 	}
 }

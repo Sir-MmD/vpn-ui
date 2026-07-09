@@ -167,6 +167,28 @@
                         </a-menu-item>
                       </a-menu>
                     </a-dropdown>
+                    <a-alert v-if="selectedCount() > 0" type="info"
+                      :show-icon="false" :class="themeSwitcher.currentTheme"
+                      :style="{ padding: '4px 10px' }">
+                      <template slot="message">
+                        <a-space :size="8" wrap>
+                          <span><b>[[ selectedCount() ]]</b> {{ i18n
+                            "pages.inbounds.selectedAccounts" }}</span>
+                          <a-button size="small" type="primary" icon="tool"
+                            @click="openBulkOps()">{{ i18n
+                            "pages.inbounds.bulkOperations" }}</a-button>
+                          <a-button size="small" icon="file-text"
+                            @click="exportSelectedTxt()">{{ i18n
+                            "pages.inbounds.exportTxt" }}</a-button>
+                          <a-button size="small" icon="file-pdf"
+                            @click="exportSelectedPdf()">{{ i18n
+                            "pages.inbounds.exportPdf" }}</a-button>
+                          <a-button size="small" icon="close"
+                            @click="clearSelection()">{{ i18n
+                            "pages.inbounds.clearSelection" }}</a-button>
+                        </a-space>
+                      </template>
+                    </a-alert>
                   </a-space>
                 </template>
                 <template #extra>
@@ -232,11 +254,22 @@
                     :data-source="searchedInbounds"
                     :scroll="isMobile ? {} : { x: 1000 }"
                     :pagination=pagination(searchedInbounds)
+                    :expanded-row-keys="expandedRowKeys"
+                    v-on="{ expandedRowsChange: keys => { expandedRowKeys = keys; } }"
                     :expand-icon-as-cell="false" :expand-row-by-click="false"
                     :expand-icon-column-index="0" :indent-size="0"
                     :row-class-name="dbInbound => (dbInbound.isMultiUser() ? '' : 'hideExpandIcon')"
                     :style="{ marginTop: '10px' }"
                     :locale='{ filterConfirm: `{{ i18n "confirm" }}`, filterReset: `{{ i18n "reset" }}`, emptyText: `{{ i18n "noData" }}` }'>
+                    <template slot="selectAllHeader">
+                      <a-checkbox :checked="isAllInboundsSelected()"
+                        :indeterminate="isSomeInboundsSelected()"
+                        @change="toggleSelectAllInbounds"></a-checkbox>
+                    </template>
+                    <template slot="select" slot-scope="text, dbInbound">
+                      <a-checkbox :checked="isInboundSel(dbInbound.id)"
+                        @change="e => toggleInboundSel(dbInbound, e.target.checked)"></a-checkbox>
+                    </template>
                     <template slot="action" slot-scope="text, dbInbound">
                       <a-dropdown :trigger="['click']">
                         <a-icon @click="e => e.preventDefault()" type="more"
@@ -280,6 +313,14 @@
                               {{ i18n "pages.inbounds.export"}} - {{ i18n
                               "pages.settings.subSettings" }}
                             </a-menu-item>
+                            <a-menu-item key="exportTxt">
+                              <a-icon type="file-text"></a-icon>
+                              {{ i18n "pages.inbounds.exportTxt" }}
+                            </a-menu-item>
+                            <a-menu-item key="exportPdf">
+                              <a-icon type="file-pdf"></a-icon>
+                              {{ i18n "pages.inbounds.exportPdf" }}
+                            </a-menu-item>
                             <a-menu-item key="delDepletedClients"
                               :style="{ color: '#FF4D4F' }">
                               <a-icon type="rest"></a-icon>
@@ -319,10 +360,11 @@
                     </template>
                     <template slot="port" slot-scope="text, dbInbound">
                       <template v-if="dbInbound.isOpenvpn">
-                        <span v-if="dbInbound.toInbound().settings.tcpEnable">TCP:
+                        <span v-if="dbInbound.toInbound().settings.tcpEnable"
+                          :style="{ display: 'block', whiteSpace: 'nowrap' }">TCP:
                           [[ dbInbound.toInbound().settings.tcpPort ]]</span>
                         <span v-if="dbInbound.toInbound().settings.udpEnable"
-                          :style="{ marginLeft: dbInbound.toInbound().settings.tcpEnable ? '8px' : '0' }">UDP:
+                          :style="{ display: 'block', whiteSpace: 'nowrap' }">UDP:
                           [[ dbInbound.port ]]</span>
                       </template>
                       <template v-else>[[ dbInbound.port ]]</template>
@@ -785,6 +827,68 @@
       </a-spin>
     </a-layout-content>
   </a-layout>
+  <a-modal id="bulk-ops-modal"
+    title='{{ i18n "pages.inbounds.bulkOperations" }}'
+    :visible="bulkOps.visible"
+    :confirm-loading="bulkOps.confirmLoading"
+    ok-text='{{ i18n "pages.inbounds.apply" }}'
+    cancel-text='{{ i18n "close" }}'
+    :class="themeSwitcher.currentTheme"
+    :closable="true"
+    :mask-closable="false"
+    @ok="() => runBulkOps()"
+    @cancel="() => bulkOps.visible = false">
+    <a-form layout="vertical">
+      <a-form-item label='{{ i18n "pages.inbounds.bulkTargetCount" }}'>
+        <a-tag color="purple">[[ selectedCount() ]]</a-tag>
+      </a-form-item>
+      <a-form-item label='{{ i18n "pages.inbounds.operation" }}'>
+        <a-select v-model="bulkOps.op"
+          :dropdown-class-name="themeSwitcher.currentTheme">
+          <a-select-option value="addDays">{{ i18n "pages.inbounds.opAddDays" }}</a-select-option>
+          <a-select-option value="subDays">{{ i18n "pages.inbounds.opSubDays" }}</a-select-option>
+          <a-select-option value="addTraffic">{{ i18n "pages.inbounds.opAddTraffic" }}</a-select-option>
+          <a-select-option value="subTraffic">{{ i18n "pages.inbounds.opSubTraffic" }}</a-select-option>
+          <a-select-option value="enable">{{ i18n "pages.inbounds.opEnable" }}</a-select-option>
+          <a-select-option value="disable">{{ i18n "pages.inbounds.opDisable" }}</a-select-option>
+        </a-select>
+      </a-form-item>
+      <a-form-item v-if="bulkIsNumericOp()" label='{{ i18n "pages.inbounds.amount" }}'>
+        <a-input-number v-model="bulkOps.amount" :min="0"
+          :style="{ width: bulkIsTrafficOp() ? '58%' : '100%' }"></a-input-number>
+        <a-select v-if="bulkIsTrafficOp()" v-model="bulkOps.unit"
+          :style="{ width: '38%', marginInlineStart: '4%' }"
+          :dropdown-class-name="themeSwitcher.currentTheme">
+          <a-select-option value="GB">GB</a-select-option>
+          <a-select-option value="MB">MB</a-select-option>
+        </a-select>
+        <span v-else :style="{ marginInlineStart: '8px' }">{{ i18n "pages.inbounds.days" }}</span>
+      </a-form-item>
+      <a-divider :style="{ margin: '8px 0' }"></a-divider>
+      <a-space direction="vertical" :size="10" :style="{ width: '100%' }">
+        <div>
+          <a-switch v-model="bulkOps.skipFirstUse" size="small"></a-switch>
+          <span :style="{ marginInlineStart: '8px' }">{{ i18n "pages.inbounds.skipFirstUse" }}</span>
+        </div>
+        <div>
+          <a-switch v-model="bulkOps.skipUnlimited" size="small"></a-switch>
+          <span :style="{ marginInlineStart: '8px' }">{{ i18n "pages.inbounds.skipUnlimited" }}</span>
+        </div>
+        <div>
+          <a-switch v-model="bulkOps.skipDisabled" size="small"></a-switch>
+          <span :style="{ marginInlineStart: '8px' }">{{ i18n "pages.inbounds.skipDisabled" }}</span>
+        </div>
+      </a-space>
+      <div v-if="bulkOps.progress.running || bulkOps.progress.done > 0" :style="{ marginTop: '14px' }">
+        <a-progress :percent="bulkProgressPercent()"
+          :status="bulkOps.progress.running ? 'active' : 'success'"></a-progress>
+        <div :style="{ marginTop: '4px', fontSize: '12px', opacity: 0.75 }">
+          [[ bulkOps.progress.done ]] / [[ bulkOps.progress.total ]]
+          <span v-if="bulkOps.progress.etaText"> · {{ i18n "pages.inbounds.eta" }} [[ bulkOps.progress.etaText ]]</span>
+        </div>
+      </div>
+    </a-form>
+  </a-modal>
 </a-layout>
 {{template "page/body_scripts" .}}
 <script
@@ -796,6 +900,10 @@
   src="{{ .base_path }}assets/js/model/inbound.js?{{ .cur_ver }}"></script>
 <script
   src="{{ .base_path }}assets/js/model/dbinbound.js?{{ .cur_ver }}"></script>
+<script
+  src="{{ .base_path }}assets/jspdf/jspdf.umd.min.js?{{ .cur_ver }}"></script>
+<script
+  src="{{ .base_path }}assets/js/util/export.js?{{ .cur_ver }}"></script>
 {{template "component/aSidebar" .}}
 {{template "component/aThemeSwitch" .}}
 {{template "component/aCustomStatistic" .}}
@@ -1021,6 +1129,11 @@
 </script>
 <script>
   const columns = [{
+    align: 'center',
+    width: 25,
+    slots: { title: 'selectAllHeader' },
+    scopedSlots: { customRender: 'select' },
+  }, {
     title: "ID",
     align: 'right',
     dataIndex: "id",
@@ -1074,6 +1187,11 @@
   }];
 
   const mobileColumns = [{
+    align: 'center',
+    width: 20,
+    slots: { title: 'selectAllHeader' },
+    scopedSlots: { customRender: 'select' },
+  }, {
     title: "ID",
     align: 'right',
     dataIndex: "id",
@@ -1097,6 +1215,7 @@
   }];
 
   const innerColumns = [
+    { width: 30, align: 'center', scopedSlots: { customRender: 'selectClient' } },
     { title: '{{ i18n "pages.inbounds.operate" }}', width: 70, scopedSlots: { customRender: 'actions' } },
     { title: '{{ i18n "pages.inbounds.enable" }}', width: 30, scopedSlots: { customRender: 'enable' } },
     { title: '{{ i18n "online" }}', width: 32, scopedSlots: { customRender: 'online' } },
@@ -1107,6 +1226,7 @@
   ];
 
   const innerMobileColumns = [
+    { width: 24, align: 'center', scopedSlots: { customRender: 'selectClient' } },
     { title: '{{ i18n "pages.inbounds.operate" }}', width: 10, align: 'center', scopedSlots: { customRender: 'actionMenu' } },
     { title: '{{ i18n "pages.inbounds.client" }}', width: 90, align: 'left', scopedSlots: { customRender: 'client' } },
     { title: '{{ i18n "pages.inbounds.info" }}', width: 10, align: 'center', scopedSlots: { customRender: 'info' } },
@@ -1129,6 +1249,10 @@
       enableFilter: false,
       filterBy: '',
       searchedInbounds: [],
+      // Controlled expansion: pagination() returns a fresh object every render, so
+      // an uncontrolled table would reset expanded rows on any re-render (e.g.
+      // ticking a selection checkbox). Owning the keys keeps rows open.
+      expandedRowKeys: [],
       expireDiff: 0,
       trafficDiff: 0,
       defaultCert: '',
@@ -1147,6 +1271,19 @@
         subJsonEnable: false,
       },
       remarkModel: '-ieo',
+      selInbounds: [],
+      selClients: [],
+      bulkOps: {
+        visible: false,
+        confirmLoading: false,
+        op: 'addDays',
+        amount: 1,
+        unit: 'GB',
+        skipFirstUse: false,
+        skipUnlimited: false,
+        skipDisabled: false,
+        progress: { running: false, done: 0, total: 0, applied: 0, skipped: 0, etaText: '' },
+      },
       datepicker: 'gregorian',
       tgBotEnable: false,
       showAlert: false,
@@ -1364,6 +1501,144 @@
             break;
         }
       },
+      // --- multi-select --------------------------------------------------
+      isInboundSel(id) { return this.selInbounds.includes(id); },
+      isClientSel(inboundId, email) {
+        return this.selInbounds.includes(inboundId) || this.selClients.includes(inboundId + ':' + email);
+      },
+      toggleInboundSel(dbInbound, checked) {
+        const id = dbInbound.id;
+        this.selClients = this.selClients.filter(k => !k.startsWith(id + ':'));
+        if (checked) { if (!this.selInbounds.includes(id)) this.selInbounds.push(id); }
+        else { this.selInbounds = this.selInbounds.filter(x => x !== id); }
+      },
+      toggleClientSel(inboundId, email, checked) {
+        // If the whole inbound was selected, unpack it into explicit per-client keys
+        // first, so unchecking one client keeps the others selected.
+        if (this.selInbounds.includes(inboundId)) {
+          const dbInbound = this.dbInbounds.find(r => r.id === inboundId);
+          const emails = (this.getInboundClients(dbInbound) || []).map(c => c.email).filter(Boolean);
+          this.selInbounds = this.selInbounds.filter(x => x !== inboundId);
+          emails.forEach(em => { const k = inboundId + ':' + em; if (!this.selClients.includes(k)) this.selClients.push(k); });
+        }
+        const key = inboundId + ':' + email;
+        if (checked) { if (!this.selClients.includes(key)) this.selClients.push(key); }
+        else { this.selClients = this.selClients.filter(k => k !== key); }
+      },
+      toggleSelectAllInbounds(e) {
+        if (e.target.checked) {
+          this.selClients = [];
+          this.selInbounds = this.dbInbounds.map(r => r.id);
+        } else { this.clearSelection(); }
+      },
+      isAllInboundsSelected() {
+        return this.dbInbounds.length > 0 && this.dbInbounds.every(r => this.selInbounds.includes(r.id));
+      },
+      isSomeInboundsSelected() {
+        return this.selInbounds.length > 0 && !this.isAllInboundsSelected();
+      },
+      clearSelection() { this.selInbounds = []; this.selClients = []; },
+      resolveSelectedTargets() {
+        const map = {};
+        const add = (inboundId, email) => { if (email) map[inboundId + ':' + email] = { inboundId, email }; };
+        this.selInbounds.forEach(id => {
+          const dbInbound = this.dbInbounds.find(r => r.id === id);
+          (this.getInboundClients(dbInbound) || []).forEach(c => add(id, c.email));
+        });
+        this.selClients.forEach(k => { const i = k.indexOf(':'); add(Number(k.slice(0, i)), k.slice(i + 1)); });
+        return Object.values(map);
+      },
+      selectedCount() { return this.resolveSelectedTargets().length; },
+      inboundTargets(dbInbound) {
+        return (this.getInboundClients(dbInbound) || [])
+          .map(c => c.email).filter(Boolean)
+          .map(email => ({ inboundId: dbInbound.id, email }));
+      },
+      // --- export (txt / pdf) -------------------------------------------
+      exportTxt(targets, filename) {
+        if (!targets || !targets.length) { this.$message.warning('{{ i18n "pages.inbounds.exportNoneSelected" }}'); return; }
+        try {
+          const cards = AccountExport.buildCards(this, targets);
+          if (!cards.length) { this.$message.warning('{{ i18n "pages.inbounds.exportNoneSelected" }}'); return; }
+          AccountExport.txt(cards, filename || 'accounts');
+        } catch (e) { this.$message.error('Export failed: ' + (e && e.message ? e.message : e)); }
+      },
+      exportPdf(targets, filename) {
+        if (!targets || !targets.length) { this.$message.warning('{{ i18n "pages.inbounds.exportNoneSelected" }}'); return; }
+        try {
+          const cards = AccountExport.buildCards(this, targets);
+          if (!cards.length) { this.$message.warning('{{ i18n "pages.inbounds.exportNoneSelected" }}'); return; }
+          AccountExport.pdf(cards, filename || 'accounts');
+        } catch (e) { this.$message.error('Export failed: ' + (e && e.message ? e.message : e)); }
+      },
+      exportSelectedTxt() { this.exportTxt(this.resolveSelectedTargets(), 'accounts'); },
+      exportSelectedPdf() { this.exportPdf(this.resolveSelectedTargets(), 'accounts'); },
+      // Single-account export straight from a client row's action buttons.
+      exportClientTxt(dbInbound, client) { this.exportTxt([{ inboundId: dbInbound.id, email: client.email }], client.email || dbInbound.remark); },
+      exportClientPdf(dbInbound, client) { this.exportPdf([{ inboundId: dbInbound.id, email: client.email }], client.email || dbInbound.remark); },
+      // --- bulk operations ----------------------------------------------
+      openBulkOps() {
+        if (!this.selectedCount()) { this.$message.warning('{{ i18n "pages.inbounds.exportNoneSelected" }}'); return; }
+        this.bulkOps.progress = { running: false, done: 0, total: 0, applied: 0, skipped: 0, etaText: '' };
+        this.bulkOps.visible = true;
+      },
+      bulkIsTrafficOp() { return ['addTraffic', 'subTraffic'].includes(this.bulkOps.op); },
+      bulkIsNumericOp() { return ['addDays', 'subDays', 'addTraffic', 'subTraffic'].includes(this.bulkOps.op); },
+      bulkProgressPercent() {
+        const p = this.bulkOps.progress;
+        return p.total > 0 ? Math.floor((p.done / p.total) * 100) : 0;
+      },
+      bulkFormatEta(sec) {
+        sec = Math.max(0, Math.ceil(sec));
+        if (sec >= 60) { return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's'; }
+        return sec + 's';
+      },
+      async runBulkOps() {
+        const targets = this.resolveSelectedTargets();
+        if (!targets.length) return;
+        const b = this.bulkOps;
+        const amount = Math.max(0, Number(b.amount) || 0);
+        const bytes = b.unit === 'MB' ? 1024 * 1024 : 1024 * 1024 * 1024;
+        const base = {
+          op: b.op,
+          days: this.bulkIsTrafficOp() ? 0 : amount,
+          amountBytes: this.bulkIsTrafficOp() ? Math.round(amount * bytes) : 0,
+          skipFirstUse: b.skipFirstUse,
+          skipUnlimited: b.skipUnlimited,
+          skipDisabled: b.skipDisabled,
+        };
+        // Batch the targets so the modal can show real per-item progress + ETA
+        // (the backend accepts an arbitrary target list, so this is honest progress,
+        // not a fake animation). One request per batch, sequential.
+        const BATCH = 20;
+        const batches = [];
+        for (let i = 0; i < targets.length; i += BATCH) batches.push(targets.slice(i, i + BATCH));
+        b.confirmLoading = true;
+        b.progress = { running: true, done: 0, total: targets.length, applied: 0, skipped: 0, etaText: '' };
+        const start = Date.now();
+        let ok = true;
+        for (let i = 0; i < batches.length; i++) {
+          const payload = Object.assign({}, base, { targets: batches[i] });
+          const msg = await HttpUtil.post('/panel/api/inbounds/bulkUpdateClients', { data: JSON.stringify(payload) });
+          if (!msg.success) { ok = false; break; }
+          const r = msg.obj || {};
+          b.progress.applied += (r.applied || 0);
+          b.progress.skipped += (r.skipped || 0);
+          b.progress.done += batches[i].length;
+          const elapsed = (Date.now() - start) / 1000;
+          const rate = elapsed > 0 ? b.progress.done / elapsed : 0;
+          const remaining = b.progress.total - b.progress.done;
+          b.progress.etaText = (rate > 0 && remaining > 0) ? this.bulkFormatEta(remaining / rate) : '';
+        }
+        b.progress.running = false;
+        b.confirmLoading = false;
+        if (ok) {
+          b.visible = false;
+          this.$message.success('{{ i18n "pages.inbounds.bulkDone" }}: ' + b.progress.applied + ' / ' + b.progress.skipped);
+          this.clearSelection();
+          await this.getDBInbounds();
+        }
+      },
       clickAction(action, dbInbound) {
         switch (action.key) {
           case "qrcode":
@@ -1407,6 +1682,12 @@
             break;
           case "delDepletedClients":
             this.delDepletedClients(dbInbound.id)
+            break;
+          case "exportTxt":
+            this.exportTxt(this.inboundTargets(dbInbound), dbInbound.remark);
+            break;
+          case "exportPdf":
+            this.exportPdf(this.inboundTargets(dbInbound), dbInbound.remark);
             break;
         }
       },
@@ -1476,7 +1757,23 @@
           isEdit: true
         });
       },
+      // Client-side guard mirroring the backend validateInboundConfig: instant
+      // feedback for a bad port or a certless OpenVPN server, before the POST.
+      validateInboundForm(inbound) {
+        const isPort = v => Number.isInteger(v) && v >= 1 && v <= 65535;
+        if (inbound.protocol === 'openvpn') {
+          const s = inbound.settings || {};
+          if (!s.udpEnable && !s.tcpEnable) { this.$message.error('OpenVPN requires at least one of TCP/UDP enabled'); return false; }
+          if (s.udpEnable && !isPort(inbound.port)) { this.$message.error('Invalid UDP port (must be 1-65535)'); return false; }
+          if (s.tcpEnable && !isPort(s.tcpPort)) { this.$message.error('Invalid TCP port (must be 1-65535)'); return false; }
+          if (!s.caCert || !s.serverCert) { this.$message.error('OpenVPN certificate is required — generate a certificate before saving'); return false; }
+        } else if (!isPort(inbound.port)) {
+          this.$message.error('Invalid port (must be 1-65535)'); return false;
+        }
+        return true;
+      },
       async addInbound(inbound, dbInbound) {
+        if (!this.validateInboundForm(inbound)) return;
         const data = {
           up: dbInbound.up,
           down: dbInbound.down,
@@ -1502,6 +1799,7 @@
         await this.submit('/panel/api/inbounds/add', data, inModal);
       },
       async updateInbound(inbound, dbInbound) {
+        if (!this.validateInboundForm(inbound)) return;
         const data = {
           up: dbInbound.up,
           down: dbInbound.down,

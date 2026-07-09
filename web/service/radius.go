@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,8 @@ type RadiusService struct {
 	mu         sync.Mutex
 	sessions   map[string]*radiusSession // key: Acct-Session-Id
 	pending    map[string]time.Time      // key: freshly allocated IP awaiting Acct-Start (User Limit blocks)
+	stationIP  map[string]string         // key: "proto:idx:Calling-Station-Id" -> its stable block IP
+	stationSeen map[string]time.Time     // last time each station authenticated (for pruning)
 	secret     []byte
 }
 
@@ -42,6 +45,13 @@ type RadiusService struct {
 // Access-Accept that assigned it and the Acct-Start that confirms it. An auth
 // that never starts a session (retry, abandoned dial) frees the IP after this.
 const pendingLeaseTTL = 90 * time.Second
+
+// pendingReclaimGrace is the minimum age of a pending block-lease before it may
+// be reclaimed for a different dial. Longer than a normal auth->Acct-Start gap
+// (a few seconds), so a device still mid-handshake is never handed its slot to
+// someone else; far shorter than pendingLeaseTTL, so a genuinely abandoned
+// (ghost) lease is reclaimed promptly instead of wedging the account until TTL.
+const pendingReclaimGrace = 15 * time.Second
 
 type radiusSession struct {
 	email    string
@@ -147,6 +157,11 @@ func (s *RadiusService) handleAuth(w radius.ResponseWriter, r *radius.Request) {
 	challenge := microsoft.MSCHAPChallenge_Get(r.Packet)
 	response := microsoft.MSCHAP2Response_Get(r.Packet)
 
+	// The client's Calling-Station-Id (its remote IP) is stable across a device's
+	// re-authentication/redial, unlike the RADIUS session-id or NAS-Port — so it keys
+	// the per-device block-IP assignment for User Limit K>1 (see allocateBlockIP).
+	station := rfc2865.CallingStationID_GetString(r.Packet)
+
 	if username == "" || nasID == "" {
 		logger.Debug("RADIUS: auth rejected — missing username or NAS-Identifier")
 		w.Write(r.Response(radius.CodeAccessReject))
@@ -231,7 +246,7 @@ func (s *RadiusService) handleAuth(w radius.ResponseWriter, r *radius.Request) {
 
 	// Assign deterministic IP so per-user Xray routing works via source IP. A deny
 	// means the account is at its User Limit and the strategy is "reject".
-	clientIP, deny := s.getClientIP(protocol, inboundId, username)
+	clientIP, deny := s.getClientIP(protocol, inboundId, username, station)
 	if deny {
 		logger.Infof("RADIUS: auth rejected — user-limit reached (strategy=reject) user=%s nas=%s", username, nasID)
 		w.Write(r.Response(radius.CodeAccessReject))
@@ -306,6 +321,17 @@ func (s *RadiusService) handleAcct(w radius.ResponseWriter, r *radius.Request) {
 		s.mu.Unlock()
 
 		if ok {
+			// Fold the final counter bytes (accumulated since the last 10s collection)
+			// into the client's quota BEFORE the counters are deleted — otherwise a
+			// disconnect (or a rapid reconnect) silently drops that traffic, which
+			// under-counts usage and under-enforces limits.
+			up, down := s.nftService.ReadAndResetClientCounters(sess.protocol, sess.ip)
+			if (up > 0 || down > 0) && sess.email != "" {
+				if db := database.GetDB(); db != nil {
+					db.Exec("UPDATE client_traffics SET up = up + ?, down = down + ? WHERE email = ?",
+						up, down, sess.email)
+				}
+			}
 			// Remove nft accounting counters
 			if err := s.nftService.RemoveClientAccounting(sess.protocol, sess.ip); err != nil {
 				logger.Warning("RADIUS: failed to remove nft accounting:", err)
@@ -382,8 +408,17 @@ func (s *RadiusService) lookupClient(protocol string, inboundId int, username st
 	db := database.GetDB()
 
 	var inbound model.Inbound
-	if err := db.First(&inbound, inboundId).Error; err != nil {
-		return "", fmt.Errorf("inbound %d not found", inboundId)
+	if inboundId > 0 {
+		if err := db.First(&inbound, inboundId).Error; err != nil {
+			return "", fmt.Errorf("inbound %d not found", inboundId)
+		}
+	} else {
+		// Protocol-level NAS-Identifier: resolve the account to its inbound by name.
+		ib, err := s.findClientInbound(protocol, username)
+		if err != nil {
+			return "", err
+		}
+		inbound = *ib
 	}
 
 	if !inbound.Enable {
@@ -551,8 +586,18 @@ func (s *RadiusService) isIPActive(ip string, protocol string) bool {
 	return strings.Contains(string(output), "tun-ovpn")
 }
 
-// parseNASIdentifier extracts protocol and inbound ID from "l2tp-{id}" or "pptp-{id}".
+// parseNASIdentifier extracts protocol and inbound ID from a NAS-Identifier.
+// Two forms are accepted:
+//   - protocol-level, e.g. "l2tp" / "pptp": inboundId is 0, meaning "resolve the
+//     account to its owning inbound by username". This is what the shared daemon
+//     configs now send — one xl2tpd/pptpd instance serves every inbound of a
+//     protocol on its single fixed port, so it can carry only ONE NAS-Identifier.
+//   - per-inbound, e.g. "l2tp-3" / "pptp-5": kept for backward compatibility.
 func parseNASIdentifier(nasID string) (protocol string, inboundId int, err error) {
+	if nasID == "l2tp" || nasID == "pptp" || nasID == "openvpn" {
+		return nasID, 0, nil
+	}
+
 	parts := strings.SplitN(nasID, "-", 2)
 	if len(parts) != 2 {
 		return "", 0, fmt.Errorf("invalid NAS-Identifier format: %s", nasID)
@@ -571,15 +616,54 @@ func parseNASIdentifier(nasID string) (protocol string, inboundId int, err error
 	return protocol, inboundId, nil
 }
 
+// findClientInbound locates the enabled inbound of the given protocol whose
+// settings contain a client with this username. Used when the RADIUS request
+// carries a protocol-level NAS-Identifier (inboundId 0): a single shared
+// xl2tpd/pptpd config serves all inbounds of a protocol, so the account is mapped
+// to its owning inbound here rather than via the NAS-Identifier. Usernames are
+// expected to be unique across a protocol's inbounds; the first match wins.
+func (s *RadiusService) findClientInbound(protocol, username string) (*model.Inbound, error) {
+	db := database.GetDB()
+	var inbounds []*model.Inbound
+	if err := db.Where("protocol = ? AND enable = ?", protocol, true).Find(&inbounds).Error; err != nil {
+		return nil, err
+	}
+	for _, inbound := range inbounds {
+		var settings struct {
+			Clients []struct {
+				ID string `json:"id"`
+			} `json:"clients"`
+		}
+		if json.Unmarshal([]byte(inbound.Settings), &settings) != nil {
+			continue
+		}
+		for _, c := range settings.Clients {
+			if c.ID == username {
+				return inbound, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("client %s not found in any %s inbound", username, protocol)
+}
+
 // getClientIP computes the deterministic IP for a VPN client. Returns (nil,false)
 // if the client is not found or the range is exhausted, and (nil,true) when the
 // account is at its User Limit and the strategy is "reject" — the caller must then
 // send an Access-Reject rather than a keyless Access-Accept.
-func (s *RadiusService) getClientIP(protocol string, inboundId int, username string) (net.IP, bool) {
+func (s *RadiusService) getClientIP(protocol string, inboundId int, username, station string) (net.IP, bool) {
 	db := database.GetDB()
 	var inbound model.Inbound
-	if err := db.First(&inbound, inboundId).Error; err != nil {
-		return nil, false
+	if inboundId > 0 {
+		if err := db.First(&inbound, inboundId).Error; err != nil {
+			return nil, false
+		}
+	} else {
+		// Protocol-level NAS-Identifier: resolve the account to its inbound by name.
+		ib, err := s.findClientInbound(protocol, username)
+		if err != nil {
+			return nil, false
+		}
+		inbound = *ib
 	}
 
 	type clientEntry struct {
@@ -624,26 +708,85 @@ func (s *RadiusService) getClientIP(protocol string, inboundId int, username str
 	if protocol != "openvpn" && k > 1 {
 		subnets := pppSubnetsOrDefault(ranges, protocol, inbound.Id)
 		strategy := normUserLimitStrategy(settings.UserLimitStrategy)
-		return s.allocateBlockIP(clientIndex, k, subnets, protocol, strategy)
+		return s.allocateBlockIP(clientIndex, k, subnets, protocol, strategy, station)
 	}
 	return computeVpnClientIP(ranges, inbound.Id, clientIndex, protocol), false
 }
 
-// allocateBlockIP picks the lowest free IP inside account `clientIndex`'s K-block
-// (User Limit) that no live session and no other pending allocation is using, and
-// marks it pending until Acct-Start confirms it. When all K are in use (device cap
-// reached) the strategy decides: "reject" returns (nil,true) so the caller denies
-// the dial; "accept" disconnects the account's OLDEST live device, frees its IP and
-// hands it to the new one. Returns (ip,false) on success, (nil,true) on deny.
-func (s *RadiusService) allocateBlockIP(clientIndex, k int, subnets []string, protocol, strategy string) (net.IP, bool) {
+// allocateBlockIP assigns a stable IP inside account `clientIndex`'s K-block (User
+// Limit) to the calling device. Devices are keyed by `station` (Calling-Station-Id):
+// a device that re-authenticates keeps the IP it already holds (idempotent), so an
+// unstable/redialing client can't evict itself and reset its traffic counter, nor be
+// handed another device's IP. A new device takes a free slot; when all K are held the
+// strategy decides — "reject" returns (nil,true) so the caller denies, "accept" evicts
+// the account's OLDEST live device. Returns (ip,false) on success, (nil,true) on deny.
+func (s *RadiusService) allocateBlockIP(clientIndex, k int, subnets []string, protocol, strategy, station string) (net.IP, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.pending == nil {
 		s.pending = make(map[string]time.Time)
 	}
+	if s.stationIP == nil {
+		s.stationIP = make(map[string]string)
+		s.stationSeen = make(map[string]time.Time)
+	}
 	now := time.Now()
 
-	// In-use set = live session IPs + still-valid pending allocations. Expired
+	// This account's K device IPs.
+	isBlockIP := make(map[string]bool, k)
+	blockIPs := make([]string, 0, k)
+	for d := 0; d < k; d++ {
+		if ip := vpnAccountDeviceIP(subnets, clientIndex, k, d); ip != "" {
+			isBlockIP[ip] = true
+			blockIPs = append(blockIPs, ip)
+		}
+	}
+
+	skey := ""
+	if station != "" {
+		skey = fmt.Sprintf("%s:%d:%s", protocol, clientIndex, station)
+	}
+
+	// assign claims ip for this station: it wins the slot, so drop any OTHER station's
+	// stale claim on the same ip, record ours, and reserve it (pending) until Acct-Start.
+	assign := func(ip string) (net.IP, bool) {
+		if skey != "" {
+			for key, oip := range s.stationIP {
+				if oip == ip && key != skey {
+					delete(s.stationIP, key)
+					delete(s.stationSeen, key)
+				}
+			}
+			s.stationIP[skey] = ip
+			s.stationSeen[skey] = now
+		}
+		s.pending[ip] = now
+		return net.ParseIP(ip).To4(), false
+	}
+
+	// IDEMPOTENT REDIAL: a client (by Calling-Station-Id) keeps the block IP it already
+	// holds — no eviction, no counter churn. Without this, a device whose CHAP/tunnel
+	// flaps re-authenticates every ~1s, is treated as a new device each time, evicts its
+	// own prior session (resetting that IP's traffic counter -> "counted delta 0") and
+	// can be handed the account's other device's IP (duplicate).
+	if skey != "" {
+		if ip, ok := s.stationIP[skey]; ok && isBlockIP[ip] {
+			s.stationSeen[skey] = now
+			s.pending[ip] = now
+			return net.ParseIP(ip).To4(), false
+		}
+		// Prune long-abandoned station claims (client gone for good) so the map can't
+		// grow without bound; active clients refresh their timestamp just above.
+		for key, ts := range s.stationSeen {
+			if now.Sub(ts) > pendingLeaseTTL {
+				delete(s.stationSeen, key)
+				delete(s.stationIP, key)
+			}
+		}
+	}
+
+	// Real occupancy = live session IPs + still-valid pending allocations (a lingering
+	// station claim with no session/pending does NOT block a new device). Expired
 	// pending leases (auth without a following Acct-Start) are reclaimed here.
 	used := make(map[string]bool, len(s.sessions)+len(s.pending))
 	for _, sess := range s.sessions {
@@ -657,27 +800,39 @@ func (s *RadiusService) allocateBlockIP(clientIndex, k int, subnets []string, pr
 		used[ip] = true
 	}
 
-	// Set of this account's K device IPs, for matching live sessions during evict.
-	blockIPs := make(map[string]bool, k)
-	for d := 0; d < k; d++ {
-		if ip := vpnAccountDeviceIP(subnets, clientIndex, k, d); ip != "" {
-			blockIPs[ip] = true
-			if !used[ip] {
-				s.pending[ip] = now
-				return net.ParseIP(ip).To4(), false
-			}
+	// (1) A free slot for this new device.
+	blockSet := make(map[string]bool, k)
+	for _, ip := range blockIPs {
+		blockSet[ip] = true
+		if !used[ip] {
+			return assign(ip)
 		}
 	}
 
-	// Block full. "accept": evict the account's oldest live device and reuse its IP.
+	// (2) Reclaim the OLDEST abandoned gap-lease (pending older than the grace) before
+	// evicting/denying. A fresh in-flight dial (younger than the grace) and a live
+	// session (never in s.pending — cleared at Acct-Start) are both left untouched.
+	var ghostIP string
+	var ghostTS time.Time
+	for _, ip := range blockIPs {
+		if ts, ok := s.pending[ip]; ok && now.Sub(ts) > pendingReclaimGrace {
+			if ghostIP == "" || ts.Before(ghostTS) {
+				ghostIP, ghostTS = ip, ts
+			}
+		}
+	}
+	if ghostIP != "" {
+		return assign(ghostIP)
+	}
+
+	// (3) Block full. "accept": evict the account's oldest live device and reuse its IP.
 	if strategy == "accept" {
-		if victimSID, victimIP := oldestBlockSession(s.sessions, blockIPs); victimIP != "" {
+		if victimSID, victimIP := oldestBlockSession(s.sessions, blockSet); victimIP != "" {
 			delete(s.sessions, victimSID)
 			s.nftService.RemoveClientAccounting(protocol, victimIP)
 			killPPPByIP(victimIP) // force the old device's ppp link down
-			s.pending[victimIP] = now
 			logger.Infof("RADIUS: user-limit accept — evicted oldest device ip=%s proto=%s to admit new device", victimIP, protocol)
-			return net.ParseIP(victimIP).To4(), false
+			return assign(victimIP)
 		}
 		// No live device to evict (all slots pending/mid-handshake) — deny for now.
 	}
@@ -896,11 +1051,15 @@ func ovpnSubnetsOrDefault(settings *openvpnSettings, proto string, id int) []str
 	return subs
 }
 
-// GenerateRadiusClientConfig writes the radcli config files for a given inbound.
-// Creates per-inbound config at /etc/ppp/radius/{protocol}-{id}.conf, shared servers file,
-// and a self-contained dictionary with Microsoft VSAs (pppd's static radiusclient
-// parser uses INCLUDE not $INCLUDE, so we can't rely on /etc/radcli/dictionary).
-func GenerateRadiusClientConfig(protocol string, inboundId int, secret string) error {
+// GenerateRadiusClientConfig writes the radcli config file for a protocol. One
+// shared xl2tpd/pptpd instance serves EVERY inbound of a protocol on its single
+// fixed port, so there is one radcli config per protocol (not per inbound), at
+// /etc/ppp/radius/{protocol}.conf, carrying a protocol-level nas_identifier
+// ({protocol}). The RADIUS server then resolves each account to its owning inbound
+// by username (see findClientInbound). Also writes the shared servers file and a
+// self-contained dictionary with Microsoft VSAs (pppd's static radiusclient parser
+// uses INCLUDE not $INCLUDE, so we can't rely on /etc/radcli/dictionary).
+func GenerateRadiusClientConfig(protocol string, secret string) error {
 	dir := "/etc/ppp/radius"
 	os.MkdirAll(dir, 0755)
 
@@ -915,21 +1074,21 @@ func GenerateRadiusClientConfig(protocol string, inboundId int, secret string) e
 		return fmt.Errorf("failed to write dictionary: %w", err)
 	}
 
-	// Per-inbound config
-	seqFile := fmt.Sprintf("/var/run/radius-%s-%d.seq", protocol, inboundId)
-	config := fmt.Sprintf(`# Auto-generated by 3x-ui RADIUS — do not edit
+	// Per-protocol config (shared by all inbounds of that protocol).
+	seqFile := fmt.Sprintf("/var/run/radius-%s.seq", protocol)
+	config := fmt.Sprintf(`# Auto-generated by vpn-ui RADIUS — do not edit
 authserver	127.0.0.1:1812
 acctserver	127.0.0.1:1813
 servers		%s/servers
 dictionary	%s/dictionary
 mapfile		%s/port-id-map
-nas_identifier	%s-%d
+nas_identifier	%s
 radius_timeout	5
 radius_retries	3
 seqfile		%s
-`, dir, dir, dir, protocol, inboundId, seqFile)
+`, dir, dir, dir, protocol, seqFile)
 
-	configPath := fmt.Sprintf("%s/%s-%d.conf", dir, protocol, inboundId)
+	configPath := fmt.Sprintf("%s/%s.conf", dir, protocol)
 	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
 		return fmt.Errorf("failed to write %s: %w", configPath, err)
 	}
@@ -939,12 +1098,30 @@ seqfile		%s
 	return os.WriteFile(dir+"/servers", []byte(servers), 0600)
 }
 
+// cleanupLegacyPerInboundFiles removes stale per-inbound PPP options and radcli
+// config files left by the previous layout (one set per inbound), now that a single
+// shared set is used per protocol. Best-effort: unreferenced leftovers are harmless,
+// but removing them keeps /etc/ppp tidy across an upgrade. optionsPrefix is the PPP
+// options basename ("options.xl2tpd" or "pptpd-options"); the shared file (no "-N"
+// suffix) is not matched by the "-*" globs, so it is preserved.
+func cleanupLegacyPerInboundFiles(optionsPrefix, protocol string) {
+	for _, pattern := range []string{
+		"/etc/ppp/" + optionsPrefix + "-*",
+		"/etc/ppp/radius/" + protocol + "-*.conf",
+	} {
+		matches, _ := filepath.Glob(pattern)
+		for _, f := range matches {
+			_ = os.Remove(f)
+		}
+	}
+}
+
 // generateRadiusDictionary writes a self-contained RADIUS dictionary at dir/dictionary.
 // Includes standard RFC 2865/2866 attributes + Microsoft VSAs for MS-CHAPv2 + MPPE.
 // This avoids depending on /etc/radcli/dictionary which uses $INCLUDE syntax
 // that pppd's statically linked radiusclient parser cannot parse.
 func generateRadiusDictionary(dir string) error {
-	dict := `# Auto-generated by 3x-ui — RADIUS dictionary for pppd
+	dict := `# Auto-generated by vpn-ui — RADIUS dictionary for pppd
 # Standard RADIUS attributes (RFC 2865)
 ATTRIBUTE	User-Name		1	string
 ATTRIBUTE	User-Password		2	string

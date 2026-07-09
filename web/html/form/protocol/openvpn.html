@@ -4,7 +4,17 @@
     :label-col="{ md: {span:8} }"
     :wrapper-col="{ md: {span:14} }"
 >
-    <a-form-item label="IP Range">
+    <a-form-item>
+        <template slot="label">
+            <a-tooltip>
+                <template slot="title">
+                    Auto-managed contiguous block (UDP shown; TCP mirrors into 10.3.x).
+                    Grows automatically as clients are added.
+                </template>
+                IP Range
+                <a-icon type="question-circle"></a-icon>
+            </a-tooltip>
+        </template>
         <template v-if="inbound.settings.ipRanges && inbound.settings.ipRanges.length">
             <a-input
                 v-for="(r, i) in inbound.settings.ipRanges"
@@ -17,10 +27,6 @@
         <span v-else :style="{ color: '#888' }">
             Assigned automatically on save
         </span>
-        <div :style="{ color: '#888', fontSize: '12px', marginTop: '2px' }">
-            Auto-managed contiguous block (UDP shown; TCP mirrors into 10.3.x).
-            Grows automatically as clients are added.
-        </div>
     </a-form-item>
     <a-form-item label="DNS 1">
         <a-input
@@ -41,35 +47,68 @@
             :max="1500"
         ></a-input-number>
     </a-form-item>
-    <a-form-item label="User Limit">
-        <a-input-number v-model="inbound.settings.userLimit" :min="1" :max="64" :step="1" :precision="0" style="width: 90px"></a-input-number>
-        <span :style="{ marginLeft: '8px', color: '#888' }">
-            Simultaneous devices per account (each device gets its own IP; any number 1-64)
-        </span>
+    <a-form-item>
+        <template slot="label">
+            <a-tooltip>
+                <template slot="title">
+                    Simultaneous devices per account (each device gets its own IP; 1 = single device, or an even number 2-64)
+                </template>
+                User Limit
+                <a-icon type="question-circle"></a-icon>
+            </a-tooltip>
+        </template>
+        <a-input-number
+            :value="inbound.settings.userLimit"
+            @change="inbound.settings.userLimit = ($event <= 1 ? 1 : Math.min(64, ($event % 2 ? $event - 1 : $event)))"
+            :min="1" :max="64" :step="2" :precision="0" style="width: 90px"
+        ></a-input-number>
     </a-form-item>
-    <a-form-item label="User Limit Strategy" v-if="inbound.settings.userLimit > 1">
-        <a-radio-group v-model="inbound.settings.userLimitStrategy">
-            <a-radio value="reject">Reject new connection</a-radio>
-            <a-radio value="accept">Accept (disconnect oldest device)</a-radio>
+    <a-form-item>
+        <template slot="label">
+            <a-tooltip>
+                <template slot="title">
+                    When an account is already at its device limit and another
+                    device connects: reject the new one, or accept it and
+                    disconnect that account's oldest device.
+                </template>
+                User Limit Strategy
+                <a-icon type="question-circle"></a-icon>
+            </a-tooltip>
+        </template>
+        <a-radio-group v-model="inbound.settings.userLimitStrategy" button-style="solid">
+            <a-radio-button value="accept">Accept</a-radio-button>
+            <a-radio-button value="reject">Reject</a-radio-button>
         </a-radio-group>
     </a-form-item>
-    <a-form-item label="Client to Client">
+    <a-form-item>
+        <template slot="label">
+            <a-tooltip>
+                <template slot="title">
+                    Allow connected clients to reach each other
+                </template>
+                Client to Client
+                <a-icon type="question-circle"></a-icon>
+            </a-tooltip>
+        </template>
         <a-switch
             v-model="inbound.settings.clientToClient"
             @change="val => { if (!val) inbound.settings.crossInbound = false }"
         ></a-switch>
-        <span :style="{ marginLeft: '8px', color: '#888' }">
-            Allow connected clients to reach each other
-        </span>
     </a-form-item>
-    <a-form-item label="Cross Inbound">
+    <a-form-item>
+        <template slot="label">
+            <a-tooltip>
+                <template slot="title">
+                    Also reach clients of other inbounds (both inbounds must enable this)
+                </template>
+                Cross Inbound
+                <a-icon type="question-circle"></a-icon>
+            </a-tooltip>
+        </template>
         <a-switch
             v-model="inbound.settings.crossInbound"
             :disabled="!inbound.settings.clientToClient"
         ></a-switch>
-        <span :style="{ marginLeft: '8px', color: '#888' }">
-            Also reach clients of other inbounds (both inbounds must enable this)
-        </span>
     </a-form-item>
     <a-form-item label="External Proxy">
         <a-switch v-model="ovpnExternalProxy"></a-switch>

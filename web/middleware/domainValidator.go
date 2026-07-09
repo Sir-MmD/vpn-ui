@@ -1,4 +1,4 @@
-// Package middleware provides HTTP middleware functions for the 3x-ui web panel,
+// Package middleware provides HTTP middleware functions for the vpn-ui web panel,
 // including domain validation and URL redirection utilities.
 package middleware
 

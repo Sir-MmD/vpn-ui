@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"runtime"
 	"sort"
 	"time"
 
@@ -33,7 +32,7 @@ type CheckClientIpJob struct {
 
 var job *CheckClientIpJob
 
-const defaultXrayAPIPort = 62789
+const defaultXrayAPIPort = 62790
 
 // ipStaleAfterSeconds controls how long a client IP kept in the
 // per-client tracking table (model.InboundClientIps.Ips) is considered
@@ -71,19 +70,11 @@ func (j *CheckClientIpJob) Run() {
 	isAccessLogAvailable := j.checkAccessLogAvailable(iplimitActive)
 
 	if isAccessLogAvailable {
-		if runtime.GOOS == "windows" {
-			if iplimitActive {
+		if iplimitActive {
+			if f2bInstalled {
 				shouldClearAccessLog = j.processLogFile()
-			}
-		} else {
-			if iplimitActive {
-				if f2bInstalled {
-					shouldClearAccessLog = j.processLogFile()
-				} else {
-					if !f2bInstalled {
-						logger.Warning("[LimitIP] Fail2Ban is not installed, Please install Fail2Ban from the x-ui bash menu.")
-					}
-				}
+			} else {
+				logger.Warning("[LimitIP] Fail2Ban is not installed, Please install Fail2Ban to enable IP limiting.")
 			}
 		}
 	}
@@ -419,8 +410,7 @@ func (j *CheckClientIpJob) updateInboundClientIps(inboundClientIps *model.Inboun
 		keptLive = liveIps[:limitIp]
 		bannedLive := liveIps[limitIp:]
 
-		// log format is load-bearing: x-ui.sh create_iplimit_jails builds
-		// filter.d/3x-ipl.conf with
+		// log format is load-bearing: a fail2ban filter parses this exact line
 		//   failregex = \[LIMIT_IP\]\s*Email\s*=\s*<F-USER>.+</F-USER>\s*\|\|\s*Disconnecting OLD IP\s*=\s*<ADDR>\s*\|\|\s*Timestamp\s*=\s*\d+
 		// don't change the wording.
 		for _, ipTime := range bannedLive {

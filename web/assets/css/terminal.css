@@ -1,0 +1,149 @@
+/* Streaming terminal console — deliberately dark in both themes.
+   Shared look for the Core Settings setup console, the systemd service
+   status log, and the WARP install log. Kept in sync with the inline copy
+   in web/html/core.html. */
+.term {
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(0, 0, 0, 0.4);
+  background: #0d1117;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
+}
+
+.term-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: #161b22;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.term-bar-icon {
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 13px;
+}
+
+.term-bar-title {
+  flex: 1;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.5);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.term-count {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.55);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.term-progress {
+  height: 3px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.term-progress-bar {
+  height: 100%;
+  width: 0;
+  background: #1890ff;
+  transition: width 0.3s ease;
+}
+
+.term-progress-bar.done { width: 100%; background: #27c93f; }
+.term-progress-bar.warn { width: 100%; background: #faad14; }
+
+.term-progress-bar.indeterminate {
+  width: 35%;
+  border-radius: 3px;
+  animation: term-slide 1.2s ease-in-out infinite;
+}
+
+@keyframes term-slide {
+  0% { margin-left: -35%; }
+  100% { margin-left: 100%; }
+}
+
+.term-body {
+  max-height: 46vh;
+  overflow: auto;
+  padding: 12px 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: #c9d1d9;
+}
+
+.term-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.term-ts { color: #6e7681; flex: 0 0 auto; }
+
+.term-glyph {
+  flex: 0 0 auto;
+  width: 12px;
+  text-align: center;
+  font-weight: 700;
+}
+
+.term-name { flex: 0 0 auto; color: #e6edf3; }
+.term-msg { color: #8b949e; }
+
+.term-ok .term-glyph { color: #3fb950; }
+.term-warn .term-glyph { color: #d29922; }
+.term-warn .term-msg { color: #d29922; }
+.term-err .term-glyph { color: #f85149; }
+.term-err .term-msg { color: #ff7b72; }
+.term-running .term-glyph,
+.term-running .term-name { color: #58a6ff; }
+
+.term-clickable {
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: 0 -4px;
+  transition: background 0.15s ease;
+}
+
+.term-clickable:hover {
+  background: rgba(88, 166, 255, 0.1);
+}
+
+.term-toggle {
+  color: #58a6ff;
+  font-size: 11px;
+  margin-left: 6px;
+  opacity: 0.8;
+}
+
+.term-steplog {
+  margin: 4px 0 8px 20px;
+  padding: 10px 12px;
+  max-height: 300px;
+  overflow: auto;
+  border-radius: 6px;
+  background: #010409;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #9da7b3;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.term-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 13px;
+  background: #58a6ff;
+  margin-left: 2px;
+  animation: term-blink 1s step-end infinite;
+}
+
+@keyframes term-blink { 50% { opacity: 0; } }

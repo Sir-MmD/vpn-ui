@@ -1,0 +1,206 @@
+{{define "modals/warpSocksModal"}}
+<a-modal id="warp-socks-modal" v-model="warpSocksModal.visible" title="Cloudflare WARP"
+         :closable="true" :mask-closable="!warpSocksModal.installing" :footer="null"
+         :class="themeSwitcher.currentTheme">
+    <!-- step 1: choose the WARP method -->
+    <template v-if="warpSocksModal.mode === 'choice'">
+        <p>{{ i18n "pages.xray.outbound.warpChooseDesc" }}</p>
+        <a-space direction="vertical" :style="{ width: '100%' }" :size="12">
+            <a-button block type="primary" icon="deployment-unit" @click="chooseWireguard">
+                {{ i18n "pages.xray.outbound.warpWireguard" }}
+            </a-button>
+            <a-button block type="primary" icon="cloud" @click="chooseSocks">
+                {{ i18n "pages.xray.outbound.warpSocks" }}
+            </a-button>
+        </a-space>
+    </template>
+    <!-- step 2: install + configure the official warp-cli in SOCKS5 mode -->
+    <template v-else>
+        <a-form layout="vertical">
+            <a-form-item label='{{ i18n "pages.xray.outbound.warpSocksPort" }}'>
+                <a-input-number v-model="warpSocksModal.port" :min="1" :max="65535"
+                    :disabled="warpSocksModal.installing" :style="{ width: '160px' }"></a-input-number>
+            </a-form-item>
+            <a-alert type="info" :show-icon="true" :style="{ marginBottom: '10px' }"
+                message='{{ i18n "pages.xray.outbound.warpSocksHint" }}'></a-alert>
+            <a-space>
+                <!-- not installed yet: one install button -->
+                <a-button v-if="!warpSocksModal.installed" type="primary" icon="cloud-download"
+                    :loading="warpSocksModal.installing" @click="installSocks">
+                    {{ i18n "pages.xray.outbound.warpSocksInstall" }}
+                </a-button>
+                <!-- already installed: reinstall (uses the port) + uninstall -->
+                <template v-else>
+                    <a-button type="primary" icon="reload" :loading="warpSocksModal.installing"
+                        @click="installSocks">
+                        {{ i18n "pages.xray.outbound.warpSocksReinstall" }}
+                    </a-button>
+                    <a-button type="danger" icon="delete" :disabled="warpSocksModal.installing"
+                        @click="uninstallSocks">
+                        {{ i18n "pages.xray.outbound.warpSocksUninstall" }}
+                    </a-button>
+                </template>
+                <a-button @click="warpSocksModal.mode = 'choice'" :disabled="warpSocksModal.installing">
+                    {{ i18n "close" }}
+                </a-button>
+                <a-tag v-if="warpSocksModal.done" color="green">{{ i18n "success" }}</a-tag>
+            </a-space>
+            <!-- warp-cli install/uninstall log — shared core-setup terminal look (assets/css/terminal.css) -->
+            <div v-if="warpSocksModal.log" class="term" :style="{ marginTop: '10px' }">
+                <div class="term-bar">
+                    <a-icon type="code" class="term-bar-icon"></a-icon>
+                    <span class="term-bar-title">warp-cli</span>
+                    <a-icon v-if="warpSocksModal.installing" type="loading" class="term-bar-icon"></a-icon>
+                </div>
+                <div class="term-body" ref="warpLog" :style="{ maxHeight: '220px' }">
+                    <div class="term-line" v-for="(l, i) in warpSocksModal.log.split('\n')" :key="i">
+                        <span class="term-name">[[ l || ' ' ]]</span>
+                    </div>
+                </div>
+            </div>
+            <!-- the SOCKS outbound is added automatically on a successful install.
+                 Uses type="info" to match the hint alert above (the green "success"
+                 tag by the buttons already signals success) instead of a clashing
+                 bright-green success card. -->
+            <a-alert v-if="warpSocksModal.done" type="info" :show-icon="true"
+                :style="{ marginTop: '10px' }"
+                message='{{ i18n "pages.xray.outbound.warpSocksAdded" }}'></a-alert>
+        </a-form>
+    </template>
+</a-modal>
+<script>
+
+    const warpSocksModal = {
+        visible: false,
+        mode: 'choice',            // 'choice' | 'socks'
+        port: 10808,
+        installed: false,          // warp-cli already present on the server?
+        installing: false,         // a background run is in progress
+        done: false,               // last run finished successfully
+        log: '',
+        show() {
+            this.mode = 'choice';
+            this.installed = false;
+            this.done = false;
+            this.log = '';
+            this.installing = false;
+            this.visible = true;
+        },
+        hide() {
+            this.visible = false;
+        },
+    };
+
+    new Vue({
+        delimiters: ['[[', ']]'],
+        el: '#warp-socks-modal',
+        data: {
+            warpSocksModal: warpSocksModal,
+        },
+        methods: {
+            // Hand off to the existing WireGuard WARP flow.
+            chooseWireguard() {
+                warpSocksModal.visible = false;
+                warpModal.show();
+            },
+            async chooseSocks() {
+                warpSocksModal.mode = 'socks';
+                warpSocksModal.done = false;
+                warpSocksModal.log = '';
+                await this.refreshInstalled();
+            },
+            // Detect whether warp-cli is already installed so we can offer either
+            // "Install & Connect" or "Reinstall / Uninstall".
+            async refreshInstalled() {
+                const msg = await HttpUtil.post('/panel/xray/warpsocks/installed');
+                // Only flip the view on a real answer from the server. If the
+                // request itself failed, leave `installed` as-is rather than
+                // wrongly forcing the not-installed view.
+                if (!msg || !msg.success) {
+                    console.warn('warp-cli installed check failed', msg);
+                    return;
+                }
+                warpSocksModal.installed = !!(msg.obj && msg.obj.installed);
+            },
+            // Scroll the terminal log to the newest line.
+            scrollWarpLog() {
+                this.$nextTick(() => {
+                    const el = this.$refs.warpLog;
+                    if (el) el.scrollTop = el.scrollHeight;
+                });
+            },
+            // Fresh install AND reinstall both hit the install action (the backend
+            // runs the installer's --reinstall entry point either way).
+            async installSocks() {
+                await this.runWarpSocks('install');
+            },
+            async uninstallSocks() {
+                await this.runWarpSocks('uninstall');
+            },
+            // Start a background warp-cli run, then poll its live state ~1s until it
+            // finishes (or a safety timeout). The log is replaced with the server's
+            // accumulated log on every poll so the console updates live.
+            async runWarpSocks(action) {
+                warpSocksModal.installing = true;
+                warpSocksModal.done = false;
+                warpSocksModal.log = '';
+                const body = action === 'install' ? { port: warpSocksModal.port } : {};
+                const startMsg = await HttpUtil.post('/panel/xray/warpsocks/' + action, body);
+                if (!startMsg || !startMsg.success) {
+                    warpSocksModal.installing = false;
+                    return;
+                }
+                const maxIter = 180; // ~180s guard so the poll can't spin forever
+                for (let i = 0; i < maxIter; i++) {
+                    await new Promise(r => setTimeout(r, 1000));
+                    const st = await HttpUtil.post('/panel/xray/warpsocks/state');
+                    const state = (st && st.obj) ? st.obj : {};
+                    if (typeof state.log === 'string') {
+                        warpSocksModal.log = state.log;
+                        this.scrollWarpLog();
+                    }
+                    if (!state.running && state.done) {
+                        warpSocksModal.installing = false;
+                        if (state.success) {
+                            if (action === 'uninstall') {
+                                // Back to the not-installed view.
+                                warpSocksModal.installed = false;
+                                warpSocksModal.done = false;
+                                warpSocksModal.log = '';
+                            } else {
+                                warpSocksModal.installed = true;
+                                warpSocksModal.done = true;
+                                this.addSocksOutbound();
+                            }
+                        }
+                        return;
+                    }
+                }
+                // Timed out waiting — stop the spinner, leave the log for inspection.
+                warpSocksModal.installing = false;
+            },
+            // Route xray through the local warp-cli SOCKS5 proxy on the entered port,
+            // tagged "warp" — the same tag the WireGuard WARP outbound uses, so the
+            // WARP routing rules apply to whichever backend is active. "warp" is a
+            // single logical outbound: replace any existing one (WireGuard, or a prior
+            // SOCKS on another port) rather than adding a duplicate tag.
+            addSocksOutbound() {
+                const port = Number(warpSocksModal.port) || 10808;
+                const outs = app.templateSettings.outbounds;
+                for (let i = outs.length - 1; i >= 0; i--) {
+                    if (outs[i] && outs[i].tag === 'warp') outs.splice(i, 1);
+                }
+                outs.push({
+                    tag: 'warp',
+                    protocol: 'socks',
+                    settings: {
+                        servers: [{ address: '127.0.0.1', port: port }],
+                    },
+                });
+                app.outboundSettings = JSON.stringify(outs);
+            },
+        },
+    });
+
+</script>
+{{end}}

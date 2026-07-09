@@ -875,6 +875,11 @@ const MediaQueryMixin = {
 
 class FileManager {
     static downloadTextFile(content, filename = 'file.txt', options = { type: "text/plain" }) {
+        // Tolerate a bare mime-type string (older/cached callers passed 'text/plain'
+        // instead of { type: 'text/plain' }); a non-object here makes the Blob
+        // constructor throw "not of type 'BlobPropertyBag'".
+        if (typeof options === 'string') options = { type: options };
+        if (!options || typeof options !== 'object') options = { type: 'text/plain' };
         let link = window.document.createElement('a');
 
         link.download = filename;

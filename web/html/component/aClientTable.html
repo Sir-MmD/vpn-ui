@@ -1,4 +1,8 @@
 {{define "component/aClientTable"}}
+<template slot="selectClient" slot-scope="text, client">
+  <a-checkbox :checked="isClientSel(record.id, client.email)"
+    @change="e => toggleClientSel(record.id, client.email, e.target.checked)"></a-checkbox>
+</template>
 <template slot="actions" slot-scope="text, client, index">
   <a-tooltip>
     <template slot="title">{{ i18n "qrCode" }}</template>
@@ -27,6 +31,14 @@
       <a-icon slot="icon" type="question-circle-o" :style="{ color: '#e04141' }"></a-icon>
       <a-icon :style="{ fontSize: '22px', cursor: 'pointer' }" class="delete-icon" type="delete" v-if="isRemovable(record.id)"></a-icon>
     </a-popconfirm>
+  </a-tooltip>
+  <a-tooltip>
+    <template slot="title">{{ i18n "pages.inbounds.exportTxt" }}</template>
+    <a-icon :style="{ fontSize: '22px' }" class="normal-icon" type="file-text" @click="exportClientTxt(record,client);"></a-icon>
+  </a-tooltip>
+  <a-tooltip>
+    <template slot="title">{{ i18n "pages.inbounds.exportPdf" }}</template>
+    <a-icon :style="{ fontSize: '22px' }" class="normal-icon" type="file-pdf" @click="exportClientPdf(record,client);"></a-icon>
   </a-tooltip>
 </template>
 <template slot="enable" slot-scope="text, client, index">
@@ -163,6 +175,14 @@
       <a-menu-item v-if="isRemovable(record.id)" @click="delClient(record.id,client)">
         <a-icon :style="{ fontSize: '14px' }" type="delete"></a-icon>
         <span :style="{ color: '#FF4D4F' }"> {{ i18n "delete"}}</span>
+      </a-menu-item>
+      <a-menu-item @click="exportClientTxt(record,client)">
+        <a-icon :style="{ fontSize: '14px' }" type="file-text"></a-icon>
+        {{ i18n "pages.inbounds.exportTxt" }}
+      </a-menu-item>
+      <a-menu-item @click="exportClientPdf(record,client)">
+        <a-icon :style="{ fontSize: '14px' }" type="file-pdf"></a-icon>
+        {{ i18n "pages.inbounds.exportPdf" }}
       </a-menu-item>
       <a-menu-item>
         <a-switch v-model="client.enable" size="small" @change="switchEnableClient(record.id, client, $event)"></a-switch>

@@ -163,6 +163,7 @@
 {{template "modals/dnsPresetsModal"}}
 {{template "modals/fakednsModal"}}
 {{template "modals/warpModal"}}
+{{template "modals/warpSocksModal"}}
 {{template "modals/nordModal"}}
 <script>
   const rulesColumns = [
@@ -1064,7 +1065,8 @@
         this.routingRuleSettings = JSON.stringify(rules);
       },
       showWarp() {
-        warpModal.show();
+        // Present the two WARP methods (WireGuard vs official warp-cli SOCKS5).
+        warpSocksModal.show();
       },
       showNord() {
         nordModal.show();

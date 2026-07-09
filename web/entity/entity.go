@@ -1,4 +1,4 @@
-// Package entity defines data structures and entities used by the web layer of the 3x-ui panel.
+// Package entity defines data structures and entities used by the web layer of the vpn-ui panel.
 package entity
 
 import (
@@ -18,7 +18,7 @@ type Msg struct {
 	Obj     any    `json:"obj"`     // Optional data object
 }
 
-// AllSetting contains all configuration settings for the 3x-ui panel including web server, Telegram bot, and subscription settings.
+// AllSetting contains all configuration settings for the vpn-ui panel including web server, Telegram bot, and subscription settings.
 type AllSetting struct {
 	// Web server settings
 	WebListen     string `json:"webListen" form:"webListen"`         // Web server listen IP address

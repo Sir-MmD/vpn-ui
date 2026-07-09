@@ -94,11 +94,49 @@
         el: '#out-modal',
         data: {
             outModal: outModal,
+            xhttpObjectErr: '',
             get outbound() {
                 return outModal.outbound;
             },
         },
         methods: {
+            // Render the whole xhttp settings object as pretty JSON for the
+            // textarea. Source of truth is the model; the structured inputs above
+            // and this view stay in sync because both read/write the same object.
+            xhttpObjectText(xh) {
+                try {
+                    return xh ? JSON.stringify(xh.toJson(), null, 2) : '';
+                } catch (e) {
+                    return '';
+                }
+            },
+            // Commit edited JSON back onto the model (on blur) by rebuilding the
+            // xhttp settings from it — fromJson keeps every key (structured +
+            // passthrough), so any xhttp object shape survives. Invalid JSON keeps
+            // the last good object and surfaces an error, so a typo never wipes
+            // the config. Clearing the box resets to default xhttp settings.
+            setXhttpObject(stream, val) {
+                if (!stream) return;
+                const v = (val || '').trim();
+                if (!v) {
+                    stream.xhttp = new xHTTPStreamSettings();
+                    this.xhttpObjectErr = '';
+                    return;
+                }
+                let parsed;
+                try {
+                    parsed = JSON.parse(v);
+                } catch (e) {
+                    this.xhttpObjectErr = 'Invalid JSON: ' + e.message;
+                    return;
+                }
+                if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+                    this.xhttpObjectErr = 'XHTTP Object must be a JSON object';
+                    return;
+                }
+                stream.xhttp = xHTTPStreamSettings.fromJson(parsed);
+                this.xhttpObjectErr = '';
+            },
             streamNetworkChange() {
                 if (this.outModal.outbound.protocol == Protocols.VLESS && !outModal.outbound.canEnableTlsFlow()) {
                     delete this.outModal.outbound.settings.flow;

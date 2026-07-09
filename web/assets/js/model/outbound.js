@@ -365,6 +365,10 @@ class xHTTPStreamSettings extends CommonClass {
             hMaxReusableSecs: "1800-3000",
             hKeepAlivePeriod: 0,
         },
+        scMaxEachPostBytes = '',
+        xPaddingBytes = '',
+        downloadSettings = undefined,
+        extra = {},
     ) {
         super();
         this.path = path;
@@ -373,37 +377,65 @@ class xHTTPStreamSettings extends CommonClass {
         this.noGRPCHeader = noGRPCHeader;
         this.scMinPostsIntervalMs = scMinPostsIntervalMs;
         this.xmux = xmux;
+        this.scMaxEachPostBytes = scMaxEachPostBytes;
+        this.xPaddingBytes = xPaddingBytes;
+        // downloadSettings is a full nested stream-settings object; stored
+        // and round-tripped verbatim (we do not model its internals here).
+        this.downloadSettings = downloadSettings;
+        // Any xhttp key the form does not model structurally (headers,
+        // noSSEHeader, scMaxBufferedPosts, xPadding* obfs, uplink*/session*/seq*,
+        // future keys...) is preserved verbatim here so ANY xhttp object shape
+        // round-trips losslessly. Kept out of the structured fields above.
+        this.extra = extra && typeof extra === 'object' ? extra : {};
     }
 
     static fromJson(json = {}) {
+        // Everything the structured fields don't own is kept verbatim in `extra`.
+        const extra = {};
+        Object.keys(json).forEach(k => {
+            if (!xHTTPStreamSettings.STRUCTURED_KEYS.has(k)) extra[k] = json[k];
+        });
         return new xHTTPStreamSettings(
             json.path,
             json.host,
             json.mode,
             json.noGRPCHeader,
             json.scMinPostsIntervalMs,
-            json.xmux
+            json.xmux,
+            json.scMaxEachPostBytes,
+            json.xPaddingBytes,
+            json.downloadSettings,
+            extra
         );
     }
 
     toJson() {
-        return {
-            path: this.path,
-            host: this.host,
-            mode: this.mode,
-            noGRPCHeader: this.noGRPCHeader,
-            scMinPostsIntervalMs: this.scMinPostsIntervalMs,
-            xmux: {
-                maxConcurrency: this.xmux.maxConcurrency,
-                maxConnections: this.xmux.maxConnections,
-                cMaxReuseTimes: this.xmux.cMaxReuseTimes,
-                hMaxRequestTimes: this.xmux.hMaxRequestTimes,
-                hMaxReusableSecs: this.xmux.hMaxReusableSecs,
-                hKeepAlivePeriod: this.xmux.hKeepAlivePeriod,
-            },
-        };
+        // Start from the preserved passthrough so unmodeled keys survive; the
+        // structured fields below then overwrite their own keys. For a plain
+        // xhttp link `extra` is empty, so output stays byte-identical.
+        const o = Object.assign({}, this.extra);
+        o.path = this.path;
+        o.host = this.host;
+        o.mode = this.mode;
+        o.noGRPCHeader = this.noGRPCHeader;
+        o.scMinPostsIntervalMs = this.scMinPostsIntervalMs;
+        // Spread the live xmux so any extra sub-keys (e.g. cMaxLifetimeMs) ride
+        // along instead of being flattened to the six the form knows about.
+        o.xmux = Object.assign({}, this.xmux);
+        // Only emit the extended xhttp fields when they carry a real value so
+        // existing outputs stay byte-identical for plain xhttp links.
+        if (this.scMaxEachPostBytes !== undefined && this.scMaxEachPostBytes !== '') o.scMaxEachPostBytes = this.scMaxEachPostBytes;
+        if (this.xPaddingBytes !== undefined && this.xPaddingBytes !== '') o.xPaddingBytes = this.xPaddingBytes;
+        if (this.downloadSettings !== undefined && this.downloadSettings !== null) o.downloadSettings = this.downloadSettings;
+        return o;
     }
 }
+// Keys the structured constructor/toJson own; everything else is preserved
+// verbatim in `extra` so any xhttp object shape round-trips losslessly.
+xHTTPStreamSettings.STRUCTURED_KEYS = new Set([
+    'path', 'host', 'mode', 'noGRPCHeader', 'scMinPostsIntervalMs',
+    'xmux', 'scMaxEachPostBytes', 'xPaddingBytes', 'downloadSettings',
+]);
 
 class TlsStreamSettings extends CommonClass {
     constructor(
@@ -435,14 +467,18 @@ class TlsStreamSettings extends CommonClass {
     }
 
     toJson() {
-        return {
-            serverName: this.serverName,
-            alpn: this.alpn,
-            fingerprint: this.fingerprint,
-            echConfigList: this.echConfigList,
-            verifyPeerCertByName: this.verifyPeerCertByName,
-            pinnedPeerCertSha256: this.pinnedPeerCertSha256
-        };
+        const o = { serverName: this.serverName };
+        // Emit optional TLS fields only when they carry a value. Xray rejects a
+        // blank/"none" fingerprint ("unknown fingerprint"), and empty optionals
+        // just add noise, so omit them.
+        if (Array.isArray(this.alpn) && this.alpn.length) o.alpn = this.alpn;
+        if (this.fingerprint && this.fingerprint !== 'none') o.fingerprint = this.fingerprint;
+        if (this.echConfigList) o.echConfigList = this.echConfigList;
+        if (this.verifyPeerCertByName) o.verifyPeerCertByName = this.verifyPeerCertByName;
+        if (this.pinnedPeerCertSha256 && !(Array.isArray(this.pinnedPeerCertSha256) && this.pinnedPeerCertSha256.length === 0)) {
+            o.pinnedPeerCertSha256 = this.pinnedPeerCertSha256;
+        }
+        return o;
     }
 }
 
@@ -1146,7 +1182,7 @@ class Outbound extends CommonClass {
     }
 
     static fromLink(link) {
-        data = link.split('://');
+        const data = link.split('://');
         if (data.length != 2) return null;
         switch (data[0].toLowerCase()) {
             case Protocols.VMess:
@@ -1161,6 +1197,39 @@ class Outbound extends CommonClass {
             default:
                 return null;
         }
+    }
+
+    // Merge a share link's `extra` object onto an xHTTPStreamSettings instance.
+    // The keys the model owns structurally (mode, xmux, sc*, xPaddingBytes,
+    // downloadSettings...) are routed to their fields; every OTHER key is kept
+    // verbatim in xh.extra so any xhttp object shape round-trips losslessly.
+    //
+    // collectUnknown MUST be false when `extra` is actually the whole vmess/link
+    // JSON (the fromVmessLink fallback) — otherwise link-level keys (add, port,
+    // id, net, tls, sni...) would leak into the xhttp settings. Pass true only
+    // when `extra` is a genuine xhttp `extra=` object.
+    static applyXhttpExtra(xh, extra, collectUnknown = false) {
+        if (!extra || typeof extra !== 'object') return;
+        // Don't let a missing/empty extra.mode clobber a mode already set from
+        // the top-level `mode=` query param.
+        if (!xh.mode && typeof extra.mode === 'string' && extra.mode) xh.mode = extra.mode;
+        if (!xh.path && typeof extra.path === 'string' && extra.path) xh.path = extra.path;
+        if (!xh.host && typeof extra.host === 'string' && extra.host) xh.host = extra.host;
+        if (typeof extra.noGRPCHeader === 'boolean') xh.noGRPCHeader = extra.noGRPCHeader;
+        if (extra.scMaxEachPostBytes !== undefined && extra.scMaxEachPostBytes !== '') xh.scMaxEachPostBytes = extra.scMaxEachPostBytes;
+        if (extra.scMinPostsIntervalMs !== undefined && extra.scMinPostsIntervalMs !== '') xh.scMinPostsIntervalMs = extra.scMinPostsIntervalMs;
+        if (typeof extra.xPaddingBytes === 'string' && extra.xPaddingBytes) xh.xPaddingBytes = extra.xPaddingBytes;
+        // Merge, don't replace, so the six default xmux keys the form binds to survive.
+        if (extra.xmux && typeof extra.xmux === 'object') xh.xmux = Object.assign({}, xh.xmux, extra.xmux);
+        // Nested full stream-settings object, passed through verbatim.
+        if (extra.downloadSettings !== undefined && extra.downloadSettings !== null) xh.downloadSettings = extra.downloadSettings;
+        if (!collectUnknown) return;
+        // Preserve everything the fields above don't own (headers, noSSEHeader,
+        // scMaxBufferedPosts, xPadding* obfs keys, uplink*/session*/seq*, future keys).
+        if (!xh.extra || typeof xh.extra !== 'object') xh.extra = {};
+        Object.keys(extra).forEach(k => {
+            if (!xHTTPStreamSettings.STRUCTURED_KEYS.has(k)) xh.extra[k] = extra[k];
+        });
     }
 
     static fromVmessLink(json = {}) {
@@ -1193,6 +1262,20 @@ class Outbound extends CommonClass {
             // explicitly to avoid that.
             const xh = new xHTTPStreamSettings(json.path, json.host);
             if (json.mode) xh.mode = json.mode;
+            // The extra xhttp fields (scMaxEachPostBytes, xPaddingBytes and a
+            // nested downloadSettings) may arrive either as an `extra` object or
+            // directly on the vmess json. Merge whichever is present.
+            let extra = json.extra;
+            if (typeof extra === 'string') { try { extra = JSON.parse(extra); } catch (_) { extra = undefined; } }
+            if (extra && typeof extra === 'object') {
+                // Genuine xhttp `extra` object: preserve every key verbatim.
+                Outbound.applyXhttpExtra(xh, extra, true);
+            } else {
+                // Fallback: fields sit directly on the vmess json. Route the
+                // known ones only — do NOT collect unknowns (would pull in the
+                // link-level keys add/port/id/net/tls...).
+                Outbound.applyXhttpExtra(xh, json, false);
+            }
             stream.xhttp = xh;
         }
 
@@ -1250,19 +1333,16 @@ class Outbound extends CommonClass {
             const extraRaw = url.searchParams.get('extra');
             if (extraRaw) {
                 try {
-                    const extra = JSON.parse(extraRaw);
-                    if (typeof extra.xPaddingBytes === 'string' && extra.xPaddingBytes) xh.xPaddingBytes = extra.xPaddingBytes;
-                    if (extra.xPaddingObfsMode === true) xh.xPaddingObfsMode = true;
-                    ["xPaddingKey", "xPaddingHeader", "xPaddingPlacement", "xPaddingMethod"].forEach(k => {
-                        if (typeof extra[k] === 'string' && extra[k]) xh[k] = extra[k];
-                    });
+                    Outbound.applyXhttpExtra(xh, JSON.parse(extraRaw), true);
                 } catch (_) { /* ignore malformed extra */ }
             }
             stream.xhttp = xh;
         }
 
         if (security == 'tls') {
-            let fp = url.searchParams.get('fp') ?? 'none';
+            // No default 'none' — 'none' is NOT a valid uTLS fingerprint and
+            // Xray rejects it ("unknown fingerprint"). Empty = no uTLS.
+            let fp = url.searchParams.get('fp') ?? '';
             let alpn = url.searchParams.get('alpn');
             let sni = url.searchParams.get('sni') ?? '';
             let ech = url.searchParams.get('ech') ?? '';

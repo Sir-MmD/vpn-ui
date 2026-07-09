@@ -383,6 +383,11 @@ func migrateFromSystemd() {
 		for _, unit := range []string{"xl2tpd", "pptpd"} {
 			_ = exec.Command("systemctl", "disable", "--now", unit).Run()
 		}
+		// When we run our own bundled pluto, the host ipsec.service must not also be
+		// running — it would hold UDP 500/4500 and conflict with the bundled daemon.
+		if usingBundledIpsec() {
+			_ = exec.Command("systemctl", "disable", "--now", "ipsec").Run()
+		}
 		// Remove the unit files the old design generated.
 		for _, f := range []string{
 			"/etc/systemd/system/openvpn-server@.service",
@@ -405,6 +410,10 @@ func migrateFromSystemd() {
 					continue // unresolved — avoid a too-broad match on a bare name
 				}
 				_ = exec.Command("pkill", "-KILL", "-f", bin).Run()
+			}
+			// Orphaned bundled pluto from a crashed panel (holds UDP 500/4500).
+			if usingBundledIpsec() {
+				_ = exec.Command("pkill", "-KILL", "-f", backend.LibreswanBundleRoot+"/libexec/ipsec/pluto.bin").Run()
 			}
 		}
 	})

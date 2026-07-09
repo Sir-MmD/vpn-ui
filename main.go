@@ -1,4 +1,4 @@
-// Package main is the entry point for the 3x-ui web panel application.
+// Package main is the entry point for the vpn-ui web panel application.
 // It initializes the database, web server, and handles command-line operations for managing the panel.
 package main
 
@@ -20,10 +20,12 @@ import (
 	_ "unsafe"
 
 	"github.com/mhsanaei/3x-ui/v2/config"
+	"github.com/mhsanaei/3x-ui/v2/corebundle"
 	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/sub"
 	"github.com/mhsanaei/3x-ui/v2/util/crypto"
+	"github.com/mhsanaei/3x-ui/v2/util/random"
 	"github.com/mhsanaei/3x-ui/v2/util/sys"
 	"github.com/mhsanaei/3x-ui/v2/web"
 	"github.com/mhsanaei/3x-ui/v2/web/global"
@@ -56,17 +58,99 @@ func initLogger() {
 	}
 }
 
-// runWebServer initializes and starts the web server for the 3x-ui panel.
+// runWebServer initializes and starts the web server for the vpn-ui panel.
+// stdoutIsTTY reports whether stdout is an interactive terminal, so ANSI colour
+// is only emitted when it will render (and not when output is piped/redirected).
+func stdoutIsTTY() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// ansiVpnUI renders "vpn-ui" as a bold, per-letter multi-colour banner for CLI
+// output. Falls back to plain text when NO_COLOR is set or stdout isn't a TTY.
+func ansiVpnUI() string {
+	const text = "vpn-ui"
+	if os.Getenv("NO_COLOR") != "" || !stdoutIsTTY() {
+		return text
+	}
+	// bright red / yellow / green / cyan / blue / magenta — one per glyph.
+	colors := []string{"91", "93", "92", "96", "94", "95"}
+	var b strings.Builder
+	for i, r := range text {
+		b.WriteString(fmt.Sprintf("\x1b[1;%sm%c", colors[i%len(colors)], r))
+	}
+	b.WriteString("\x1b[0m")
+	return b.String()
+}
+
+// warnUnsupportedDistro prints a prominent warning at panel startup when the host
+// distro is not on vpn-ui's tested list (service.DistroSupported). Colorful when
+// stdout is a TTY (honors NO_COLOR); always also emits a logger.Warning so it lands
+// in the journal / non-TTY logs too.
+func warnUnsupportedDistro() {
+	ok, pretty, reason := service.DistroSupported()
+	if ok {
+		return
+	}
+	logger.Warningf("unsupported distro: %s (%s) — not officially supported by vpn-ui, expect errors",
+		pretty, reason)
+
+	tested := service.SupportedDistroSummary()
+	if os.Getenv("NO_COLOR") != "" || !stdoutIsTTY() {
+		fmt.Fprintf(os.Stderr,
+			"\nWARNING: %s is NOT officially supported by vpn-ui. It may run, but expect errors.\n"+
+				"Tested distros: %s.\n\n", pretty, tested)
+		return
+	}
+	const (
+		reset = "\x1b[0m"
+		yb    = "\x1b[1;93m" // bold yellow
+		rb    = "\x1b[1;91m" // bold red
+		dim   = "\x1b[2m"
+	)
+	rule := yb + strings.Repeat("━", 64) + reset
+	fmt.Fprintln(os.Stderr, "\n"+rule)
+	fmt.Fprintln(os.Stderr, rb+"⚠  UNSUPPORTED DISTRO"+reset)
+	fmt.Fprintf(os.Stderr, "%s%s%s is not officially supported by vpn-ui — %sexpect errors%s.\n",
+		yb, pretty, reset, rb, reset)
+	fmt.Fprintf(os.Stderr, "%sTested: %s%s\n", dim, tested, reset)
+	fmt.Fprintln(os.Stderr, rule+"\n")
+}
+
 func runWebServer() {
+	fmt.Println(ansiVpnUI())
 	log.Printf("Starting %v %v", config.GetName(), config.GetVersion())
 
 	initLogger()
+
+	warnUnsupportedDistro()
 
 	godotenv.Load()
 
 	err := database.InitDB(config.GetDBPath())
 	if err != nil {
 		log.Fatalf("Error initializing database: %v", err)
+	}
+
+	// Extract the pinned Xray core + base geo files baked into the panel. The
+	// core is overwritten on every start so the bundled (patched) fork is always
+	// what runs — switching/updating it from the dashboard is disabled. Geo files
+	// are written only when missing, so dashboard geo updates persist. On a build
+	// without an embedded bundle (checkout without build/core/build.sh output),
+	// both calls are no-ops and the panel uses whatever is already on disk.
+	binDir := config.GetBinFolderPath()
+	if p, exErr := corebundle.ExtractXray(binDir); exErr != nil {
+		logger.Warning("could not extract bundled xray core:", exErr)
+	} else if p != "" {
+		logger.Info("extracted bundled xray core to", p)
+	}
+	if geo, exErr := corebundle.ExtractGeofiles(binDir); exErr != nil {
+		logger.Warning("could not extract bundled geo files:", exErr)
+	} else if len(geo) > 0 {
+		logger.Info("extracted bundled geo files:", geo)
 	}
 
 	var server *web.Server
@@ -145,6 +229,183 @@ func runWebServer() {
 			return
 		}
 	}
+}
+
+// installSystemd creates the panel's systemd unit, enables it at boot, and starts
+// it — so the panel runs under systemd instead of a direct binary execution.
+// Invoked by `vpn-ui --systemd`. Must run as root (it writes /etc/systemd/system).
+func installSystemd() {
+	if err := database.InitDB(config.GetDBPath()); err != nil {
+		log.Fatalf("Error initializing database: %v", err)
+	}
+	var s service.SystemdService
+	name := s.GetServiceName()
+	fmt.Printf("Installing systemd service %q (create + enable on boot + start now)...\n", name)
+	err := s.SaveService(service.SaveServiceRequest{
+		Name:   name,
+		Unit:   service.DefaultUnit(name),
+		Enable: true,
+		Start:  true,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "systemd install failed:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Done. The panel now runs under systemd as %q.\n", name)
+	fmt.Printf("  status: systemctl status %s\n", name)
+	fmt.Printf("  logs:   journalctl -u %s -f\n", name)
+}
+
+// runUninstall removes the panel and everything it installed on the host: the
+// systemd unit, child daemons, firewall/nftables rules, policy routing, the
+// /etc configs, the bundled daemon trees, logs, the database and finally the
+// binary itself. It is the inverse of `--systemd`/provisioning. Distro packages
+// (libreswan, nftables, iproute2, kernel modules) and irreversible boot/modprobe
+// edits are left in place and flagged for the operator. Invoked by
+// `vpn-ui --uninstall`; `--yes`/`--force` skips the confirmation prompt. Must run
+// as root. Best-effort: a single failed step is recorded, not fatal.
+func runUninstall(assumeYes bool) {
+	// The teardown calls services that log through the logger package (unlike
+	// SaveService), so initialise it first to avoid a nil-logger panic.
+	initLogger()
+	// The DB is only needed to read the configured systemd service name; if it's
+	// already gone we still tear down the rest of the host with defaults.
+	if err := database.InitDB(config.GetDBPath()); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: database unavailable, using defaults:", err)
+	}
+
+	exePath, _ := os.Executable()
+
+	if !assumeYes {
+		fmt.Println("This will REMOVE vpn-ui and everything it installed on this host:")
+		fmt.Println("  • the systemd unit, child daemons (openvpn/xl2tpd/pptpd/pluto)")
+		fmt.Println("  • nftables 'ip vpn' table, firewalld trust, fwmark routing (table 100)")
+		fmt.Println("  • /etc configs, /usr/libexec/vpn-ui bundles, logs, bin/, the database")
+		fmt.Println("  • the vpn-ui binary itself")
+		fmt.Println("Distro packages and boot/modprobe edits are kept and listed at the end.")
+		fmt.Print("Type 'yes' to proceed: ")
+		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		if strings.TrimSpace(line) != "yes" {
+			fmt.Println("Aborted — nothing was removed.")
+			return
+		}
+	}
+
+	fmt.Println("Uninstalling vpn-ui...")
+	report := service.Uninstall(service.UninstallOptions{ExePath: exePath})
+
+	// Remove the database (next to the binary) — done here, after the service
+	// teardown that needed it to resolve the unit name.
+	dbPath := config.GetDBPath()
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm", dbPath + "-journal"} {
+		if err := os.Remove(p); err == nil {
+			report.Removed = append(report.Removed, p)
+		} else if !os.IsNotExist(err) {
+			report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", p, err))
+		}
+	}
+
+	// Remove the running binary last. On Linux unlinking a running executable is
+	// safe — the inode lives until this process exits.
+	if exePath != "" {
+		if err := os.Remove(exePath); err == nil {
+			report.Removed = append(report.Removed, exePath)
+		} else if !os.IsNotExist(err) {
+			report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", exePath, err))
+		}
+	}
+
+	fmt.Printf("\nRemoved %d item(s).\n", len(report.Removed))
+	for _, r := range report.Removed {
+		fmt.Println("  -", r)
+	}
+	if len(report.Kept) > 0 {
+		fmt.Println("\nKept in place — remove manually if you no longer want them:")
+		for _, k := range report.Kept {
+			fmt.Println("  -", k)
+		}
+	}
+	if len(report.Errors) > 0 {
+		fmt.Println("\nEncountered errors (best-effort, teardown continued):")
+		for _, e := range report.Errors {
+			fmt.Println("  !", e)
+		}
+	}
+	fmt.Println("\nvpn-ui uninstalled.")
+}
+
+// randomFreePort returns a random, currently-bindable TCP port in a high range,
+// falling back to an OS-assigned port if the random picks keep colliding.
+func randomFreePort() int {
+	for i := 0; i < 20; i++ {
+		p := 10000 + random.Num(55535) // 10000..65534
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
+		if err == nil {
+			_ = ln.Close()
+			return p
+		}
+	}
+	if ln, err := net.Listen("tcp", ":0"); err == nil {
+		defer ln.Close()
+		return ln.Addr().(*net.TCPAddr).Port
+	}
+	return 20000 + random.Num(40000)
+}
+
+// randomizeSetting generates a fresh random port, login username, login password
+// and web base path for the panel, persists them, and prints them so the operator
+// can log in. Invoked by `vpn-ui --random` (composable with --systemd, which is
+// applied afterwards so the unit boots with these settings).
+func randomizeSetting() error {
+	if err := database.InitDB(config.GetDBPath()); err != nil {
+		fmt.Println("Database initialization failed:", err)
+		return err
+	}
+
+	settingService := service.SettingService{}
+	userService := service.UserService{}
+
+	port := randomFreePort()
+	username := random.Seq(12)
+	password := random.Seq(20)
+	webBasePath := random.Seq(16)
+
+	if err := settingService.SetPort(port); err != nil {
+		fmt.Println("Failed to set port:", err)
+		return err
+	}
+	if err := userService.UpdateFirstUser(username, password); err != nil {
+		fmt.Println("Failed to set username and password:", err)
+		return err
+	}
+	if err := settingService.SetBasePath(webBasePath); err != nil {
+		fmt.Println("Failed to set web base path:", err)
+		return err
+	}
+
+	// Read the base path back so the printed value matches how it is stored
+	// (SetBasePath normalizes leading/trailing slashes).
+	normPath, _ := settingService.GetBasePath()
+	if normPath == "" {
+		normPath = "/"
+	}
+	// Resolve the server's public IPv4 the same way the dashboard does, then
+	// assemble the one-click panel URL (http, new port + web path).
+	ip := service.GetServerIPv4()
+	url := fmt.Sprintf("http://%s:%d%s", ip, port, normPath)
+
+	fmt.Println(ansiVpnUI())
+	fmt.Println("Randomized panel settings:")
+	fmt.Printf("  Port:     %d\n", port)
+	fmt.Printf("  Username: %s\n", username)
+	fmt.Printf("  Password: %s\n", password)
+	fmt.Printf("  WebPath:  %s\n", normPath)
+	fmt.Printf("  IP:       %s\n", ip)
+	fmt.Printf("  URL:      %s\n", url)
+	if ip == "N/A" {
+		fmt.Println("  (could not detect public IP — substitute the server's address in the URL)")
+	}
+	return nil
 }
 
 // resetSetting resets all panel settings to their default values.
@@ -410,7 +671,7 @@ func GetListenIP(getListen bool) {
 	}
 }
 
-// migrateDb performs database migration operations for the 3x-ui panel.
+// migrateDb performs database migration operations for the vpn-ui panel.
 func migrateDb() {
 	inboundService := service.InboundService{}
 
@@ -440,11 +701,11 @@ func readRadiusSecret() string {
 }
 
 // openvpnAuth handles OpenVPN auth-user-pass-verify via RADIUS PAP.
-// Usage: x-ui openvpn-auth {inbound_id} {credentials_file}
+// Usage: vpn-ui openvpn-auth {inbound_id} {credentials_file}
 // The credentials file has username on line 1, password on line 2.
 func openvpnAuth() {
 	if len(os.Args) < 4 {
-		fmt.Fprintln(os.Stderr, "usage: x-ui openvpn-auth <inbound_id> <cred_file>")
+		fmt.Fprintln(os.Stderr, "usage: vpn-ui openvpn-auth <inbound_id> <cred_file>")
 		os.Exit(1)
 	}
 
@@ -509,6 +770,13 @@ func openvpnAuth() {
 // file, authoritative) and not held by a fresh lease (a short-TTL marker that
 // bridges the gap between this connect and the client appearing in the status
 // file). Leaked leases self-expire, so no long-lived bookkeeping is needed.
+// ovpnLeaseReclaimGrace is the minimum age of a gap-lease before it may be
+// reclaimed for a new dial. OpenVPN rewrites the status file every 5s, so any
+// live device is listed within 5s of connecting; a lease older than this that is
+// still absent from the status is therefore an abandoned ghost — safe to reclaim
+// without stealing a slot from a device that is merely mid-handshake.
+const ovpnLeaseReclaimGrace = 10 * time.Second
+
 func ovpnLeaseBlockIP(inboundId int, username, poolIP string) (string, string, bool) {
 	proto := "udp"
 	if strings.HasPrefix(poolIP, "10.3.") {
@@ -530,11 +798,16 @@ func ovpnLeaseBlockIP(inboundId int, username, poolIP string) (string, string, b
 	candidates := parts[1:]
 
 	statusPath := fmt.Sprintf("/var/run/openvpn/status-%d-%s.log", inboundId, proto)
-	inUse := ovpnStatusIPs(statusPath)
+	liveStatus := ovpnStatusIPs(statusPath) // devices OpenVPN currently reports connected
+	inUse := make(map[string]bool, len(liveStatus))
+	for ip := range liveStatus {
+		inUse[ip] = true
+	}
 
 	leaseDir := filepath.Join(dir, "leases-"+proto)
 	_ = os.MkdirAll(leaseDir, 0755)
 	now := time.Now()
+	leaseAge := make(map[string]time.Duration) // block IP -> age of its gap-lease
 	if entries, e := os.ReadDir(leaseDir); e == nil {
 		for _, ent := range entries {
 			p := filepath.Join(leaseDir, ent.Name())
@@ -543,10 +816,11 @@ func ovpnLeaseBlockIP(inboundId int, username, poolIP string) (string, string, b
 				continue
 			}
 			if now.Sub(fi.ModTime()) > 30*time.Second {
-				os.Remove(p) // stale gap-lease
+				os.Remove(p) // stale gap-lease past its TTL
 				continue
 			}
 			inUse[ent.Name()] = true // lease file is named by the leased IP
+			leaseAge[ent.Name()] = now.Sub(fi.ModTime())
 		}
 	}
 
@@ -558,21 +832,43 @@ func ovpnLeaseBlockIP(inboundId int, username, poolIP string) (string, string, b
 		return ip, mask, false
 	}
 
-	// Block full (device cap reached). "accept": admit this device by reusing the
-	// oldest existing device's IP and disconnecting THAT device; "reject": refuse.
+	// The block is full by LEASE count — but a gap-lease can outlive its device by up
+	// to 30s, so "full" may be an illusion. "accept": admit by reusing an IP; "reject":
+	// refuse (unchanged — a live device cap is enforced by the lease count).
 	if ovpnReadStrategy(dir, proto) == "accept" {
-		// Capture the victim's client-ID here, while only the existing devices hold
-		// the block IPs (this new client is not in the status yet). We reuse the
-		// victim's IP for this client, so once it connects two clients share that IP
-		// briefly — killing by the pre-captured CID disconnects the OLD one, not the
-		// one we just admitted.
+		// Prefer reclaiming a slot pinned ONLY by a stale gap-lease (an abandoned dial)
+		// over evicting a live device — and never self-evict. A ghost = a lease older
+		// than the grace whose IP is NOT in the status. OpenVPN rewrites the status
+		// every 5s, so any real device is listed within 5s of connecting; a >grace lease
+		// still absent from the status is abandoned, not a device merely mid-handshake.
+		// Reclaim the OLDEST such ghost.
+		var ghostIP string
+		var ghostAge time.Duration
+		for _, ip := range candidates {
+			if liveStatus[ip] {
+				continue // a genuinely connected device — never a ghost
+			}
+			if age, leased := leaseAge[ip]; leased && age > ovpnLeaseReclaimGrace && age > ghostAge {
+				ghostIP, ghostAge = ip, age
+			}
+		}
+		if ghostIP != "" {
+			_ = os.WriteFile(filepath.Join(leaseDir, ghostIP), []byte(username), 0644)
+			return ghostIP, mask, false
+		}
+
+		// A real device-cap hit: evict the oldest LIVE device and reuse its IP. The kill
+		// MUST happen AFTER this hook returns — client-connect runs synchronously and
+		// blocks OpenVPN's management loop — so hand it to the detached openvpn-evict
+		// helper. Killing by the pre-captured real address hits the OLD device.
 		victimIP, victimRAddr := ovpnOldestFromStatus(statusPath, candidates)
 		if victimIP == "" {
-			victimIP = candidates[0] // status not yet populated -> evict the first slot
+			// No live device in the status and no reclaimable ghost — every slot is a
+			// fresh lease mid-handshake. Reuse the first slot WITHOUT an evictor (there
+			// is nothing live to kill, and spawning one would evict this new client).
+			_ = os.WriteFile(filepath.Join(leaseDir, candidates[0]), []byte(username), 0644)
+			return candidates[0], mask, false
 		}
-		// The kill MUST happen AFTER this hook returns: client-connect runs
-		// synchronously and blocks OpenVPN's management event loop, so a kill issued
-		// from here would deadlock. Hand it to a detached helper (openvpn-evict).
 		ovpnSpawnEvict(inboundId, proto, victimIP, victimRAddr)
 		_ = os.WriteFile(filepath.Join(leaseDir, victimIP), []byte(username), 0644)
 		return victimIP, mask, false
@@ -646,7 +942,7 @@ func ovpnSpawnEvict(inboundId int, proto, ip, raddr string) {
 // clients). The new client reuses the victim's VIRTUAL IP, but real addresses are
 // unique, so this hits the old device, not the one just admitted. Falls back to the
 // OLDEST client on <ip> when no real address was pre-captured.
-// Usage: x-ui openvpn-evict <id> <proto> <ip> [real-address]
+// Usage: vpn-ui openvpn-evict <id> <proto> <ip> [real-address]
 func openvpnEvict() {
 	if len(os.Args) < 5 {
 		return
@@ -719,28 +1015,44 @@ func openvpnEvict() {
 // virtual (tunnel) IPs currently held by connected clients.
 func ovpnStatusIPs(statusPath string) map[string]bool {
 	set := map[string]bool{}
-	data, err := os.ReadFile(statusPath)
-	if err != nil {
-		return set
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		// CLIENT_LIST<TAB>CommonName<TAB>RealAddr<TAB>VirtualAddr<TAB>...
-		if !strings.HasPrefix(line, "CLIENT_LIST\t") {
-			continue
+	// OpenVPN rewrites this file IN PLACE every few seconds; a read that lands mid-
+	// rewrite sees a truncated file (missing CLIENT_LIST rows). Under User Limit
+	// "reject" that makes a live device look absent and wrongly admits an extra one.
+	// A complete status ends with an "END" line — read a few times until we see one,
+	// and union every read's rows so a partial snapshot can only ADD, never drop, a
+	// device (a more-complete "used" set is always the safe direction).
+	for attempt := 0; attempt < 4; attempt++ {
+		data, err := os.ReadFile(statusPath)
+		if err != nil {
+			break
 		}
-		f := strings.Split(line, "\t")
-		if len(f) > 3 && f[3] != "" {
-			set[f[3]] = true
+		complete := false
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.TrimSpace(line) == "END" {
+				complete = true
+			}
+			// CLIENT_LIST<TAB>CommonName<TAB>RealAddr<TAB>VirtualAddr<TAB>...
+			if !strings.HasPrefix(line, "CLIENT_LIST\t") {
+				continue
+			}
+			f := strings.Split(line, "\t")
+			if len(f) > 3 && f[3] != "" {
+				set[f[3]] = true
+			}
 		}
+		if complete {
+			break // got a whole snapshot — trustworthy
+		}
+		time.Sleep(5 * time.Millisecond) // landed mid-rewrite; let it finish, retry
 	}
 	return set
 }
 
-// Usage: x-ui openvpn-connect {inbound_id}
+// Usage: vpn-ui openvpn-connect {inbound_id}
 // Reads common_name and ifconfig_pool_remote_ip from environment.
 func openvpnConnect() {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: x-ui openvpn-connect <inbound_id>")
+		fmt.Fprintln(os.Stderr, "usage: vpn-ui openvpn-connect <inbound_id>")
 		os.Exit(1)
 	}
 
@@ -795,11 +1107,11 @@ func openvpnConnect() {
 }
 
 // openvpnDisconnect handles OpenVPN client-disconnect via RADIUS Acct-Stop.
-// Usage: x-ui openvpn-disconnect {inbound_id}
+// Usage: vpn-ui openvpn-disconnect {inbound_id}
 // Reads common_name and ifconfig_pool_remote_ip from environment.
 func openvpnDisconnect() {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: x-ui openvpn-disconnect <inbound_id>")
+		fmt.Fprintln(os.Stderr, "usage: vpn-ui openvpn-disconnect <inbound_id>")
 		os.Exit(1)
 	}
 
@@ -840,12 +1152,52 @@ func openvpnDisconnect() {
 	os.Exit(0)
 }
 
-// main is the entry point of the 3x-ui application.
+// main is the entry point of the vpn-ui application.
 // It parses command-line arguments to run the web server, migrate database, or update settings.
 func main() {
 	if len(os.Args) < 2 {
 		runWebServer()
 		return
+	}
+
+	// Standalone maintenance switches. They can be combined in any order, e.g.
+	//   vpn-ui --random --systemd
+	// and are handled before flag parsing (they aren't top-level flags). Each
+	// accepts a `--` or bare form:
+	//   --random / random    randomize port + username + password + web path
+	//   --systemd / systemd   install + enable-at-boot + start as a systemd unit
+	// --random runs first, so a combined `--random --systemd` boots the unit
+	// with the freshly randomized settings.
+	{
+		doRandom, doSystemd, doUninstall, doForce, onlySwitches := false, false, false, false, true
+		for _, a := range os.Args[1:] {
+			switch strings.TrimPrefix(a, "--") {
+			case "random":
+				doRandom = true
+			case "systemd":
+				doSystemd = true
+			case "uninstall":
+				doUninstall = true
+			case "yes", "force":
+				doForce = true
+			default:
+				onlySwitches = false
+			}
+		}
+		if onlySwitches && (doRandom || doSystemd || doUninstall) {
+			// Uninstall is exclusive and destructive — if requested, run only it.
+			if doUninstall {
+				runUninstall(doForce)
+				return
+			}
+			if doRandom {
+				randomizeSetting()
+			}
+			if doSystemd {
+				installSystemd()
+			}
+			return
+		}
 	}
 
 	var showVersion bool
@@ -893,8 +1245,14 @@ func main() {
 		fmt.Println()
 		fmt.Println("Commands:")
 		fmt.Println("    run            run web panel")
-		fmt.Println("    migrate        migrate form other/old x-ui")
+		fmt.Println("    migrate        migrate form other/old vpn-ui")
 		fmt.Println("    setting        set settings")
+		fmt.Println("    --systemd      install+enable+start the panel as a systemd service")
+		fmt.Println("    --random       randomize panel port + username + password + web path")
+		fmt.Println("                   (combinable, e.g. --random --systemd)")
+		fmt.Println("    --uninstall    remove the panel: systemd unit, daemons, firewall,")
+		fmt.Println("                   routing, /etc configs, bundles, logs, DB and the binary")
+		fmt.Println("                   (--yes to skip the confirmation prompt)")
 	}
 
 	flag.Parse()

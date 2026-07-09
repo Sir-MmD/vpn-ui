@@ -229,14 +229,14 @@ func decodeUserLimit(raw map[string]json.RawMessage) int {
 
 // normUserLimitStrategy normalizes the per-inbound "User Limit Strategy" — what
 // happens when a (K+1)-th device connects to an account already at its User Limit.
-// "accept" disconnects the oldest existing device and admits the new one; anything
-// else (default/unset) is "reject" — the new device is refused. Only meaningful
+// "reject" refuses the new device; anything else (default/unset) is "accept" —
+// disconnect the account's oldest device and admit the new one. Only meaningful
 // when User Limit K>1.
 func normUserLimitStrategy(s string) string {
-	if s == "accept" {
-		return "accept"
+	if s == "reject" {
+		return "reject"
 	}
-	return "reject"
+	return "accept"
 }
 
 // inboundRanges returns the effective /24 ranges an inbound currently owns, used

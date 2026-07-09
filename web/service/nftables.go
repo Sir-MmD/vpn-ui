@@ -12,7 +12,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/xray"
 )
 
-const nftConfigFile = "/etc/x-ui/vpn.nft"
+const nftConfigFile = "/etc/vpn-ui/vpn.nft"
 
 // vpnAddrSpace is the covering /14 for the four protocol /16s VPN clients live in
 // (10.0/16 L2TP, 10.1 PPTP, 10.2/10.3 OpenVPN — see vpnrange.go). Trusting the
@@ -294,7 +294,7 @@ func (s *NftService) ApplyNftRules() error {
 	}
 
 	// Write and load atomically
-	if err := os.MkdirAll("/etc/x-ui", 0755); err != nil {
+	if err := os.MkdirAll("/etc/vpn-ui", 0755); err != nil {
 		return err
 	}
 	if err := os.WriteFile(nftConfigFile, []byte(b.String()), 0644); err != nil {
@@ -380,6 +380,40 @@ func (s *NftService) RemoveClientAccounting(protocol, ip string) error {
 
 	logger.Debugf("nft: removed %s accounting for %s", protocol, ip)
 	return nil
+}
+
+// ReadAndResetClientCounters atomically reads AND zeros this client's up/down
+// counters, returning the byte deltas accumulated since the last collection. Call
+// this right before RemoveClientAccounting on session end so those final bytes are
+// persisted rather than discarded when the counters are deleted (otherwise up to a
+// full 10s collection window — more under rapid reconnects — is lost from the
+// client's quota). Zeroing here also stops the periodic job from double-counting
+// the same bytes.
+func (s *NftService) ReadAndResetClientCounters(protocol, ip string) (up, down int64) {
+	counterIP := strings.ReplaceAll(ip, ".", "_")
+	up = s.resetCounter(fmt.Sprintf("%s_up_%s", protocol, counterIP))
+	down = s.resetCounter(fmt.Sprintf("%s_down_%s", protocol, counterIP))
+	return up, down
+}
+
+// resetCounter atomically reads+zeros one named counter, returning its bytes (0 if
+// missing/unparseable).
+func (s *NftService) resetCounter(name string) int64 {
+	out, err := exec.Command("nft", "-j", "reset", "counter", "ip", "vpn", name).Output()
+	if err != nil {
+		return 0
+	}
+	var res nftCounterOutput
+	if json.Unmarshal(out, &res) != nil {
+		return 0
+	}
+	for _, raw := range res.Nftables {
+		var e nftCounterEntry
+		if json.Unmarshal(raw, &e) == nil && e.Counter != nil && e.Counter.Name == name {
+			return e.Counter.Bytes
+		}
+	}
+	return 0
 }
 
 // CollectAndResetTraffic atomically reads and resets all VPN traffic counters.

@@ -33,8 +33,8 @@
 
 ### Building & Running
 ```bash
-# Build (creates bin/3x-ui.exe)
-go run tasks.json → "go: build" task
+# Build (CGO required for sqlite)
+CGO_ENABLED=1 go build -o vpn-ui main.go
 
 # Run with debug logging
 XUI_DEBUG=true go run ./main.go
@@ -126,11 +126,6 @@ Both `install.sh` and `x-ui.sh` follow these patterns:
 - Multi-distro support via `$release` variable (ubuntu, debian, centos, arch, etc.)
 - Port detection with `is_port_in_use()` using ss/netstat/lsof
 - Systemd service management with distro-specific unit files (`.service.debian`, `.service.arch`, `.service.rhel`)
-
-### Docker Build
-Multi-stage Dockerfile:
-1. **Builder**: CGO-enabled build, runs `DockerInit.sh` to download Xray binary
-2. **Final**: Alpine-based with fail2ban pre-configured
 
 ### Key File Locations (Production)
 - Binary: `/usr/local/x-ui/`

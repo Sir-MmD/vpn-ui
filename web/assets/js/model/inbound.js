@@ -15,6 +15,8 @@ const Protocols = {
 };
 
 const SSMethods = {
+    AES_256_GCM: 'aes-256-gcm',
+    AES_128_GCM: 'aes-128-gcm',
     CHACHA20_POLY1305: 'chacha20-poly1305',
     CHACHA20_IETF_POLY1305: 'chacha20-ietf-poly1305',
     XCHACHA20_IETF_POLY1305: 'xchacha20-ietf-poly1305',
@@ -2914,7 +2916,7 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
     dns2 = "8.8.4.4",
     mtu = 1400,
     userLimit = 1,
-    userLimitStrategy = "reject",
+    userLimitStrategy = "accept",
     l2tpUsers = [new Inbound.L2tpSettings.L2tpUser()],
   ) {
     super(protocol);
@@ -2951,7 +2953,7 @@ Inbound.L2tpSettings = class extends Inbound.Settings {
       json.dns2 ?? "8.8.4.4",
       json.mtu ?? 1400,
       json.userLimit ?? 1,
-      json.userLimitStrategy ?? "reject",
+      json.userLimitStrategy ?? "accept",
       Inbound.L2tpSettings.L2tpUser.fromJson(json.clients),
     );
   }
@@ -3087,7 +3089,7 @@ Inbound.PptpSettings = class extends Inbound.Settings {
     dns2 = "8.8.4.4",
     mtu = 1400,
     userLimit = 1,
-    userLimitStrategy = "reject",
+    userLimitStrategy = "accept",
     pptpUsers = [new Inbound.PptpSettings.PptpUser()],
   ) {
     super(protocol);
@@ -3118,7 +3120,7 @@ Inbound.PptpSettings = class extends Inbound.Settings {
       json.dns2 ?? "8.8.4.4",
       json.mtu ?? 1400,
       json.userLimit ?? 1,
-      json.userLimitStrategy ?? "reject",
+      json.userLimitStrategy ?? "accept",
       Inbound.PptpSettings.PptpUser.fromJson(json.clients),
     );
   }
@@ -3257,13 +3259,13 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
     tlsCrypt = "",
     openvpnUsers = [new Inbound.OpenvpnSettings.OpenvpnUser()],
     externalProxy = [],
-    cipherMode = "new",
-    ciphers = Inbound.OpenvpnSettings.CIPHER_MODES.new.slice(),
+    cipherMode = "all",
+    ciphers = Inbound.OpenvpnSettings.CIPHER_MODES.all.slice(),
     clientToClient = false,
     crossInbound = false,
     ipRanges = [],
     userLimit = 1,
-    userLimitStrategy = "reject",
+    userLimitStrategy = "accept",
   ) {
     super(protocol);
     this.udpEnable = udpEnable;
@@ -3296,7 +3298,7 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
   static fromJson(json = {}) {
     const ciphers = Array.isArray(json.ciphers)
       ? json.ciphers.slice()
-      : Inbound.OpenvpnSettings.CIPHER_MODES.new.slice();
+      : Inbound.OpenvpnSettings.CIPHER_MODES.all.slice();
     return new Inbound.OpenvpnSettings(
       Protocols.OPENVPN,
       json.udpEnable ?? true,
@@ -3318,7 +3320,7 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
       json.crossInbound ?? false,
       Array.isArray(json.ipRanges) ? json.ipRanges.slice() : [],
       json.userLimit ?? 1,
-      json.userLimitStrategy ?? "reject",
+      json.userLimitStrategy ?? "accept",
     );
   }
 

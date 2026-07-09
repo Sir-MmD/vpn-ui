@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # build/backend/build.sh — Build portable, statically-linked VPN daemon binaries
-# that get embedded into the x-ui binary (go:embed) and extracted at runtime.
+# that get embedded into the vpn-ui binary (go:embed) and extracted at runtime.
 #
 # The daemons are built against musl (Alpine) and statically linked, so the
 # resulting binaries run on any Linux distro/glibc version without depending on
@@ -19,6 +19,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT_ROOT="$REPO_ROOT/backend/bin"
 
+# shellcheck source=../lib/log.sh
+source "$REPO_ROOT/build/lib/log.sh" 2>/dev/null || { step(){ echo "==> $*"; }; ok(){ echo "  - $*"; }; info(){ echo "  $*"; }; warn(){ echo "  ! $*" >&2; }; err(){ echo "  x $*" >&2; }; hr(){ :; }; }
+
 # goarch -> Alpine build platform (docker --platform)
 declare -A PLATFORM=(
     [amd64]="linux/amd64"
@@ -34,13 +37,13 @@ build_arch() {
         # Not an error: the Go embed simply has no bundle for this arch, so the
         # daemons fall back to the host package manager there. Keeps CI green for
         # arches we don't (yet) build daemons for (armv7, s390x, …).
-        echo "==> No daemon bundle for '$goarch' (unsupported) — skipping" >&2
+        warn "No daemon bundle for '$goarch' (unsupported) — skipping"
         return 0
     fi
     local outdir="$OUT_ROOT/$goarch"
     mkdir -p "$outdir"
 
-    echo "==> Building daemons for $goarch ($platform)"
+    step "Building daemons for $goarch ($platform)"
     # DOCKER_NET lets the caller pick host networking when the default bridge is
     # firewalled (common with firewalld on the build host).
     docker run --rm ${DOCKER_NET:-} --platform "$platform" -v "$outdir:/out" alpine:3.20 sh -euxc '
@@ -103,14 +106,26 @@ build_arch() {
     # Alpine 3.22 ships ppp 2.5.2. Do NOT drop below 3.21: ppp 2.5.0 (Alpine 3.20)
     # has a missing-braces bug in rc_read_config that makes the RADIUS plugin fail
     # to read ANY config file ("RADIUS: Can't read config file") — fixed in 2.5.1.
-    echo "==> Building pppd bundle for $goarch"
+    step "Building pppd bundle for $goarch"
     docker run --rm ${DOCKER_NET:-} --platform "$platform" \
         -e ARCH="$muslarch" \
         -v "$outdir:/out" \
         -v "$REPO_ROOT/build/backend/pppd-bundle.sh:/pppd-bundle.sh:ro" \
         alpine:3.22 sh -e /pppd-bundle.sh
 
-    echo "==> Done: $(ls -lh "$outdir")"
+    # libreswan (IPsec) built with USE_DH2=true — the ALL_ALGS build that offers the
+    # MODP1024 (DH2) group legacy L2TP/IPsec clients (Windows 7, old MikroTik) need,
+    # which no distro package ships. Like pppd it can't be one static binary (NSS
+    # dlopens freebl), so it ships as a relocatable musl tree. Slow to compile, so
+    # it's cached with the rest of the bundle.
+    step "Building libreswan (ALL_ALGS) bundle for $goarch"
+    docker run --rm ${DOCKER_NET:-} --platform "$platform" \
+        -e ARCH="$muslarch" \
+        -v "$outdir:/out" \
+        -v "$REPO_ROOT/build/backend/libreswan-bundle.sh:/libreswan-bundle.sh:ro" \
+        alpine:3.22 sh -e /libreswan-bundle.sh
+
+    ok "Done: $(ls -lh "$outdir")"
 }
 
 for a in "${ARCHES[@]}"; do

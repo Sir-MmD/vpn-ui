@@ -9,8 +9,8 @@ func TestNormUserLimitStrategy(t *testing.T) {
 	cases := map[string]string{
 		"accept": "accept",
 		"reject": "reject",
-		"":       "reject", // unset/legacy defaults to reject
-		"bogus":  "reject",
+		"":       "accept", // unset/legacy defaults to accept (evict oldest); see normUserLimitStrategy
+		"bogus":  "accept",
 	}
 	for in, want := range cases {
 		if got := normUserLimitStrategy(in); got != want {
@@ -29,7 +29,7 @@ func TestAllocateBlockIPFreeAndReject(t *testing.T) {
 
 	// free slot: hand out the lowest device IP, no deny.
 	s := &RadiusService{sessions: map[string]*radiusSession{}}
-	ip, deny := s.allocateBlockIP(0, k, subs, "l2tp", "reject")
+	ip, deny := s.allocateBlockIP(0, k, subs, "l2tp", "reject", "")
 	if deny || ip == nil || ip.String() != "10.0.5.6" {
 		t.Fatalf("free slot: got ip=%v deny=%v want 10.0.5.6/false", ip, deny)
 	}
@@ -40,7 +40,7 @@ func TestAllocateBlockIPFreeAndReject(t *testing.T) {
 		full["sess-"+itoa(d)] = &radiusSession{ip: "10.0.5." + itoa(6+d), protocol: "l2tp", started: time.Now()}
 	}
 	s = &RadiusService{sessions: full}
-	if ip, deny := s.allocateBlockIP(0, k, subs, "l2tp", "reject"); ip != nil || !deny {
+	if ip, deny := s.allocateBlockIP(0, k, subs, "l2tp", "reject", ""); ip != nil || !deny {
 		t.Fatalf("full+reject: got ip=%v deny=%v want nil/true", ip, deny)
 	}
 }

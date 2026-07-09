@@ -12,7 +12,7 @@ import (
 )
 
 // packageManager abstracts the host's package manager. It's used for the one
-// VPN dependency that can't be baked into the x-ui binary — libreswan (the
+// VPN dependency that can't be baked into the vpn-ui binary — libreswan (the
 // IPsec daemon for L2TP/IPsec), whose pluto + NSS crypto don't relocate
 // reliably. Everything else (xl2tpd, openvpn, pptpd, pppd) ships in the binary.
 type packageManager struct {
@@ -109,8 +109,14 @@ func lastNonEmptyLine(s string) string {
 // service. The package is named "libreswan" on every major distro. Stock
 // libreswan works for modern clients (Windows/macOS/iOS/Android); MikroTik and
 // legacy devices that require the MODP1024 DH group need the ALL_ALGS rebuild
-// (handled by setup-vpn-backend.sh), which is out of scope here.
+// (handled by the bundled USE_DH2 libreswan; see ipsec_bundle.go), which is out
+// of scope here.
 func ensureLibreswan() ProvisionStep {
+	// When a libreswan bundle is embedded we run our own USE_DH2 pluto instead of
+	// the host package + systemd — no distro install, no systemd unit.
+	if usingBundledIpsec() {
+		return ensureBundledLibreswan()
+	}
 	var log strings.Builder
 	if !commandExists("ipsec") {
 		pm := detectPackageManager()
@@ -193,10 +199,10 @@ func installLibreswanFromAUR() (string, error) {
 // command output. `ipsec checknss` creates it when absent and is safe to run
 // repeatedly. No-op without ipsec.
 func initIpsecNSS() (string, error) {
-	if !commandExists("ipsec") {
+	if !ipsecAvailable() {
 		return "", nil
 	}
-	out, err := exec.Command("ipsec", "checknss").CombinedOutput()
+	out, err := exec.Command(ipsecCmd(), "checknss").CombinedOutput()
 	return string(out), err
 }
 
@@ -204,6 +210,12 @@ func initIpsecNSS() (string, error) {
 // returning the command output. Uses systemd where present; falls back to the
 // `ipsec start` wrapper otherwise.
 func startIpsecService() string {
+	if usingBundledIpsec() {
+		if err := startBundledPluto(); err != nil {
+			return "\n$ start bundled pluto\n" + err.Error()
+		}
+		return "\n$ start bundled pluto\nok"
+	}
 	if commandExists("systemctl") {
 		out, _ := exec.Command("systemctl", "enable", "--now", "ipsec").CombinedOutput()
 		return "\n$ systemctl enable --now ipsec\n" + string(out)
@@ -218,6 +230,12 @@ func startIpsecService() string {
 // keeps it enabled. Falls back to the `ipsec restart` wrapper when systemd isn't
 // present. Returns the command output for the setup/restart log.
 func restartIpsecService() (string, error) {
+	if usingBundledIpsec() {
+		// procMgr.Start supersedes any running pluto, so this is a restart; it also
+		// re-adds the conn from the (possibly regenerated) /etc/ipsec.conf.
+		err := startBundledPluto()
+		return "\n$ restart bundled pluto\n", err
+	}
 	if commandExists("systemctl") {
 		out, err := exec.Command("systemctl", "restart", "ipsec").CombinedOutput()
 		return "\n$ systemctl restart ipsec\n" + string(out), err
@@ -226,10 +244,26 @@ func restartIpsecService() (string, error) {
 	return "\n$ ipsec restart\n" + string(out), err
 }
 
+// stopIpsecService stops libreswan (ipsec.service). systemd-first with an
+// `ipsec stop` fallback — mirrors restartIpsecService so the ipsec core's Stop
+// button matches the panel's `systemctl is-active ipsec` status view.
+func stopIpsecService() error {
+	if usingBundledIpsec() {
+		return stopBundledPluto()
+	}
+	if commandExists("systemctl") {
+		return exec.Command("systemctl", "stop", "ipsec").Run()
+	}
+	return exec.Command("ipsec", "stop").Run()
+}
+
 // ipsecFailureDiagnostics captures why ipsec.service didn't come up, so the setup
 // console shows the real cause (bad ipsec.conf, missing XFRM/af_key module, NSS,
 // …) instead of a bare "not active". Best-effort and systemd-only.
 func ipsecFailureDiagnostics() string {
+	if usingBundledIpsec() {
+		return procMgr.Logs(ipsecProcName)
+	}
 	if !commandExists("systemctl") {
 		return ""
 	}
@@ -248,10 +282,10 @@ var libreswanVersionRe = regexp.MustCompile(`(\d+)\.(\d+)`)
 // `ipsec --version` (e.g. "Linux Libreswan 3.32 (netkey) on …" → 3, 32). ok is
 // false when ipsec isn't installed or the version can't be parsed.
 func libreswanVersion() (major, minor int, ok bool) {
-	if !commandExists("ipsec") {
+	if !ipsecAvailable() {
 		return 0, 0, false
 	}
-	out, _ := exec.Command("ipsec", "--version").CombinedOutput()
+	out, _ := exec.Command(ipsecCmd(), "--version").CombinedOutput()
 	m := libreswanVersionRe.FindStringSubmatch(string(out))
 	if m == nil {
 		return 0, 0, false

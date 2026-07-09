@@ -185,7 +185,7 @@ func TestCustomGeoDownloadToPath(t *testing.T) {
 	}))
 	defer ts.Close()
 	dir := t.TempDir()
-	t.Setenv("XUI_BIN_FOLDER", dir)
+	t.Setenv("VPNUI_BIN_FOLDER", dir)
 	dest := filepath.Join(dir, "geoip_t.dat")
 	s := CustomGeoService{}
 	skipped, _, err := s.downloadToPath(ts.URL, dest, "")
@@ -219,7 +219,7 @@ func TestCustomGeoDownloadToPath_missingLocalSendsNoIMSFromDB(t *testing.T) {
 	}))
 	defer ts.Close()
 	dir := t.TempDir()
-	t.Setenv("XUI_BIN_FOLDER", dir)
+	t.Setenv("VPNUI_BIN_FOLDER", dir)
 	dest := filepath.Join(dir, "geoip_rebuild.dat")
 	s := CustomGeoService{}
 	skipped, _, err := s.downloadToPath(ts.URL, dest, lm)
@@ -248,7 +248,7 @@ func TestCustomGeoDownloadToPath_repairSkipsConditional(t *testing.T) {
 	}))
 	defer ts.Close()
 	dir := t.TempDir()
-	t.Setenv("XUI_BIN_FOLDER", dir)
+	t.Setenv("VPNUI_BIN_FOLDER", dir)
 	dest := filepath.Join(dir, "geoip_bad.dat")
 	if err := os.WriteFile(dest, make([]byte, minDatBytes-1), 0o644); err != nil {
 		t.Fatal(err)
@@ -279,7 +279,7 @@ func TestCustomGeoFileNameFor(t *testing.T) {
 
 func TestLocalDatFileNeedsRepair(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("XUI_BIN_FOLDER", dir)
+	t.Setenv("VPNUI_BIN_FOLDER", dir)
 	if !localDatFileNeedsRepair(filepath.Join(dir, "missing.dat")) {
 		t.Fatal("missing")
 	}

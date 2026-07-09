@@ -1,6 +1,7 @@
 {{define "modals/inboundModal"}}
 <a-modal id="inbound-modal" v-model="inModal.visible" :title="inModal.title" :dialog-style="{ top: '20px' }"
     @ok="inModal.ok" :confirm-loading="inModal.confirmLoading" :closable="true" :mask-closable="false"
+    :ok-button-props="{ props: { disabled: !modalFormValid } }"
     :class="themeSwitcher.currentTheme" :ok-text="inModal.okText" cancel-text='{{ i18n "close" }}'>
     {{template "form/inbound"}}
 </a-modal>
@@ -197,6 +198,41 @@
             ovpnCbcCiphers() {
                 return Inbound.OpenvpnSettings.CIPHERS_CBC;
             },
+            // ---- live port / cert validation (reactive; no wait for "Add") ----
+            portValidateStatus() {
+                const ib = inModal.inbound;
+                if (!ib) return "";
+                if (ib.protocol === "openvpn" && !(ib.settings && ib.settings.udpEnable)) return "";
+                const p = ib.port;
+                return (Number.isInteger(p) && p >= 1 && p <= 65535) ? "" : "error";
+            },
+            portHelp() {
+                return this.portValidateStatus === "error" ? "Port must be a whole number between 1 and 65535" : "";
+            },
+            tcpPortValidateStatus() {
+                const ib = inModal.inbound;
+                if (!ib || ib.protocol !== "openvpn" || !(ib.settings && ib.settings.tcpEnable)) return "";
+                const p = ib.settings.tcpPort;
+                return (Number.isInteger(p) && p >= 1 && p <= 65535) ? "" : "error";
+            },
+            tcpPortHelp() {
+                return this.tcpPortValidateStatus === "error" ? "Port must be a whole number between 1 and 65535" : "";
+            },
+            // Gate the modal's OK button live: no valid port / no OpenVPN cert -> can't submit.
+            modalFormValid() {
+                const ib = inModal.inbound;
+                if (!ib) return true;
+                const okPort = p => Number.isInteger(p) && p >= 1 && p <= 65535;
+                if (ib.protocol === "openvpn") {
+                    const s = ib.settings || {};
+                    if (!s.udpEnable && !s.tcpEnable) return false;
+                    if (s.udpEnable && !okPort(ib.port)) return false;
+                    if (s.tcpEnable && !okPort(s.tcpPort)) return false;
+                    if (!s.caCert || !s.serverCert) return false;
+                    return true;
+                }
+                return okPort(ib.port);
+            },
         },
         watch: {
             "inModal.inbound.stream.security"(newVal, oldVal) {
@@ -237,6 +273,31 @@
             },
         },
         methods: {
+            // Port inputs: hard digit-only + live cap at the max TCP/UDP port.
+            // blockNonDigit stops any non-digit keystroke from ever entering the
+            // box; sanitizePort strips/caps on change & paste (returns undefined
+            // for empty so the field can be cleared while editing).
+            blockNonDigit(e) {
+                if (e.key && e.key.length === 1 && !/[0-9]/.test(e.key)) {
+                    e.preventDefault();
+                }
+            },
+            sanitizePort(v) {
+                let d = String(v == null ? "" : v).replace(/\D/g, "").slice(0, 5);
+                if (d === "") return undefined;
+                let n = parseInt(d, 10);
+                return n > 65535 ? 65535 : n;
+            },
+            onProtocolChange(protocol) {
+                // Prefill the standard control port for the PPP-based VPN protocols
+                // (L2TP 1701, PPTP 1723) so the operator doesn't have to know them.
+                // Fires only on create — the protocol select is disabled when editing.
+                if (protocol === 'l2tp') {
+                    inModal.inbound.port = 1701;
+                } else if (protocol === 'pptp') {
+                    inModal.inbound.port = 1723;
+                }
+            },
             streamNetworkChange() {
                 if (!inModal.inbound.canEnableTls()) {
                     this.inModal.inbound.stream.security = "none";

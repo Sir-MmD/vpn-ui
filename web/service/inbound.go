@@ -1,4 +1,4 @@
-// Package service provides business logic services for the 3x-ui web panel,
+// Package service provides business logic services for the vpn-ui web panel,
 // including inbound/outbound management, user administration, settings, and Xray integration.
 package service
 
@@ -266,7 +266,49 @@ func isVpnProtocol(p model.Protocol) bool {
 // It validates port uniqueness, client email uniqueness, and required fields,
 // then saves the inbound to the database and optionally adds it to the running Xray instance.
 // Returns the created inbound, whether Xray needs restart, and any error.
+// validateInboundConfig enforces invariants the panel UI is also expected to
+// guard, so an API client (or a stale/buggy frontend) can't persist a bad
+// inbound: a sane TCP/UDP port range, and — for OpenVPN — that a server
+// certificate actually exists before the inbound is created.
+func (s *InboundService) validateInboundConfig(inbound *model.Inbound) error {
+	validPort := func(p int) bool { return p >= 1 && p <= 65535 }
+
+	if inbound.Protocol == "openvpn" {
+		var st struct {
+			TcpEnable  bool   `json:"tcpEnable"`
+			TcpPort    int    `json:"tcpPort"`
+			UdpEnable  bool   `json:"udpEnable"`
+			CaCert     string `json:"caCert"`
+			ServerCert string `json:"serverCert"`
+		}
+		if err := json.Unmarshal([]byte(inbound.Settings), &st); err != nil {
+			return common.NewError("Invalid OpenVPN settings:", err)
+		}
+		if !st.TcpEnable && !st.UdpEnable {
+			return common.NewError("OpenVPN requires at least one of TCP/UDP enabled")
+		}
+		if st.UdpEnable && !validPort(inbound.Port) {
+			return common.NewError("Invalid OpenVPN UDP port (must be 1-65535):", inbound.Port)
+		}
+		if st.TcpEnable && !validPort(st.TcpPort) {
+			return common.NewError("Invalid OpenVPN TCP port (must be 1-65535):", st.TcpPort)
+		}
+		if strings.TrimSpace(st.CaCert) == "" || strings.TrimSpace(st.ServerCert) == "" {
+			return common.NewError("OpenVPN certificate is required: generate or provide a certificate before saving")
+		}
+		return nil
+	}
+
+	if !validPort(inbound.Port) {
+		return common.NewError("Invalid port (must be 1-65535):", inbound.Port)
+	}
+	return nil
+}
+
 func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, bool, error) {
+	if err := s.validateInboundConfig(inbound); err != nil {
+		return inbound, false, err
+	}
 	exist, err := s.checkPortExist(inbound.Listen, inbound.Port, 0)
 	if err != nil {
 		return inbound, false, err
@@ -452,6 +494,9 @@ func (s *InboundService) GetInbound(id int) (*model.Inbound, error) {
 // It validates changes, updates the database, and syncs with the running Xray instance.
 // Returns the updated inbound, whether Xray needs restart, and any error.
 func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, bool, error) {
+	if err := s.validateInboundConfig(inbound); err != nil {
+		return inbound, false, err
+	}
 	exist, err := s.checkPortExist(inbound.Listen, inbound.Port, inbound.Id)
 	if err != nil {
 		return inbound, false, err
@@ -1316,6 +1361,235 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 		needRestart = true
 	}
 	return needRestart, tx.Save(oldInbound).Error
+}
+
+// --- Bulk client operations ---------------------------------------------------
+
+// BulkClientTarget identifies one client (by email, unique within an inbound) that a
+// bulk operation should touch.
+type BulkClientTarget struct {
+	InboundId int    `json:"inboundId"`
+	Email     string `json:"email"`
+}
+
+// BulkClientUpdateRequest describes a bulk operation applied to many clients across
+// many inbounds. Op is one of addDays/subDays/addTraffic/subTraffic/enable/disable.
+// Days is used by the day ops; AmountBytes by the traffic ops.
+type BulkClientUpdateRequest struct {
+	Op            string             `json:"op"`
+	Days          int64              `json:"days"`
+	AmountBytes   int64              `json:"amountBytes"`
+	SkipFirstUse  bool               `json:"skipFirstUse"`
+	SkipUnlimited bool               `json:"skipUnlimited"`
+	SkipDisabled  bool               `json:"skipDisabled"`
+	Targets       []BulkClientTarget `json:"targets"`
+}
+
+// BulkClientUpdateResult reports how many targeted clients were changed vs skipped
+// (by a skip toggle, a no-op op, or because the client wasn't found).
+type BulkClientUpdateResult struct {
+	Applied int `json:"applied"`
+	Skipped int `json:"skipped"`
+}
+
+const bulkMsPerDay = int64(86400000)
+
+// bulkNumToInt64 coerces a JSON-decoded numeric field (float64 by default) to int64.
+func bulkNumToInt64(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case json.Number:
+		i, _ := n.Int64()
+		return i
+	}
+	return 0
+}
+
+// BulkUpdateClients applies one operation to every targeted client, honouring the
+// skip toggles. It mutates each affected inbound's settings JSON in place and saves
+// it inside a single transaction. Returns the applied/skipped counts and the set of
+// protocols touched, so the caller can regenerate the right subsystems once.
+func (s *InboundService) BulkUpdateClients(req BulkClientUpdateRequest) (BulkClientUpdateResult, map[string]bool, error) {
+	result := BulkClientUpdateResult{}
+	touched := map[string]bool{}
+
+	switch req.Op {
+	case "addDays", "subDays", "addTraffic", "subTraffic", "enable", "disable":
+	default:
+		return result, touched, common.NewError("unknown bulk operation:", req.Op)
+	}
+
+	// Group targeted emails by inbound so each inbound is loaded and saved once.
+	byInbound := map[int]map[string]bool{}
+	for _, t := range req.Targets {
+		if t.Email == "" {
+			continue
+		}
+		if byInbound[t.InboundId] == nil {
+			byInbound[t.InboundId] = map[string]bool{}
+		}
+		byInbound[t.InboundId][t.Email] = true
+	}
+
+	now := time.Now().Unix() * 1000
+	db := database.GetDB()
+	tx := db.Begin()
+	var err error
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		} else {
+			tx.Commit()
+		}
+	}()
+
+	for inboundId, emails := range byInbound {
+		var inbound *model.Inbound
+		inbound, err = s.GetInbound(inboundId)
+		if err != nil {
+			return result, touched, err
+		}
+		var settings map[string]any
+		if err = json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
+			return result, touched, err
+		}
+		clientsAny, ok := settings["clients"].([]any)
+		if !ok {
+			continue
+		}
+		changed := false
+		for i := range clientsAny {
+			cm, ok := clientsAny[i].(map[string]any)
+			if !ok {
+				continue
+			}
+			email, _ := cm["email"].(string)
+			if email == "" || !emails[email] {
+				continue
+			}
+			if applyBulkClientOp(cm, req, now) {
+				cm["updated_at"] = now
+				clientsAny[i] = cm
+				changed = true
+				result.Applied++
+				// Keep the enforcement table (client_traffics) in sync with the new
+				// limit/expiry/enable. The auto-disable check (disableInvalidClients)
+				// reads client_traffics.total/expiry_time/enable, and those are
+				// otherwise only written by add/updateClient — NOT by a whole-inbound
+				// save — so without this a bulk limit/expiry change would be cosmetic.
+				if e := tx.Model(&xray.ClientTraffic{}).Where("email = ?", email).
+					Updates(map[string]any{
+						"enable":      cm["enable"],
+						"total":       bulkNumToInt64(cm["totalGB"]),
+						"expiry_time": bulkNumToInt64(cm["expiryTime"]),
+					}).Error; e != nil {
+					err = e
+					return result, touched, err
+				}
+			} else {
+				result.Skipped++
+			}
+		}
+		if !changed {
+			continue
+		}
+		settings["clients"] = clientsAny
+		var newSettings []byte
+		if newSettings, err = json.MarshalIndent(settings, "", "  "); err != nil {
+			return result, touched, err
+		}
+		inbound.Settings = string(newSettings)
+		if err = tx.Save(inbound).Error; err != nil {
+			return result, touched, err
+		}
+		touched[string(inbound.Protocol)] = true
+	}
+	return result, touched, nil
+}
+
+// applyBulkClientOp mutates one client map per the request, returning false when the
+// skip toggles exclude it or the op is a no-op for that client. Semantics:
+//   - addDays/subDays adjust expiryTime: >0 absolute (ms), <0 delayed "start after
+//     first use" (grow the delay when adding), ==0 no expiry (addDays anchors from now).
+//   - subTraffic floors totalGB at 1 byte so a subtract never flips a limited account
+//     to unlimited (totalGB==0 means unlimited).
+func applyBulkClientOp(cm map[string]any, req BulkClientUpdateRequest, now int64) bool {
+	expiry := bulkNumToInt64(cm["expiryTime"])
+	total := bulkNumToInt64(cm["totalGB"])
+	enable, _ := cm["enable"].(bool)
+
+	if req.SkipFirstUse && expiry < 0 {
+		return false
+	}
+	if req.SkipDisabled && !enable {
+		return false
+	}
+	if req.SkipUnlimited {
+		switch req.Op {
+		case "addTraffic", "subTraffic":
+			if total == 0 {
+				return false
+			}
+		case "addDays", "subDays":
+			if expiry == 0 {
+				return false
+			}
+		}
+	}
+
+	switch req.Op {
+	case "addDays":
+		ms := req.Days * bulkMsPerDay
+		if expiry > 0 {
+			expiry += ms
+		} else if expiry < 0 {
+			expiry -= ms
+		} else {
+			expiry = now + ms
+		}
+		cm["expiryTime"] = expiry
+	case "subDays":
+		if expiry == 0 {
+			return false // nothing to shorten on a no-expiry account
+		}
+		ms := req.Days * bulkMsPerDay
+		if expiry > 0 {
+			expiry -= ms
+		} else { // delayed start: shrink the delay, clamped at 0
+			expiry += ms
+			if expiry > 0 {
+				expiry = 0
+			}
+		}
+		cm["expiryTime"] = expiry
+	case "addTraffic":
+		cm["totalGB"] = total + req.AmountBytes
+	case "subTraffic":
+		if total <= 0 {
+			return false // unlimited: nothing to subtract
+		}
+		total -= req.AmountBytes
+		if total < 1 {
+			total = 1
+		}
+		cm["totalGB"] = total
+	case "enable":
+		if enable {
+			return false
+		}
+		cm["enable"] = true
+	case "disable":
+		if !enable {
+			return false
+		}
+		cm["enable"] = false
+	}
+	return true
 }
 
 func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraffics []*xray.ClientTraffic) (error, bool, []string, []string, []string) {

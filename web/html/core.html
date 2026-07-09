@@ -7,6 +7,7 @@
   <a-layout id="content-layout">
     <a-layout-content>
       <a-spin :spinning="spinning" :delay="300" tip='{{ i18n "loading"}}' size="large">
+        <transition name="list" appear>
         <a-row :gutter="[16, 16]" :style="{ margin: 0 }">
 
           <!-- Header -->
@@ -102,17 +103,17 @@
                   <div class="core-kv-list">
                     <div class="core-kv">
                       <span class="core-kv-label">{{ i18n "pages.core.version" }}</span>
-                      <span class="core-kv-value">[[ core.version || '—' ]]</span>
+                      <span class="core-kv-value">[[ core.version || '—' ]]
+                        <a-tooltip v-if="core.name === 'xray'" title='{{ i18n "pages.index.xrayCoreLocked" }}'>
+                          <a-tag color="blue" :style="{ marginInlineStart: '6px' }">
+                            <a-icon type="lock"></a-icon> {{ i18n "pages.index.coreLockedTag" }}
+                          </a-tag>
+                        </a-tooltip>
+                      </span>
                     </div>
-                    <div class="core-kv" v-if="core.name !== 'xray' && core.name !== 'radius'">
+                    <div class="core-kv" v-if="core.name !== 'xray' && core.name !== 'radius' && core.name !== 'ipsec'">
                       <span class="core-kv-label">{{ i18n "pages.core.inbounds" }}</span>
                       <span class="core-kv-value">[[ core.inbounds ]]</span>
-                    </div>
-                    <div class="core-kv" v-if="core.extra && core.extra.ipsec !== undefined">
-                      <span class="core-kv-label">IPsec</span>
-                      <span class="core-kv-value" :class="core.extra.ipsec ? 'core-value-ok' : 'core-value-warn'">
-                        [[ core.extra.ipsec ? '{{ i18n "pages.core.stateRunning" }}' : '{{ i18n "pages.core.stateStopped" }}' ]]
-                      </span>
                     </div>
                   </div>
 
@@ -209,6 +210,7 @@
           </a-col>
 
         </a-row>
+        </transition>
       </a-spin>
     </a-layout-content>
   </a-layout>
@@ -225,7 +227,7 @@
       <div class="setup-modal-head-title">[[ provisionTitle() ]]</div>
     </div>
 
-    <div class="term">
+    <div class="term term--setup">
       <div class="term-bar">
         <a-icon type="code" class="term-bar-icon"></a-icon>
         <span class="term-bar-title">vpn-ui — {{ i18n "pages.core.consoleTitle" }}</span>
@@ -233,38 +235,36 @@
       </div>
       <div class="term-progress">
         <div class="term-progress-bar"
-          :class="{ indeterminate: provisionRunning, warn: !provisionRunning && rebootRequired, done: !provisionRunning && provisionDone && !rebootRequired }"></div>
+          :class="{ warn: !provisionRunning && rebootRequired, done: !provisionRunning && provisionDone && !rebootRequired }"
+          :style="{ width: provProgress() + '%' }"></div>
       </div>
       <div class="term-body" ref="term">
-        <!-- One row per step. Steps that captured command output (package
-             installs, modprobe errors, …) are clickable to expand that log. -->
+        <!-- One row per step: leading ✓/!/✗ glyph, name, detail, timestamp on the
+             right. Rows that captured command output are clickable to expand it. -->
         <div v-for="(item, i) in provisionResult" :key="i" class="term-step">
           <div class="term-line" :class="[lineClass(item), item.log ? 'term-clickable' : '']"
             @click="item.log && toggleStep(i)"
             :title="item.log ? (expanded[i] ? '{{ i18n "pages.core.hideLog" }}' : '{{ i18n "pages.core.showLog" }}') : ''">
-            <span class="term-ts">[[ item.ts ]]</span>
             <span class="term-glyph">[[ glyph(item) ]]</span>
             <span class="term-name">[[ item.name ]]</span>
             <span class="term-msg" v-if="item.msg">[[ item.msg ]]</span>
             <a-icon v-if="item.log" :type="expanded[i] ? 'up' : 'down'" class="term-toggle"></a-icon>
+            <span class="term-ts">[[ item.ts ]]</span>
           </div>
           <pre v-if="item.log && expanded[i]" class="term-steplog">[[ item.log ]]</pre>
         </div>
 
-        <!-- Live activity line: names the step currently in progress. -->
-        <div v-if="provisionRunning" class="term-line term-running">
-          <span class="term-ts">[[ nowStamp ]]</span>
-          <span class="term-glyph">›</span>
-          <span class="term-name">
-            {{ i18n "pages.core.setupRunning" }}<template v-if="currentStep()"> — [[ currentStep() ]]</template>
-          </span>
-          <span class="term-cursor"></span>
+        <!-- Running: percent + ETA + step in flight (the bar is the strip above). -->
+        <div v-if="provisionRunning" class="term-status">
+          <span class="term-pct">[[ provProgress() ]]%</span>
+          <span class="term-eta" v-if="etaText()">ETA [[ etaText() ]]</span>
+          <span class="term-cur" v-if="currentStep()">⟳ [[ currentStep() ]]</span>
         </div>
 
-        <div v-if="!provisionRunning && provisionDone && !rebootRequired" class="term-line term-ok">
-          <span class="term-ts">[[ nowStamp ]]</span>
-          <span class="term-glyph">✓</span>
-          <span class="term-name">{{ i18n "pages.core.setupDone" }}</span>
+        <!-- Done: ✓/!/✗ tally + how long it took. -->
+        <div v-if="!provisionRunning && provisionDone" class="term-status term-status-done">
+          <span class="term-summary">[[ provSummary() ]]</span>
+          <span class="term-elapsed" v-if="elapsedText()">· [[ elapsedText() ]]</span>
         </div>
       </div>
     </div>
@@ -357,6 +357,9 @@
       provisionResult: [],
       provStamps: [],
       nowStamp: '',
+      provStartMs: 0,
+      provEndMs: 0,
+      nowMs: 0,
       expanded: {},
       provTimer: null,
       rebootRequired: false,
@@ -444,6 +447,9 @@
         this.rebootPkg = '';
         this.provisionRunning = true;
         this.provisionVisible = true;
+        this.provStartMs = Date.now();
+        this.provEndMs = 0;
+        this.nowMs = this.provStartMs;
         this.tick();
         const msg = await HttpUtil.post('/panel/core/provision');
         if (msg && msg.success && msg.obj) {
@@ -463,6 +469,7 @@
             this.applyReboot(msg.obj);
             this.tick();
             if (!msg.obj.running) {
+              this.provEndMs = Date.now();
               this.provisioned = !!msg.obj.provisioned;
               await this.loadStatus(false);
               this.$nextTick(() => this.scrollTerm());
@@ -498,6 +505,7 @@
       },
       tick() {
         this.nowStamp = this.tsNow();
+        this.nowMs = Date.now();
       },
       glyph(item) {
         if (!item.ok) return '✗';
@@ -508,6 +516,48 @@
         if (!item.ok) return 'term-err';
         if (item.warn) return 'term-warn';
         return 'term-ok';
+      },
+      // etaText estimates the time left from the average step duration so far ×
+      // an estimated remaining count. The total is host-dependent (unknown up
+      // front), so it is a moving estimate that shrinks toward the end. Empty
+      // until at least one step has finished.
+      etaText() {
+        const done = this.provisionResult.length;
+        if (!done || !this.provStartMs || !this.nowMs) return '';
+        const elapsed = (this.nowMs - this.provStartMs) / 1000;
+        if (elapsed <= 0) return '';
+        const est = Math.max(20, done + 2);
+        const eta = Math.round((elapsed / done) * Math.max(0, est - done));
+        return eta > 0 ? eta + 's' : '';
+      },
+      // elapsedText is the wall-clock the finished run took.
+      elapsedText() {
+        if (!this.provStartMs) return '';
+        const end = this.provEndMs || this.nowMs;
+        const s = Math.round((end - this.provStartMs) / 1000);
+        return s > 0 ? 'done in ' + s + 's' : '';
+      },
+      // The provisioning step count is host-dependent and unknown in advance, so
+      // the bar runs off a smooth estimate that always keeps a little headroom and
+      // never overflows; it snaps to 100% only once the run is actually done.
+      provProgress() {
+        if (this.provisionDone && !this.provisionRunning) return 100;
+        const done = this.provisionResult.length;
+        const est = Math.max(20, done + 2);
+        return Math.min(96, Math.round((done / est) * 100));
+      },
+      // provSummary is a language-neutral ✓/!/✗ tally for the completed line,
+      // matching glyph() precedence (a not-ok step counts as an error even if it
+      // also set warn).
+      provSummary() {
+        const r = this.provisionResult;
+        const err = r.filter((s) => !s.ok).length;
+        const warn = r.filter((s) => s.ok && s.warn).length;
+        const ok = r.length - err - warn;
+        let out = '✓ ' + ok;
+        if (warn) out += '   ! ' + warn;
+        if (err) out += '   ✗ ' + err;
+        return out;
       },
       okCount() {
         return this.provisionResult.filter((s) => s.ok).length;
@@ -568,10 +618,10 @@
         this.reconnectTimer = setTimeout(probe, 20000);
       },
       coreTitle(name) {
-        return ({ xray: 'Xray', l2tp: 'L2TP / IPsec', pptp: 'PPTP', openvpn: 'OpenVPN', radius: 'RADIUS' })[name] || name;
+        return ({ xray: 'Xray', l2tp: 'L2TP', ipsec: 'IPsec (libreswan)', pptp: 'PPTP', openvpn: 'OpenVPN', radius: 'RADIUS' })[name] || name;
       },
       coreIcon(name) {
-        return ({ xray: 'tool', l2tp: 'lock', pptp: 'api', openvpn: 'safety-certificate', radius: 'key' })[name] || 'appstore';
+        return ({ xray: 'tool', l2tp: 'lock', ipsec: 'security-scan', pptp: 'api', openvpn: 'safety-certificate', radius: 'key' })[name] || 'appstore';
       },
       stateText(state) {
         return ({
@@ -911,7 +961,7 @@
   }
 
   .term-progress {
-    height: 3px;
+    height: 5px;
     background: rgba(255, 255, 255, 0.06);
     overflow: hidden;
   }
@@ -920,22 +970,11 @@
     height: 100%;
     width: 0;
     background: #1890ff;
-    transition: width 0.3s ease;
+    transition: width 0.4s ease;
   }
 
-  .term-progress-bar.done { width: 100%; background: #27c93f; }
-  .term-progress-bar.warn { width: 100%; background: #faad14; }
-
-  .term-progress-bar.indeterminate {
-    width: 35%;
-    border-radius: 3px;
-    animation: term-slide 1.2s ease-in-out infinite;
-  }
-
-  @keyframes term-slide {
-    0% { margin-left: -35%; }
-    100% { margin-left: 100%; }
-  }
+  .term-progress-bar.done { background: #27c93f; }
+  .term-progress-bar.warn { background: #faad14; }
 
   .term-body {
     max-height: 46vh;
@@ -1020,6 +1059,28 @@
   }
 
   @keyframes term-blink { 50% { opacity: 0; } }
+
+  /* ---- setup provisioning console (scoped so shared WARP/systemd consoles,
+     which reuse .term-line/.term-name, are left alone) ------------------------ */
+  .term--setup .term-name { font-weight: 600; }
+  .term--setup .term-msg { flex: 1 1 auto; min-width: 0; }
+  .term--setup .term-ts { margin-left: auto; }   /* timestamp pinned to the right */
+
+  /* status footer: percent + ETA + current step (running), or tally + elapsed (done) */
+  .term-status {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px dashed rgba(255, 255, 255, 0.08);
+    font-variant-numeric: tabular-nums;
+  }
+  .term-pct { color: #58a6ff; font-weight: 700; }
+  .term-eta { color: #8b949e; }
+  .term-cur { flex: 1 1 auto; min-width: 0; color: #58a6ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .term-status-done .term-summary { color: #c9d1d9; font-weight: 600; letter-spacing: .5px; }
+  .term-status-done .term-elapsed { color: #8b949e; }
 
   /* Reboot-required explainer (inside the setup modal) */
   .reboot-panel {

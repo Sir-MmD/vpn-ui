@@ -50,6 +50,7 @@ func (a *ServerController) initRouter(g *gin.RouterGroup) {
 	g.GET("/getNewmldsa65", a.getNewmldsa65)
 	g.GET("/getNewmlkem768", a.getNewmlkem768)
 	g.GET("/getNewVlessEnc", a.getNewVlessEnc)
+	g.GET("/distroStatus", a.distroStatus)
 
 	g.POST("/stopXrayService", a.stopXrayService)
 	g.POST("/restartXrayService", a.restartXrayService)
@@ -86,6 +87,18 @@ func (a *ServerController) startTask() {
 
 // status returns the current server status information.
 func (a *ServerController) status(c *gin.Context) { jsonObj(c, a.lastStatus, nil) }
+
+// distroStatus reports whether the running host distro is on vpn-ui's tested list,
+// for the dashboard's unsupported-distro warning modal.
+func (a *ServerController) distroStatus(c *gin.Context) {
+	supported, pretty, reason := service.DistroSupported()
+	jsonObj(c, gin.H{
+		"supported": supported,
+		"pretty":    pretty,
+		"reason":    reason,
+		"tested":    service.SupportedDistroSummary(),
+	}, nil)
+}
 
 // getCpuHistoryBucket retrieves aggregated CPU usage history based on the specified time bucket.
 func (a *ServerController) getCpuHistoryBucket(c *gin.Context) {

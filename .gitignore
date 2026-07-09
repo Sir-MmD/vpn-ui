@@ -41,8 +41,24 @@ docker-compose.override.yml
 # Local build artifact + agent config (never commit)
 /vpn-ui
 /vpn-ui.bak.*
+/build/out/
 .claude/
 
 # caveman plugin tooling (not project code)
 .agents/
 skills-lock.json
+
+# Bundled Xray core + base geo files (built by build/core/build.sh, embedded via
+# go:embed at build time) — large artifacts, never commit them.
+corebundle/core/*
+!corebundle/core/.gitkeep
+
+# Runtime state + local working dirs (regenerate on run/test — never commit).
+# vpn-ui.db holds panel credentials; the old x-ui.db rule missed it post-rebrand.
+/vpn-ui.db
+/bino/
+/host_logs/
+/test_unit/test_subject/
+/test_unit/results/
+__pycache__/
+*.pyc

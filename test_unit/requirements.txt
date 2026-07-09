@@ -1,0 +1,2 @@
+# TOML config is read with the stdlib tomllib (py3.11+); no PyYAML needed.
+requests>=2.28

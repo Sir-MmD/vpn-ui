@@ -65,7 +65,7 @@ func (s *SystemdService) GetServiceName() string {
 func DefaultUnit(name string) string {
 	exe, err := os.Executable()
 	if err != nil || exe == "" {
-		exe = "/usr/local/x-ui/x-ui"
+		exe = "/usr/local/vpn-ui/vpn-ui"
 	}
 	return fmt.Sprintf(`[Unit]
 Description=%s panel service
@@ -193,6 +193,28 @@ func (s *SystemdService) SaveService(req SaveServiceRequest) error {
 		}
 	} else {
 		_, _ = systemctl("stop", name)
+	}
+	return nil
+}
+
+// RemoveService stops, disables and removes the named panel unit, then reloads
+// systemd. Best-effort: it attempts every step regardless of individual
+// failures (the unit may be half-installed or already gone) and returns the
+// unit-file removal error only when it's something other than "not found".
+// This is the standalone teardown counterpart to SaveService and is used by the
+// `--uninstall` path. Safe to call for a unit that was started outside this
+// process (`disable --now` stops that unit's own PID, not the caller).
+func (s *SystemdService) RemoveService(name string) error {
+	name = sanitizeServiceName(name)
+	if commandExists("systemctl") {
+		_, _ = systemctl("disable", "--now", name)
+	}
+	err := os.Remove(unitPath(name))
+	if commandExists("systemctl") {
+		_, _ = systemctl("daemon-reload")
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	return nil
 }

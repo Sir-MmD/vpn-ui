@@ -1,5 +1,5 @@
 // Package backend bundles the VPN daemon binaries (xl2tpd, and later
-// openvpn/libreswan/pppd) directly into the x-ui executable via go:embed and
+// openvpn/libreswan/pppd) directly into the vpn-ui executable via go:embed and
 // extracts them at runtime. This lets the panel "bake in" the backend instead
 // of installing daemons per-distro through the host package manager.
 //
@@ -40,7 +40,7 @@ var Daemons = []Daemon{
 
 // PptpCtrlLink is the fixed path pptpd was compiled to exec pptpctrl from
 // (--sbindir sentinel). Provisioning symlinks it to the extracted pptpctrl so
-// the bundle works regardless of where x-ui is installed.
+// the bundle works regardless of where vpn-ui is installed.
 const PptpCtrlLink = "/usr/libexec/vpn-ui/pptpctrl"
 
 // archDir is the embedded sub-directory for the running architecture.
@@ -61,12 +61,12 @@ func Available() bool {
 }
 
 // BinDir is the absolute directory where daemons are extracted — next to the
-// x-ui executable, so it adapts to any install location (/usr/local/x-ui,
-// /usr/lib/x-ui, …).
+// vpn-ui executable, so it adapts to any install location (/usr/local/vpn-ui,
+// /usr/lib/vpn-ui, …).
 func BinDir() string {
 	exe, err := os.Executable()
 	if err != nil {
-		return "/usr/local/x-ui/backend/bin"
+		return "/usr/local/vpn-ui/backend/bin"
 	}
 	return filepath.Join(filepath.Dir(exe), "backend", "bin")
 }

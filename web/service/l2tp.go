@@ -20,7 +20,7 @@ import (
 type L2tpService struct {
 	inboundService InboundService
 	nftService     NftService
-	radiusService  RadiusService
+	radiusService  *RadiusService
 	radiusSecret   string
 }
 
@@ -50,7 +50,7 @@ type l2tpClient struct {
 }
 
 // SetRadius configures the RADIUS service and shared secret for L2TP authentication.
-func (s *L2tpService) SetRadius(rs RadiusService, secret string) {
+func (s *L2tpService) SetRadius(rs *RadiusService, secret string) {
 	s.radiusService = rs
 	s.radiusSecret = secret
 }
@@ -151,27 +151,39 @@ func (s *L2tpService) GenerateAllConfigs() error {
 	if err := s.GenerateIPsecConfig(inbounds); err != nil {
 		return err
 	}
-	radiusSecret := s.getRadiusSecret()
-	for _, inbound := range inbounds {
-		if err := s.GeneratePPPOptions(inbound); err != nil {
+	// One shared xl2tpd LNS serves every inbound, so the PPP options + radcli
+	// config are written ONCE for the whole protocol (not per inbound). Link
+	// options (DNS/MTU) come from the first inbound.
+	cleanupLegacyPerInboundFiles("options.xl2tpd", "l2tp")
+	if err := s.GeneratePPPOptions(inbounds[0]); err != nil {
+		return err
+	}
+	if radiusSecret := s.getRadiusSecret(); radiusSecret != "" {
+		if err := GenerateRadiusClientConfig("l2tp", radiusSecret); err != nil {
 			return err
-		}
-		if radiusSecret != "" {
-			if err := GenerateRadiusClientConfig("l2tp", inbound.Id, radiusSecret); err != nil {
-				return err
-			}
 		}
 	}
 
 	return nil
 }
 
-// GenerateXl2tpdConfig writes /etc/xl2tpd/xl2tpd.conf with one [lns] section per L2TP inbound.
+// GenerateXl2tpdConfig writes /etc/xl2tpd/xl2tpd.conf. xl2tpd is a single daemon
+// bound to one UDP port (1701) and serves only ONE effective LNS — two [lns …]
+// sections on the same port collide (the panel used to emit one per inbound, all
+// named "default", so only the last inbound worked). So ALL L2TP inbounds now share
+// a SINGLE [lns default]: every inbound's IP range is listed, and the actual
+// per-client IP is pinned by RADIUS (Framed-IP-Address), which resolves the account
+// to its own inbound's pool. A single shared PPP options file carries a
+// protocol-level nas_identifier (see GeneratePPPOptions).
 func (s *L2tpService) GenerateXl2tpdConfig(inbounds []*model.Inbound) error {
 	var b strings.Builder
 	b.WriteString("[global]\n")
 	b.WriteString("port = 1701\n\n")
+	b.WriteString("[lns default]\n")
 
+	// The PPP gateway (local ip) is the first inbound's first range .1; per-link /32
+	// point-to-point addressing means one gateway serves every client /24.
+	localIp := ""
 	for _, inbound := range inbounds {
 		settings, err := s.parseSettings(inbound)
 		if err != nil {
@@ -184,31 +196,37 @@ func (s *L2tpService) GenerateXl2tpdConfig(inbounds []*model.Inbound) error {
 			subnet := s.GetSubnetForInbound(inbound)
 			ranges = []string{defaultRange(subnet)}
 		}
-		// The PPP gateway (local ip) is the first range's .1; per-link /32
-		// point-to-point addressing means one gateway serves all client /24s.
-		localIp := settings.LocalIp
-		if start, _, ok := parseRange(ranges[0]); ok {
-			localIp = fmt.Sprintf("%d.%d.%d.1", start[0], start[1], start[2])
-		}
-
-		b.WriteString("[lns default]\n")
 		// xl2tpd accepts multiple `ip range` lines; each range's client IP is then
 		// pinned deterministically by RADIUS (Framed-IP-Address).
 		for _, r := range ranges {
 			b.WriteString(fmt.Sprintf("ip range = %s\n", r))
 		}
-		b.WriteString(fmt.Sprintf("local ip = %s\n", localIp))
-		b.WriteString("require authentication = yes\n")
-		b.WriteString(fmt.Sprintf("name = l2tp-%d\n", inbound.Id))
-		b.WriteString(fmt.Sprintf("pppoptfile = /etc/ppp/options.xl2tpd-%d\n", inbound.Id))
-		b.WriteString("length bit = yes\n")
-		b.WriteString("flow bit = yes\n\n")
+		if localIp == "" {
+			localIp = settings.LocalIp
+			if start, _, ok := parseRange(ranges[0]); ok {
+				localIp = fmt.Sprintf("%d.%d.%d.1", start[0], start[1], start[2])
+			}
+		}
 	}
+	if localIp == "" {
+		localIp = "10.0.2.1"
+	}
+
+	b.WriteString(fmt.Sprintf("local ip = %s\n", localIp))
+	b.WriteString("require authentication = yes\n")
+	b.WriteString("name = l2tp\n")
+	b.WriteString("pppoptfile = /etc/ppp/options.xl2tpd\n")
+	b.WriteString("length bit = yes\n")
+	b.WriteString("flow bit = yes\n\n")
 
 	return s.writeFile("/etc/xl2tpd/xl2tpd.conf", b.String())
 }
 
-// GeneratePPPOptions writes per-inbound PPP options file.
+// GeneratePPPOptions writes the single shared PPP options file
+// /etc/ppp/options.xl2tpd used by the one xl2tpd LNS for every L2TP inbound. It
+// carries a protocol-level name + RADIUS config (nas_identifier "l2tp"); the RADIUS
+// server maps each account to its inbound by username. DNS/MTU are taken from the
+// representative (first) inbound — all L2TP inbounds share these link options.
 func (s *L2tpService) GeneratePPPOptions(inbound *model.Inbound) error {
 	settings, err := s.parseSettings(inbound)
 	if err != nil {
@@ -229,7 +247,7 @@ func (s *L2tpService) GeneratePPPOptions(inbound *model.Inbound) error {
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("name l2tp-%d\n", inbound.Id))
+	b.WriteString("name l2tp\n")
 	b.WriteString("refuse-pap\n")
 	b.WriteString("refuse-chap\n")
 	b.WriteString("require-mschap-v2\n")
@@ -251,9 +269,9 @@ func (s *L2tpService) GeneratePPPOptions(inbound *model.Inbound) error {
 	b.WriteString(fmt.Sprintf("mru %d\n", mtu))
 	b.WriteString("nodefaultroute\n")
 	b.WriteString("plugin radius.so\n")
-	b.WriteString(fmt.Sprintf("radius-config-file /etc/ppp/radius/l2tp-%d.conf\n", inbound.Id))
+	b.WriteString("radius-config-file /etc/ppp/radius/l2tp.conf\n")
 
-	return s.writeFile(fmt.Sprintf("/etc/ppp/options.xl2tpd-%d", inbound.Id), b.String())
+	return s.writeFile("/etc/ppp/options.xl2tpd", b.String())
 }
 
 // getDisabledEmails returns a set of client emails that are disabled in the
@@ -314,7 +332,7 @@ func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 	keyexchangeV1 := lsOK && lsMajor >= 5
 
 	var b strings.Builder
-	b.WriteString("# Auto-generated by 3x-ui L2TP service — do not edit\n")
+	b.WriteString("# Auto-generated by vpn-ui L2TP service — do not edit\n")
 	b.WriteString("config setup\n")
 	b.WriteString("    uniqueids=no\n")
 	b.WriteString("    logfile=/var/log/pluto.log\n")
@@ -324,6 +342,13 @@ func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 	b.WriteString("\n")
 	b.WriteString("conn l2tp-psk\n")
 	b.WriteString("    auto=add\n")
+	// The bundled pluto can't find `ipsec` on its PATH, so the default
+	// `leftupdown=ipsec _updown` fails and the IPsec SA never installs (breaking
+	// real L2TP/IPsec, esp. a 2nd concurrent client). Point it at the absolute
+	// bundle path. Host libreswan has `ipsec` on PATH, so it keeps the default.
+	if usingBundledIpsec() {
+		b.WriteString(fmt.Sprintf("    leftupdown=%q\n", bundledIpsecUpdown()))
+	}
 	b.WriteString("    leftprotoport=17/1701\n")
 	b.WriteString("    rightprotoport=17/%any\n")
 	b.WriteString("    type=transport\n")
@@ -343,7 +368,7 @@ func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 	// only present in an ALL_ALGS=true build. Libreswan rejects the WHOLE
 	// connection if the proposal names a group it doesn't support, so modp1024
 	// is appended only when the installed Libreswan actually has it — otherwise
-	// stock/distro Libreswan (which x-ui setup installs) fails to load the conn.
+	// stock/distro Libreswan (which vpn-ui setup installs) fails to load the conn.
 	ike := "aes256-sha2;modp2048,aes128-sha2;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048,3des-sha1;modp2048," +
 		"aes256-sha2;modp1536,aes128-sha2;modp1536,aes256-sha1;modp1536,aes128-sha1;modp1536,3des-sha1;modp1536,3des-md5;modp1536," +
 		"aes256-sha2;dh20,aes256-sha2;dh19,aes128-sha2;dh19"
@@ -381,6 +406,12 @@ func (s *L2tpService) GenerateIPsecConfig(inbounds []*model.Inbound) error {
 // aborts (and thus reports "not supported") if the NSS DB isn't initialized,
 // which safely errs toward dropping modp1024.
 func ipsecSupportsModp1024() bool {
+	// The bundled libreswan is built USE_DH2=true, so MODP1024 is always present —
+	// and asserting it here avoids running pluto --selftest before its NSS db is
+	// initialized (which would abort and wrongly report "no MODP1024").
+	if usingBundledIpsec() {
+		return true
+	}
 	out, _ := exec.Command("ipsec", "pluto", "--selftest").CombinedOutput()
 	return strings.Contains(strings.ToUpper(string(out)), "MODP1024")
 }
@@ -442,16 +473,24 @@ func (s *L2tpService) RestartServices() error {
 			if err := s.GenerateIPsecConfig(inbounds); err != nil {
 				logger.Warning("L2TP: failed to regenerate ipsec.conf:", err)
 			}
-			// Ensure the NSS db exists (fresh Ubuntu/Libreswan 5.x omits it, which
-			// makes ipsec.service's checknss pre-check fail) and the service is
-			// enabled for boot, then (re)start it via systemd so the unit state is
-			// accurate. Libreswan reads /etc/ipsec.conf on restart automatically.
-			_, _ = initIpsecNSS()
-			if commandExists("systemctl") {
-				_ = exec.Command("systemctl", "enable", "ipsec").Run()
-			}
-			if out, err := restartIpsecService(); err != nil {
-				logger.Warning("L2TP: failed to restart ipsec:", err, strings.TrimSpace(out))
+			if usingBundledIpsec() {
+				// Run our own USE_DH2 pluto as a supervised child: checknss, start
+				// pluto foreground, then load the conn (see startBundledPluto).
+				if err := startBundledPluto(); err != nil {
+					logger.Warning("L2TP: failed to start bundled pluto:", err)
+				}
+			} else {
+				// Host libreswan: ensure the NSS db exists (fresh Ubuntu/Libreswan 5.x
+				// omits it, breaking ipsec.service's checknss pre-check) and the unit is
+				// enabled for boot, then (re)start via systemd so the unit state is
+				// accurate. Libreswan reads /etc/ipsec.conf on restart automatically.
+				_, _ = initIpsecNSS()
+				if commandExists("systemctl") {
+					_ = exec.Command("systemctl", "enable", "ipsec").Run()
+				}
+				if out, err := restartIpsecService(); err != nil {
+					logger.Warning("L2TP: failed to restart ipsec:", err, strings.TrimSpace(out))
+				}
 			}
 			break
 		}
@@ -512,7 +551,7 @@ func (s *L2tpService) KillDisabledSessions() {
 		}
 	}
 
-	if len(disabled) > 0 {
+	if len(disabled) > 0 && s.radiusService != nil {
 		s.radiusService.KillSessionsByEmail(disabled)
 	}
 }
@@ -529,7 +568,9 @@ func (s *L2tpService) DisableClients(emails []string) {
 		emailSet[e] = true
 	}
 
-	s.radiusService.KillSessionsByEmail(emailSet)
+	if s.radiusService != nil {
+		s.radiusService.KillSessionsByEmail(emailSet)
+	}
 }
 
 func (s *L2tpService) writeFile(path, content string) error {

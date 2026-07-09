@@ -1,13 +1,11 @@
 package service
 
 import (
-	"archive/zip"
 	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -195,6 +193,30 @@ type LogEntry struct {
 	Event       int
 }
 
+// publicIPv4Services are the endpoints tried in order to discover the server's
+// public IPv4 (first non-"N/A" wins). Shared by the dashboard status poll and
+// the CLI URL printout so both resolve the IP the same way.
+var publicIPv4Services = []string{
+	"https://api4.ipify.org",
+	"https://ipv4.icanhazip.com",
+	"https://v4.api.ipinfo.io/ip",
+	"https://ipv4.myexternalip.com/raw",
+	"https://4.ident.me",
+	"https://check-host.net/ip",
+}
+
+// GetServerIPv4 returns the server's public IPv4 using the same probe list the
+// dashboard status uses, or "N/A" if none respond. Uncached — intended for
+// one-shot CLI use (e.g. printing the panel URL after `--random`).
+func GetServerIPv4() string {
+	for _, url := range publicIPv4Services {
+		if ip := getPublicIP(url); ip != "N/A" {
+			return ip
+		}
+	}
+	return "N/A"
+}
+
 func getPublicIP(url string) string {
 	client := &http.Client{
 		Timeout: 3 * time.Second,
@@ -349,14 +371,7 @@ func (s *ServerService) GetStatus(lastStatus *Status) *Status {
 	}
 
 	// IP fetching with caching
-	showIp4ServiceLists := []string{
-		"https://api4.ipify.org",
-		"https://ipv4.icanhazip.com",
-		"https://v4.api.ipinfo.io/ip",
-		"https://ipv4.myexternalip.com/raw",
-		"https://4.ident.me",
-		"https://check-host.net/ip",
-	}
+	showIp4ServiceLists := publicIPv4Services
 	showIp6ServiceLists := []string{
 		"https://api6.ipify.org",
 		"https://ipv6.icanhazip.com",
@@ -645,70 +660,15 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 	return fileName, nil
 }
 
+// UpdateXray is intentionally disabled. This panel ships a SPECIFIC pinned Xray
+// core — a patched fork baked into the binary (see the corebundle package) whose
+// Shadowsocks method-fallback fix the whole product depends on. That exact core
+// is extracted and made authoritative on every startup, so switching or updating
+// it from the dashboard is forbidden: it would replace the vetted core with an
+// arbitrary upstream release. The dashboard hides the switch UI; this is the
+// server-side guard so the API can't be driven directly either.
 func (s *ServerService) UpdateXray(version string) error {
-	// 1. Stop xray before doing anything
-	if err := s.StopXrayService(); err != nil {
-		logger.Warning("failed to stop xray before update:", err)
-	}
-
-	// 2. Download the zip
-	zipFileName, err := s.downloadXRay(version)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(zipFileName)
-
-	zipFile, err := os.Open(zipFileName)
-	if err != nil {
-		return err
-	}
-	defer zipFile.Close()
-
-	stat, err := zipFile.Stat()
-	if err != nil {
-		return err
-	}
-	reader, err := zip.NewReader(zipFile, stat.Size())
-	if err != nil {
-		return err
-	}
-
-	// 3. Helper to extract files
-	copyZipFile := func(zipName string, fileName string) error {
-		zipFile, err := reader.Open(zipName)
-		if err != nil {
-			return err
-		}
-		defer zipFile.Close()
-		os.MkdirAll(filepath.Dir(fileName), 0755)
-		os.Remove(fileName)
-		file, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, fs.ModePerm)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		_, err = io.Copy(file, zipFile)
-		return err
-	}
-
-	// 4. Extract correct binary
-	if runtime.GOOS == "windows" {
-		targetBinary := filepath.Join("bin", "xray-windows-amd64.exe")
-		err = copyZipFile("xray.exe", targetBinary)
-	} else {
-		err = copyZipFile("xray", xray.GetBinaryPath())
-	}
-	if err != nil {
-		return err
-	}
-
-	// 5. Restart xray
-	if err := s.xrayService.RestartXray(true); err != nil {
-		logger.Error("start xray failed:", err)
-		return err
-	}
-
-	return nil
+	return fmt.Errorf("the Xray core is bundled and locked to the panel's pinned build; changing or updating the core version is not allowed")
 }
 
 func (s *ServerService) GetLogs(count string, level string, syslog string) []string {
@@ -716,11 +676,6 @@ func (s *ServerService) GetLogs(count string, level string, syslog string) []str
 	var lines []string
 
 	if syslog == "true" {
-		// Check if running on Windows - journalctl is not available
-		if runtime.GOOS == "windows" {
-			return []string{"Syslog is not supported on Windows. Please use application logs instead by unchecking the 'Syslog' option."}
-		}
-
 		// Validate and sanitize count parameter
 		countInt, err := strconv.Atoi(count)
 		if err != nil || countInt < 1 || countInt > 10000 {
@@ -743,12 +698,12 @@ func (s *ServerService) GetLogs(count string, level string, syslog string) []str
 		}
 
 		// Use hardcoded command with validated parameters
-		cmd := exec.Command("journalctl", "-u", "x-ui", "--no-pager", "-n", strconv.Itoa(countInt), "-p", level)
+		cmd := exec.Command("journalctl", "-u", "vpn-ui", "--no-pager", "-n", strconv.Itoa(countInt), "-p", level)
 		var out bytes.Buffer
 		cmd.Stdout = &out
 		err = cmd.Run()
 		if err != nil {
-			return []string{"Failed to run journalctl command! Make sure systemd is available and x-ui service is registered."}
+			return []string{"Failed to run journalctl command! Make sure systemd is available and vpn-ui service is registered."}
 		}
 		lines = strings.Split(out.String(), "\n")
 	} else {
