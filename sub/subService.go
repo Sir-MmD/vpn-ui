@@ -479,7 +479,17 @@ func (s *SubService) genConnectionCard(inbound *model.Inbound, email string) str
 	// the client id alone (SshService.lookupAccount), so showing the email there would
 	// hand the subscriber a username that cannot log in. mtproto has no username at all:
 	// the secret IS the credential.
-	details := []string{protocolLabel(inbound.Protocol)}
+	var settings map[string]any
+	_ = json.Unmarshal([]byte(inbound.Settings), &settings)
+
+	protoLabel := protocolLabel(inbound.Protocol)
+	if inbound.Protocol == model.L2TP {
+		if en, ok := settings["ipsecEnable"].(bool); ok && !en {
+			protoLabel = "L2TP"
+		}
+	}
+
+	details := []string{protoLabel}
 	switch inbound.Protocol {
 	case model.MTPROTO:
 		if c.Secret != "" {
@@ -491,15 +501,17 @@ func (s *SubService) genConnectionCard(inbound *model.Inbound, email string) str
 			details = append(details, "pass="+c.Password)
 		}
 	default:
-		details = append(details, "user="+email)
+		username := c.ID
+		if strings.TrimSpace(username) == "" {
+			username = email
+		}
+		details = append(details, "user="+username)
 		if c.Password != "" {
 			details = append(details, "pass="+c.Password)
 		}
 	}
 
 	// The pre-shared key lives at the inbound level for the protocols that use one.
-	var settings map[string]any
-	_ = json.Unmarshal([]byte(inbound.Settings), &settings)
 	switch inbound.Protocol {
 	case model.L2TP:
 		if en, _ := settings["ipsecEnable"].(bool); en {
@@ -515,17 +527,69 @@ func (s *SubService) genConnectionCard(inbound *model.Inbound, email string) str
 		}
 	}
 
+	type cardEndpoint struct {
+		host   string
+		port   int
+		remark string
+	}
+	var endpoints []cardEndpoint
+
+	// Check if externalProxy is defined in inbound.Settings
+	if rawEps, ok := settings["externalProxy"].([]any); ok && len(rawEps) > 0 {
+		for _, raw := range rawEps {
+			if epMap, ok := raw.(map[string]any); ok {
+				dest, _ := epMap["dest"].(string)
+				dest = strings.TrimSpace(dest)
+				if dest == "" {
+					continue
+				}
+				port := 0
+				switch p := epMap["port"].(type) {
+				case float64:
+					port = int(p)
+				case int:
+					port = p
+				}
+				if port <= 0 {
+					port = inbound.Port
+				}
+				remark, _ := epMap["remark"].(string)
+				endpoints = append(endpoints, cardEndpoint{
+					host:   dest,
+					port:   port,
+					remark: strings.TrimSpace(remark),
+				})
+			}
+		}
+	}
+
+	if len(endpoints) == 0 {
+		endpoints = append(endpoints, cardEndpoint{
+			host: server,
+			port: inbound.Port,
+		})
+	}
+
 	// No query params on purpose: `trojan://secret@host:port#name` is the shape every
 	// importer handles, and each extra parameter is one more thing a strict parser can
 	// reject. url.URL escapes the credential and the fragment (spaces as %20, not '+',
 	// which a fragment must have).
-	u := url.URL{
-		Scheme:   "trojan",
-		User:     url.User(secret),
-		Host:     net.JoinHostPort(server, strconv.Itoa(inbound.Port)),
-		Fragment: s.genRemark(inbound, email, strings.Join(details, " ")),
+	baseDetails := strings.Join(details, " ")
+	cards := make([]string, 0, len(endpoints))
+	for _, ep := range endpoints {
+		fullDetails := baseDetails
+		if ep.remark != "" {
+			fullDetails = baseDetails + " (" + ep.remark + ")"
+		}
+		u := url.URL{
+			Scheme:   "trojan",
+			User:     url.User(secret),
+			Host:     net.JoinHostPort(ep.host, strconv.Itoa(ep.port)),
+			Fragment: s.genRemark(inbound, email, fullDetails),
+		}
+		cards = append(cards, u.String())
 	}
-	return u.String()
+	return strings.Join(cards, "\n")
 }
 
 // genWireguardLink emits an importable wireguard:// link per device x endpoint for a wg-c
@@ -2240,14 +2304,14 @@ func (s *SubService) ResolveRequest(c *gin.Context) (scheme string, host string,
 		host = h
 	}
 	if host == "" {
-		host = c.GetHeader("X-Real-IP")
-	}
-	if host == "" {
 		var err error
 		host, _, err = net.SplitHostPort(c.Request.Host)
 		if err != nil {
 			host = c.Request.Host
 		}
+	}
+	if host == "" {
+		host = c.GetHeader("X-Real-IP")
 	}
 
 	// host:port for URLs
@@ -2262,7 +2326,7 @@ func (s *SubService) ResolveRequest(c *gin.Context) (scheme string, host string,
 	// header display host
 	hostHeader = c.GetHeader("X-Forwarded-Host")
 	if hostHeader == "" {
-		hostHeader = c.GetHeader("X-Real-IP")
+		hostHeader = c.Request.Host
 	}
 	if hostHeader == "" {
 		hostHeader = host
