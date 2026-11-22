@@ -125,6 +125,36 @@ func TestConnectionCardUsesSshLoginName(t *testing.T) {
 	}
 }
 
+// VPN protocols (l2tp, pptp, openvpn, etc.) must show the client ID (the vpnUsername)
+// in the card if one is set, rather than the tracking email.
+func TestConnectionCardUsesVpnUsername(t *testing.T) {
+	s := cardService()
+	in := credInbound(model.L2TP, 1701,
+		`{"ipsecEnable":true,"ipsecPsk":"psk1","clients":[{"id":"samael-l2","email":"samael@example.com","password":"pw"}]}`)
+	got := parseCard(t, s.genConnectionCard(in, "samael@example.com")).Fragment
+	if !strings.Contains(got, "user=samael-l2") {
+		t.Fatalf("l2tp card should show the vpn username from id: %q", got)
+	}
+	if strings.Contains(got, "user=samael@example.com") {
+		t.Fatalf("l2tp card must not show the email when id is set: %q", got)
+	}
+}
+
+// An inbound with externalProxy should emit cards with the relay host and port instead of s.address.
+func TestConnectionCardRespectsExternalProxy(t *testing.T) {
+	s := cardService()
+	in := credInbound(model.L2TP, 1701,
+		`{"externalProxy":[{"dest":"relay.example.com","port":1701,"remark":"relay1"}],"clients":[{"id":"u1","email":"e1","password":"p"}]}`)
+	card := s.genConnectionCard(in, "e1")
+	u := parseCard(t, card)
+	if u.Host != "relay.example.com:1701" {
+		t.Fatalf("card host should be external proxy: got %q", u.Host)
+	}
+	if !strings.Contains(u.Fragment, "(relay1)") {
+		t.Fatalf("card remark should contain external proxy remark: %q", u.Fragment)
+	}
+}
+
 // Spaces in a name must be %20, never '+': a '+' in a fragment is a literal plus, so a
 // client would display "user=x+pass=y". url.URL gets this right and QueryEscape does not,
 // which is the trap this pins.
